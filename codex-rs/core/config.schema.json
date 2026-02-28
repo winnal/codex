@@ -639,7 +639,8 @@
         "cli",
         "vscode",
         "exec",
-        "mcp"
+        "mcp",
+        "scratchpad"
       ],
       "type": "string"
     },

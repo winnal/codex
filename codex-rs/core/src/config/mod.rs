@@ -2527,7 +2527,6 @@ mod tests {
     use crate::config_loader::RequirementSource;
     use crate::features::Feature;
     use codex_config::CONFIG_TOML_FILE;
-    use codex_protocol::protocol::SessionSource;
 
     use super::*;
     use core_test_support::test_absolute_path;
@@ -2662,7 +2661,7 @@ stage_1_sources = ["exec"]
                 min_rollout_idle_hours: 24,
                 extract_model: Some("gpt-5-mini".to_string()),
                 consolidation_model: Some("gpt-5".to_string()),
-                stage_1_sources: vec![SessionSource::Exec],
+                stage_1_sources: vec![MemoriesStageOneSource::Exec],
             }
         );
     }
@@ -2678,7 +2677,7 @@ stage_1_sources = ["exec"]
 
         assert_eq!(
             config.memories.stage_1_sources,
-            vec![SessionSource::Cli, SessionSource::VSCode]
+            vec![MemoriesStageOneSource::Cli, MemoriesStageOneSource::VSCode]
         );
     }
 
