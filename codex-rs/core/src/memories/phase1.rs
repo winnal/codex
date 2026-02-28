@@ -19,7 +19,6 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_secrets::redact_secrets;
 use futures::StreamExt;
@@ -30,8 +29,6 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::info;
 use tracing::warn;
-
-const MEMORY_STAGE1_ALLOWED_SOURCES: &[SessionSource] = &[SessionSource::Exec];
 
 #[derive(Clone, Debug)]
 pub(in crate::memories) struct RequestContext {
@@ -163,7 +160,8 @@ async fn claim_startup_jobs(
         return None;
     };
 
-    let allowed_sources = MEMORY_STAGE1_ALLOWED_SOURCES
+    let allowed_sources = memories_config
+        .stage_1_sources
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();

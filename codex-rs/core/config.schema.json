@@ -634,6 +634,15 @@
         }
       ]
     },
+    "MemoriesStageOneSource": {
+      "enum": [
+        "cli",
+        "vscode",
+        "exec",
+        "mcp"
+      ],
+      "type": "string"
+    },
     "MemoriesToml": {
       "additionalProperties": false,
       "description": "Memories settings loaded from config.toml.",
@@ -680,6 +689,13 @@
         "no_memories_if_mcp_or_web_search": {
           "description": "When `true`, web searches and MCP tool calls mark the thread `memory_mode` as `\"polluted\"`.",
           "type": "boolean"
+        },
+        "stage_1_sources": {
+          "description": "Session sources eligible for stage-1 memory extraction.",
+          "items": {
+            "$ref": "#/definitions/MemoriesStageOneSource"
+          },
+          "type": "array"
         },
         "use_memories": {
           "description": "When `false`, skip injecting memory usage instructions into developer prompts.",
