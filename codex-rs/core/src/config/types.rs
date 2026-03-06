@@ -388,6 +388,8 @@ pub struct MemoriesToml {
     pub max_rollouts_per_startup: Option<usize>,
     /// Minimum idle time between last thread activity and memory creation (hours). > 12h recommended.
     pub min_rollout_idle_hours: Option<i64>,
+    /// Minimum idle time between last thread activity and memory creation for `exec` sessions.
+    pub exec_min_rollout_idle_hours: Option<i64>,
     /// Session sources eligible for stage-1 memory extraction.
     pub stage_1_sources: Option<Vec<MemoriesStageOneSource>>,
     /// Model used for thread summarisation.
@@ -433,6 +435,7 @@ pub struct MemoriesConfig {
     pub max_rollout_age_days: i64,
     pub max_rollouts_per_startup: usize,
     pub min_rollout_idle_hours: i64,
+    pub exec_min_rollout_idle_hours: i64,
     pub extract_model: Option<String>,
     pub consolidation_model: Option<String>,
     pub stage_1_sources: Vec<MemoriesStageOneSource>,
@@ -449,9 +452,28 @@ impl Default for MemoriesConfig {
             max_rollout_age_days: DEFAULT_MEMORIES_MAX_ROLLOUT_AGE_DAYS,
             max_rollouts_per_startup: DEFAULT_MEMORIES_MAX_ROLLOUTS_PER_STARTUP,
             min_rollout_idle_hours: DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS,
+            exec_min_rollout_idle_hours: DEFAULT_MEMORIES_MIN_ROLLOUT_IDLE_HOURS,
             extract_model: None,
             consolidation_model: None,
             stage_1_sources: vec![MemoriesStageOneSource::Cli, MemoriesStageOneSource::VSCode],
+        }
+    }
+}
+
+impl MemoriesConfig {
+    pub fn idle_hours_for_source(&self, source: MemoriesStageOneSource) -> i64 {
+        match source {
+            MemoriesStageOneSource::Exec => self.exec_min_rollout_idle_hours,
+            MemoriesStageOneSource::Scratchpad => {
+                if self.stage_1_sources.contains(&MemoriesStageOneSource::Exec) {
+                    self.exec_min_rollout_idle_hours
+                } else {
+                    self.min_rollout_idle_hours
+                }
+            }
+            MemoriesStageOneSource::Cli
+            | MemoriesStageOneSource::VSCode
+            | MemoriesStageOneSource::Mcp => self.min_rollout_idle_hours,
         }
     }
 }
@@ -485,6 +507,10 @@ impl From<MemoriesToml> for MemoriesConfig {
                 .min_rollout_idle_hours
                 .unwrap_or(defaults.min_rollout_idle_hours)
                 .clamp(1, 48),
+            exec_min_rollout_idle_hours: toml
+                .exec_min_rollout_idle_hours
+                .unwrap_or(defaults.exec_min_rollout_idle_hours)
+                .clamp(0, 48),
             extract_model: toml.extract_model,
             consolidation_model: toml.consolidation_model,
             stage_1_sources: toml.stage_1_sources.map_or_else(

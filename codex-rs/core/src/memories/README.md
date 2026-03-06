@@ -23,6 +23,9 @@ the pipeline only considers thread sources that are:
 - from configured stage-1 memory sources (defaults to `cli` and `vscode`; optional values include `exec`, `mcp`, and `scratchpad`)
 - within the configured age window
 - idle long enough (to avoid summarizing still-active/fresh sources)
+  - interactive sources (`cli`, `vscode`, `mcp`) use `min_rollout_idle_hours`
+  - `exec` uses `exec_min_rollout_idle_hours`
+  - `scratchpad` follows the `exec` idle threshold when `exec` sourcing is enabled; otherwise it uses the interactive idle threshold
 - not already owned by another in-flight phase-1 worker
 - within startup scan/claim limits (bounded work per startup)
 

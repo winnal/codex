@@ -652,6 +652,11 @@
           "description": "Model used for memory consolidation.",
           "type": "string"
         },
+        "exec_min_rollout_idle_hours": {
+          "description": "Minimum idle time between last thread activity and memory creation for `exec` sessions.",
+          "format": "int64",
+          "type": "integer"
+        },
         "extract_model": {
           "description": "Model used for thread summarisation.",
           "type": "string"

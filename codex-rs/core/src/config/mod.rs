@@ -2619,6 +2619,7 @@ max_unused_days = 21
 max_rollout_age_days = 42
 max_rollouts_per_startup = 9
 min_rollout_idle_hours = 24
+exec_min_rollout_idle_hours = 0
 extract_model = "gpt-5-mini"
 consolidation_model = "gpt-5"
 stage_1_sources = ["exec"]
@@ -2635,6 +2636,7 @@ stage_1_sources = ["exec"]
                 max_rollout_age_days: Some(42),
                 max_rollouts_per_startup: Some(9),
                 min_rollout_idle_hours: Some(24),
+                exec_min_rollout_idle_hours: Some(0),
                 extract_model: Some("gpt-5-mini".to_string()),
                 consolidation_model: Some("gpt-5".to_string()),
                 stage_1_sources: Some(vec![MemoriesStageOneSource::Exec]),
@@ -2659,6 +2661,7 @@ stage_1_sources = ["exec"]
                 max_rollout_age_days: 42,
                 max_rollouts_per_startup: 9,
                 min_rollout_idle_hours: 24,
+                exec_min_rollout_idle_hours: 0,
                 extract_model: Some("gpt-5-mini".to_string()),
                 consolidation_model: Some("gpt-5".to_string()),
                 stage_1_sources: vec![MemoriesStageOneSource::Exec],
@@ -2678,6 +2681,61 @@ stage_1_sources = ["exec"]
         assert_eq!(
             config.memories.stage_1_sources,
             vec![MemoriesStageOneSource::Cli, MemoriesStageOneSource::VSCode]
+        );
+    }
+
+    #[test]
+    fn memories_exec_idle_hours_can_be_zero_and_scratchpad_follows_exec_when_enabled() {
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                memories: Some(MemoriesToml {
+                    stage_1_sources: Some(vec![
+                        MemoriesStageOneSource::Exec,
+                        MemoriesStageOneSource::Scratchpad,
+                    ]),
+                    min_rollout_idle_hours: Some(12),
+                    exec_min_rollout_idle_hours: Some(0),
+                    ..MemoriesToml::default()
+                }),
+                ..ConfigToml::default()
+            },
+            ConfigOverrides::default(),
+            tempdir().expect("tempdir").path().to_path_buf(),
+        )
+        .expect("load config");
+
+        assert_eq!(config.memories.min_rollout_idle_hours, 12);
+        assert_eq!(config.memories.exec_min_rollout_idle_hours, 0);
+        assert_eq!(
+            config
+                .memories
+                .idle_hours_for_source(MemoriesStageOneSource::Scratchpad),
+            0
+        );
+    }
+
+    #[test]
+    fn memories_scratchpad_uses_interactive_idle_when_exec_not_enabled() {
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                memories: Some(MemoriesToml {
+                    stage_1_sources: Some(vec![MemoriesStageOneSource::Scratchpad]),
+                    min_rollout_idle_hours: Some(12),
+                    exec_min_rollout_idle_hours: Some(0),
+                    ..MemoriesToml::default()
+                }),
+                ..ConfigToml::default()
+            },
+            ConfigOverrides::default(),
+            tempdir().expect("tempdir").path().to_path_buf(),
+        )
+        .expect("load config");
+
+        assert_eq!(
+            config
+                .memories
+                .idle_hours_for_source(MemoriesStageOneSource::Scratchpad),
+            12
         );
     }
 

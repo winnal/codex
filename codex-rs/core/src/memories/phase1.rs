@@ -230,7 +230,12 @@ async fn claim_startup_jobs(
                 scan_limit: phase_one::THREAD_SCAN_LIMIT,
                 max_claimed: memories_config.max_rollouts_per_startup,
                 max_age_days: memories_config.max_rollout_age_days,
-                min_rollout_idle_hours: memories_config.min_rollout_idle_hours,
+                interactive_min_rollout_idle_hours: memories_config
+                    .idle_hours_for_source(MemoriesStageOneSource::Cli),
+                exec_min_rollout_idle_hours: memories_config
+                    .idle_hours_for_source(MemoriesStageOneSource::Exec),
+                scratchpad_min_rollout_idle_hours: memories_config
+                    .idle_hours_for_source(MemoriesStageOneSource::Scratchpad),
                 allowed_sources: allowed_sources.as_slice(),
                 scratchpad_cwd: scratchpad_cwd.as_deref(),
                 lease_seconds: phase_one::JOB_LEASE_SECONDS,
@@ -401,8 +406,11 @@ fn discover_scratchpad_candidates(
             .saturating_mul(24)
             .saturating_mul(3_600),
     );
-    let max_updated_at =
-        now.saturating_sub(memories_config.min_rollout_idle_hours.saturating_mul(3_600));
+    let max_updated_at = now.saturating_sub(
+        memories_config
+            .idle_hours_for_source(MemoriesStageOneSource::Scratchpad)
+            .saturating_mul(3_600),
+    );
 
     let mut candidates_by_identity = HashMap::<String, ScratchpadCandidate>::new();
     for relative_dir in [
@@ -1386,6 +1394,7 @@ created_at: 2026-02-28T12:03:50Z\n";
             max_rollout_age_days: 30,
             max_rollouts_per_startup: 16,
             min_rollout_idle_hours: 0,
+            exec_min_rollout_idle_hours: 0,
             extract_model: None,
             consolidation_model: None,
             stage_1_sources: vec![MemoriesStageOneSource::Scratchpad],

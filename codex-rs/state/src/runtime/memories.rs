@@ -125,7 +125,7 @@ WHERE thread_id = ?
     /// - excludes threads with `memory_mode != 'enabled'`
     /// - excludes the current thread id
     /// - keeps only threads in the age window:
-    ///   `updated_at >= now - max_age_days` and `updated_at <= now - min_rollout_idle_hours`
+    ///   `updated_at >= now - max_age_days` and source-specific idle cutoffs
     /// - when `scratchpad_cwd` is provided, keeps scratchpad threads only when
     ///   `cwd = scratchpad_cwd`
     /// - keeps only threads whose memory is stale:
@@ -145,7 +145,9 @@ WHERE thread_id = ?
             scan_limit,
             max_claimed,
             max_age_days,
-            min_rollout_idle_hours,
+            interactive_min_rollout_idle_hours,
+            exec_min_rollout_idle_hours,
+            scratchpad_min_rollout_idle_hours,
             allowed_sources,
             scratchpad_cwd,
             lease_seconds,
@@ -157,7 +159,12 @@ WHERE thread_id = ?
         let worker_id = current_thread_id;
         let current_thread_id = worker_id.to_string();
         let max_age_cutoff = (Utc::now() - Duration::days(max_age_days.max(0))).timestamp();
-        let idle_cutoff = (Utc::now() - Duration::hours(min_rollout_idle_hours.max(0))).timestamp();
+        let interactive_idle_cutoff =
+            (Utc::now() - Duration::hours(interactive_min_rollout_idle_hours.max(0))).timestamp();
+        let exec_idle_cutoff =
+            (Utc::now() - Duration::hours(exec_min_rollout_idle_hours.max(0))).timestamp();
+        let scratchpad_idle_cutoff =
+            (Utc::now() - Duration::hours(scratchpad_min_rollout_idle_hours.max(0))).timestamp();
 
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
@@ -217,7 +224,22 @@ LEFT JOIN jobs
         builder
             .push(" AND updated_at >= ")
             .push_bind(max_age_cutoff);
-        builder.push(" AND updated_at <= ").push_bind(idle_cutoff);
+        builder.push(" AND ((");
+        builder.push("source = ");
+        builder.push_bind("exec");
+        builder.push(" AND updated_at <= ");
+        builder.push_bind(exec_idle_cutoff);
+        builder.push(") OR (source = ");
+        builder.push_bind("scratchpad");
+        builder.push(" AND updated_at <= ");
+        builder.push_bind(scratchpad_idle_cutoff);
+        builder.push(") OR (source NOT IN (");
+        builder.push_bind("exec");
+        builder.push(", ");
+        builder.push_bind("scratchpad");
+        builder.push(") AND updated_at <= ");
+        builder.push_bind(interactive_idle_cutoff);
+        builder.push("))");
         builder.push(" AND COALESCE(stage1_outputs.source_updated_at, -1) < updated_at");
         builder.push(" AND COALESCE(jobs.last_success_watermark, -1) < updated_at");
         push_thread_order_and_limit(&mut builder, SortKey::UpdatedAt, scan_limit);
@@ -1629,7 +1651,9 @@ mod tests {
                     scan_limit: 1,
                     max_claimed: 5,
                     max_age_days: 30,
-                    min_rollout_idle_hours: 12,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 12,
+                    scratchpad_min_rollout_idle_hours: 12,
                     allowed_sources: allowed_sources.as_slice(),
                     scratchpad_cwd: None,
                     lease_seconds: 3600,
@@ -1730,7 +1754,9 @@ mod tests {
                     scan_limit: 1,
                     max_claimed: 1,
                     max_age_days: 30,
-                    min_rollout_idle_hours: 12,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 12,
+                    scratchpad_min_rollout_idle_hours: 12,
                     allowed_sources: allowed_sources.as_slice(),
                     scratchpad_cwd: None,
                     lease_seconds: 3600,
@@ -1801,7 +1827,9 @@ mod tests {
                     scan_limit: 10,
                     max_claimed: 10,
                     max_age_days: 30,
-                    min_rollout_idle_hours: 12,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 12,
+                    scratchpad_min_rollout_idle_hours: 12,
                     allowed_sources: allowed_sources.as_slice(),
                     scratchpad_cwd: None,
                     lease_seconds: 3600,
@@ -1893,7 +1921,9 @@ mod tests {
                     scan_limit: 10,
                     max_claimed: 10,
                     max_age_days: 30,
-                    min_rollout_idle_hours: 12,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 12,
+                    scratchpad_min_rollout_idle_hours: 12,
                     allowed_sources: allowed_sources.as_slice(),
                     scratchpad_cwd: Some(local_repo_root.as_str()),
                     lease_seconds: 3600,
@@ -1910,6 +1940,76 @@ mod tests {
         assert!(claimed_ids.contains(&local_scratchpad_thread_id.to_string()));
         assert!(claimed_ids.contains(&cli_thread_id.to_string()));
         assert!(!claimed_ids.contains(&foreign_scratchpad_thread_id.to_string()));
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn claim_stage1_jobs_allows_exec_immediately_while_interactive_still_waits() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+            .await
+            .expect("initialize runtime");
+
+        let now = Utc::now();
+        let current_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("current thread id");
+        let exec_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("exec thread id");
+        let cli_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("cli thread id");
+
+        let mut current =
+            test_thread_metadata(&codex_home, current_thread_id, codex_home.join("current"));
+        current.created_at = now;
+        current.updated_at = now;
+        runtime
+            .upsert_thread(&current)
+            .await
+            .expect("upsert current thread");
+
+        let recent_at = now - Duration::minutes(5);
+
+        let mut exec_thread =
+            test_thread_metadata(&codex_home, exec_thread_id, codex_home.join("exec"));
+        exec_thread.created_at = recent_at;
+        exec_thread.updated_at = recent_at;
+        exec_thread.source = "exec".to_string();
+        runtime
+            .upsert_thread(&exec_thread)
+            .await
+            .expect("upsert exec thread");
+
+        let mut cli_thread =
+            test_thread_metadata(&codex_home, cli_thread_id, codex_home.join("cli"));
+        cli_thread.created_at = recent_at;
+        cli_thread.updated_at = recent_at;
+        runtime
+            .upsert_thread(&cli_thread)
+            .await
+            .expect("upsert cli thread");
+
+        let allowed_sources = vec!["exec".to_string(), "cli".to_string()];
+        let claims = runtime
+            .claim_stage1_jobs_for_startup(
+                current_thread_id,
+                Stage1StartupClaimParams {
+                    scan_limit: 10,
+                    max_claimed: 10,
+                    max_age_days: 30,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 0,
+                    scratchpad_min_rollout_idle_hours: 0,
+                    allowed_sources: allowed_sources.as_slice(),
+                    scratchpad_cwd: None,
+                    lease_seconds: 3600,
+                },
+            )
+            .await
+            .expect("claim stage1 jobs");
+
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].thread.id, exec_thread_id);
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
@@ -2325,7 +2425,9 @@ INSERT INTO jobs (
                     scan_limit: 200,
                     max_claimed: 64,
                     max_age_days: 30,
-                    min_rollout_idle_hours: 12,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 12,
+                    scratchpad_min_rollout_idle_hours: 12,
                     allowed_sources: allowed_sources.as_slice(),
                     scratchpad_cwd: None,
                     lease_seconds: 3600,
@@ -2360,7 +2462,9 @@ WHERE kind = 'memory_stage1'
                     scan_limit: 200,
                     max_claimed: 64,
                     max_age_days: 30,
-                    min_rollout_idle_hours: 12,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 12,
+                    scratchpad_min_rollout_idle_hours: 12,
                     allowed_sources: allowed_sources.as_slice(),
                     scratchpad_cwd: None,
                     lease_seconds: 3600,
@@ -2415,7 +2519,9 @@ WHERE kind = 'memory_stage1'
                     scan_limit: 5_000,
                     max_claimed: 64,
                     max_age_days: 30,
-                    min_rollout_idle_hours: 12,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 12,
+                    scratchpad_min_rollout_idle_hours: 12,
                     allowed_sources: allowed_sources.as_slice(),
                     scratchpad_cwd: None,
                     lease_seconds: 3_600,
@@ -2449,7 +2555,9 @@ WHERE kind = 'memory_stage1'
                     scan_limit: 5_000,
                     max_claimed: 64,
                     max_age_days: 30,
-                    min_rollout_idle_hours: 12,
+                    interactive_min_rollout_idle_hours: 12,
+                    exec_min_rollout_idle_hours: 12,
+                    scratchpad_min_rollout_idle_hours: 12,
                     allowed_sources: allowed_sources.as_slice(),
                     scratchpad_cwd: None,
                     lease_seconds: 3_600,
