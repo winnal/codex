@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
+use codex_core::config::types::MemoriesStageOneSource;
 use codex_core::features::Feature;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
@@ -176,6 +177,7 @@ async fn web_search_pollution_moves_selected_thread_into_removed_phase2_inputs()
             .expect("test config should allow feature update");
         config.memories.max_raw_memories_for_consolidation = 1;
         config.memories.no_memories_if_mcp_or_web_search = true;
+        config.memories.stage_1_sources = vec![MemoriesStageOneSource::Exec];
     });
     let initial = initial_builder.build(&server).await?;
     mount_sse_once(
@@ -248,6 +250,7 @@ async fn web_search_pollution_moves_selected_thread_into_removed_phase2_inputs()
             .expect("test config should allow feature update");
         config.memories.max_raw_memories_for_consolidation = 1;
         config.memories.no_memories_if_mcp_or_web_search = true;
+        config.memories.stage_1_sources = vec![MemoriesStageOneSource::Exec];
     });
     let resumed = resumed_builder
         .resume(&server, home.clone(), rollout_path.clone())
@@ -333,6 +336,7 @@ async fn build_test_codex(server: &wiremock::MockServer, home: Arc<TempDir>) -> 
             .enable(Feature::MemoryTool)
             .expect("test config should allow feature update");
         config.memories.max_raw_memories_for_consolidation = 1;
+        config.memories.stage_1_sources = vec![MemoriesStageOneSource::Exec];
     });
     builder.build(server).await
 }
@@ -358,7 +362,7 @@ async fn seed_stage1_output(
         thread_id,
         codex_home.join(format!("rollout-{thread_id}.jsonl")),
         updated_at,
-        SessionSource::Cli,
+        SessionSource::Exec,
     );
     metadata_builder.cwd = codex_home.join(format!("workspace-{rollout_slug}"));
     metadata_builder.model_provider = Some("test-provider".to_string());

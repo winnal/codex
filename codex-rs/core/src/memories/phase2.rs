@@ -2,10 +2,12 @@ use crate::agent::AgentStatus;
 use crate::agent::status::is_final as is_final_agent_status;
 use crate::codex::Session;
 use crate::config::Config;
+use crate::config::types::MemoriesStageOneSource;
 use crate::features::Feature;
 use crate::memories::memory_root;
 use crate::memories::metrics;
 use crate::memories::phase_two;
+use crate::memories::phase1::resolve_scratchpad_repo_root;
 use crate::memories::prompts::build_consolidation_prompt;
 use crate::memories::storage::rebuild_raw_memories_file_from_memories;
 use crate::memories::storage::rollout_summary_file_stem;
@@ -54,6 +56,7 @@ pub(super) async fn run(session: &Arc<Session>, config: Arc<Config>) {
     let root = memory_root(&config.codex_home);
     let max_raw_memories = config.memories.max_raw_memories_for_consolidation;
     let max_unused_days = config.memories.max_unused_days;
+    let (allowed_sources, scratchpad_cwd) = stage1_source_filters_for_phase2(&config);
 
     // 1. Claim the job.
     let claim = match job::claim(session, db).await {
@@ -78,7 +81,12 @@ pub(super) async fn run(session: &Arc<Session>, config: Arc<Config>) {
 
     // 3. Query the memories
     let selection = match db
-        .get_phase2_input_selection(max_raw_memories, max_unused_days)
+        .get_phase2_input_selection_filtered(
+            max_raw_memories,
+            max_unused_days,
+            allowed_sources.as_slice(),
+            scratchpad_cwd.as_deref(),
+        )
         .await
     {
         Ok(selection) => selection,
@@ -158,6 +166,33 @@ pub(super) async fn run(session: &Arc<Session>, config: Arc<Config>) {
         input: raw_memories.len() as i64,
     };
     emit_metrics(session, counters);
+}
+
+fn stage1_source_filters_for_phase2(config: &Config) -> (Vec<String>, Option<String>) {
+    let scratchpad_source_enabled = config
+        .memories
+        .stage_1_sources
+        .contains(&MemoriesStageOneSource::Scratchpad);
+    let scratchpad_cwd = if scratchpad_source_enabled {
+        resolve_scratchpad_repo_root(&config.cwd)
+            .map(|repo_root| repo_root.to_string_lossy().to_string())
+    } else {
+        None
+    };
+
+    let mut allowed_sources = config
+        .memories
+        .stage_1_sources
+        .iter()
+        .map(|source| source.as_db_source_str().to_string())
+        .collect::<Vec<_>>();
+    if scratchpad_source_enabled && scratchpad_cwd.is_none() {
+        allowed_sources.retain(|source| source != "scratchpad");
+    }
+    if allowed_sources.is_empty() {
+        allowed_sources.push("__codex_no_allowed_stage1_sources__".to_string());
+    }
+    (allowed_sources, scratchpad_cwd)
 }
 
 fn artifact_memories_for_phase2(

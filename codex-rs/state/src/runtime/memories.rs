@@ -327,12 +327,23 @@ LIMIT ?
         n: usize,
         max_unused_days: i64,
     ) -> anyhow::Result<Phase2InputSelection> {
+        self.get_phase2_input_selection_filtered(n, max_unused_days, &[], None)
+            .await
+    }
+
+    pub async fn get_phase2_input_selection_filtered(
+        &self,
+        n: usize,
+        max_unused_days: i64,
+        allowed_sources: &[String],
+        scratchpad_cwd: Option<&str>,
+    ) -> anyhow::Result<Phase2InputSelection> {
         if n == 0 {
             return Ok(Phase2InputSelection::default());
         }
         let cutoff = (Utc::now() - Duration::days(max_unused_days.max(0))).timestamp();
 
-        let current_rows = sqlx::query(
+        let mut current_rows_query = QueryBuilder::<Sqlite>::new(
             r#"
 SELECT
     so.thread_id,
@@ -351,23 +362,42 @@ LEFT JOIN threads AS t
     ON t.id = so.thread_id
 WHERE t.memory_mode = 'enabled'
   AND (length(trim(so.raw_memory)) > 0 OR length(trim(so.rollout_summary)) > 0)
+            "#,
+        );
+        Self::push_phase2_thread_source_filters(
+            &mut current_rows_query,
+            allowed_sources,
+            scratchpad_cwd,
+        );
+        current_rows_query.push(
+            r#"
   AND (
-        (so.last_usage IS NOT NULL AND so.last_usage >= ?)
-        OR (so.last_usage IS NULL AND so.source_updated_at >= ?)
+        (so.last_usage IS NOT NULL AND so.last_usage >= 
+            "#,
+        );
+        current_rows_query.push_bind(cutoff);
+        current_rows_query.push(
+            r#")
+        OR (so.last_usage IS NULL AND so.source_updated_at >= 
+            "#,
+        );
+        current_rows_query.push_bind(cutoff);
+        current_rows_query.push(
+            r#")
   )
 ORDER BY
     COALESCE(so.usage_count, 0) DESC,
     COALESCE(so.last_usage, so.source_updated_at) DESC,
     so.source_updated_at DESC,
     so.thread_id DESC
-LIMIT ?
+LIMIT 
             "#,
-        )
-        .bind(cutoff)
-        .bind(cutoff)
-        .bind(n as i64)
-        .fetch_all(self.pool.as_ref())
-        .await?;
+        );
+        let current_rows = current_rows_query
+            .push_bind(n as i64)
+            .build()
+            .fetch_all(self.pool.as_ref())
+            .await?;
 
         let mut current_thread_ids = HashSet::with_capacity(current_rows.len());
         let mut selected = Vec::with_capacity(current_rows.len());
@@ -387,7 +417,7 @@ LIMIT ?
             )?)?);
         }
 
-        let previous_rows = sqlx::query(
+        let mut previous_rows_query = QueryBuilder::<Sqlite>::new(
             r#"
 SELECT
     so.thread_id,
@@ -403,11 +433,22 @@ FROM stage1_outputs AS so
 LEFT JOIN threads AS t
     ON t.id = so.thread_id
 WHERE so.selected_for_phase2 = 1
+            "#,
+        );
+        Self::push_phase2_thread_source_filters(
+            &mut previous_rows_query,
+            allowed_sources,
+            scratchpad_cwd,
+        );
+        previous_rows_query.push(
+            r#"
 ORDER BY so.source_updated_at DESC, so.thread_id DESC
             "#,
-        )
-        .fetch_all(self.pool.as_ref())
-        .await?;
+        );
+        let previous_rows = previous_rows_query
+            .build()
+            .fetch_all(self.pool.as_ref())
+            .await?;
 
         let previous_selected = previous_rows
             .iter()
@@ -433,6 +474,28 @@ ORDER BY so.source_updated_at DESC, so.thread_id DESC
             retained_thread_ids,
             removed,
         })
+    }
+
+    fn push_phase2_thread_source_filters<'a>(
+        builder: &mut QueryBuilder<'a, Sqlite>,
+        allowed_sources: &'a [String],
+        scratchpad_cwd: Option<&'a str>,
+    ) {
+        if !allowed_sources.is_empty() {
+            builder.push(" AND t.source IN (");
+            let mut separated = builder.separated(", ");
+            for source in allowed_sources {
+                separated.push_bind(source);
+            }
+            separated.push_unseparated(")");
+        }
+        if let Some(scratchpad_cwd) = scratchpad_cwd {
+            builder.push(" AND (t.source != ");
+            builder.push_bind("scratchpad");
+            builder.push(" OR t.cwd = ");
+            builder.push_bind(scratchpad_cwd);
+            builder.push(")");
+        }
     }
 
     /// Marks a thread as polluted and enqueues phase-2 forgetting when the
@@ -1847,6 +1910,227 @@ mod tests {
         assert!(claimed_ids.contains(&local_scratchpad_thread_id.to_string()));
         assert!(claimed_ids.contains(&cli_thread_id.to_string()));
         assert!(!claimed_ids.contains(&foreign_scratchpad_thread_id.to_string()));
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn get_phase2_input_selection_filtered_respects_allowed_sources() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+            .await
+            .expect("initialize runtime");
+
+        let exec_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("exec thread id");
+        let cli_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("cli thread id");
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+
+        let mut exec_thread = test_thread_metadata(
+            &codex_home,
+            exec_thread_id,
+            codex_home.join("workspace-exec"),
+        );
+        exec_thread.source = "exec".to_string();
+        runtime
+            .upsert_thread(&exec_thread)
+            .await
+            .expect("upsert exec thread");
+        runtime
+            .upsert_thread(&test_thread_metadata(
+                &codex_home,
+                cli_thread_id,
+                codex_home.join("workspace-cli"),
+            ))
+            .await
+            .expect("upsert cli thread");
+
+        for (thread_id, source_updated_at) in [(exec_thread_id, 101_i64), (cli_thread_id, 100_i64)]
+        {
+            let claim = runtime
+                .try_claim_stage1_job(thread_id, owner, source_updated_at, 3600, 64)
+                .await
+                .expect("claim stage1");
+            let ownership_token = match claim {
+                Stage1JobClaimOutcome::Claimed { ownership_token } => ownership_token,
+                other => panic!("unexpected stage1 claim outcome: {other:?}"),
+            };
+            assert!(
+                runtime
+                    .mark_stage1_job_succeeded(
+                        thread_id,
+                        ownership_token.as_str(),
+                        source_updated_at,
+                        &format!("raw-{source_updated_at}"),
+                        &format!("summary-{source_updated_at}"),
+                        None,
+                    )
+                    .await
+                    .expect("mark stage1 success"),
+                "stage1 success should persist output"
+            );
+        }
+
+        let phase2_claim = runtime
+            .try_claim_global_phase2_job(owner, 3600)
+            .await
+            .expect("claim phase2");
+        let (phase2_token, input_watermark) = match phase2_claim {
+            Phase2JobClaimOutcome::Claimed {
+                ownership_token,
+                input_watermark,
+            } => (ownership_token, input_watermark),
+            other => panic!("unexpected phase2 claim outcome: {other:?}"),
+        };
+        let selected_outputs = runtime
+            .list_stage1_outputs_for_global(2)
+            .await
+            .expect("list selected outputs");
+        assert!(
+            runtime
+                .mark_global_phase2_job_succeeded(
+                    phase2_token.as_str(),
+                    input_watermark,
+                    &selected_outputs,
+                )
+                .await
+                .expect("mark phase2 success"),
+            "phase2 success should persist selected rows"
+        );
+
+        let allowed_sources = vec!["exec".to_string()];
+        let selection = runtime
+            .get_phase2_input_selection_filtered(2, 36_500, allowed_sources.as_slice(), None)
+            .await
+            .expect("load filtered phase2 selection");
+
+        assert_eq!(
+            selection
+                .selected
+                .iter()
+                .map(|output| output.thread_id)
+                .collect::<Vec<_>>(),
+            vec![exec_thread_id]
+        );
+        assert_eq!(
+            selection
+                .previous_selected
+                .iter()
+                .map(|output| output.thread_id)
+                .collect::<Vec<_>>(),
+            vec![exec_thread_id]
+        );
+        assert!(selection.removed.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn get_phase2_input_selection_filtered_respects_scratchpad_repo_scope() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string(), None)
+            .await
+            .expect("initialize runtime");
+
+        let owner = ThreadId::from_string(&Uuid::new_v4().to_string()).expect("owner id");
+        let local_scratchpad_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("local scratchpad thread id");
+        let foreign_scratchpad_thread_id = ThreadId::from_string(&Uuid::new_v4().to_string())
+            .expect("foreign scratchpad thread id");
+        let cli_thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("cli thread id");
+        let local_repo_root = codex_home.join("repo-local");
+        let foreign_repo_root = codex_home.join("repo-foreign");
+
+        let mut local_scratchpad = test_thread_metadata(
+            &codex_home,
+            local_scratchpad_thread_id,
+            local_repo_root.clone(),
+        );
+        local_scratchpad.source = "scratchpad".to_string();
+        local_scratchpad.rollout_path = local_repo_root.join("scratch/codex/pads/local.md");
+        runtime
+            .upsert_thread(&local_scratchpad)
+            .await
+            .expect("upsert local scratchpad thread");
+
+        let mut foreign_scratchpad = test_thread_metadata(
+            &codex_home,
+            foreign_scratchpad_thread_id,
+            foreign_repo_root.clone(),
+        );
+        foreign_scratchpad.source = "scratchpad".to_string();
+        foreign_scratchpad.rollout_path = foreign_repo_root.join("scratch/codex/pads/foreign.md");
+        runtime
+            .upsert_thread(&foreign_scratchpad)
+            .await
+            .expect("upsert foreign scratchpad thread");
+
+        runtime
+            .upsert_thread(&test_thread_metadata(
+                &codex_home,
+                cli_thread_id,
+                codex_home.join("workspace-cli"),
+            ))
+            .await
+            .expect("upsert cli thread");
+
+        for (thread_id, source_updated_at) in [
+            (foreign_scratchpad_thread_id, 103_i64),
+            (local_scratchpad_thread_id, 102_i64),
+            (cli_thread_id, 101_i64),
+        ] {
+            let claim = runtime
+                .try_claim_stage1_job(thread_id, owner, source_updated_at, 3600, 64)
+                .await
+                .expect("claim stage1");
+            let ownership_token = match claim {
+                Stage1JobClaimOutcome::Claimed { ownership_token } => ownership_token,
+                other => panic!("unexpected stage1 claim outcome: {other:?}"),
+            };
+            assert!(
+                runtime
+                    .mark_stage1_job_succeeded(
+                        thread_id,
+                        ownership_token.as_str(),
+                        source_updated_at,
+                        &format!("raw-{source_updated_at}"),
+                        &format!("summary-{source_updated_at}"),
+                        None,
+                    )
+                    .await
+                    .expect("mark stage1 success"),
+                "stage1 success should persist output"
+            );
+        }
+
+        let allowed_sources = vec!["scratchpad".to_string(), "cli".to_string()];
+        let local_repo_root = local_repo_root.to_string_lossy().to_string();
+        let selection = runtime
+            .get_phase2_input_selection_filtered(
+                3,
+                36_500,
+                allowed_sources.as_slice(),
+                Some(local_repo_root.as_str()),
+            )
+            .await
+            .expect("load filtered phase2 selection");
+
+        assert_eq!(
+            selection
+                .selected
+                .iter()
+                .map(|output| output.thread_id)
+                .collect::<Vec<_>>(),
+            vec![local_scratchpad_thread_id, cli_thread_id]
+        );
+        assert!(
+            selection
+                .selected
+                .iter()
+                .all(|output| output.thread_id != foreign_scratchpad_thread_id)
+        );
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }

@@ -32,6 +32,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -202,8 +203,7 @@ async fn claim_startup_jobs(
 
     let scratchpad_source_enabled = has_scratchpad_stage_one_source(memories_config);
     let scratchpad_cwd = if scratchpad_source_enabled {
-        find_repo_root_with_scratchpad(&config.cwd)
-            .map(|repo_root| dunce::canonicalize(&repo_root).unwrap_or(repo_root))
+        resolve_scratchpad_repo_root(&config.cwd)
             .map(|repo_root| repo_root.to_string_lossy().to_string())
     } else {
         None
@@ -255,6 +255,7 @@ async fn claim_startup_jobs(
 struct ScratchpadCandidate {
     path: PathBuf,
     updated_at: DateTime<Utc>,
+    logical_pad_name: String,
 }
 
 async fn sync_scratchpad_threads(session: &Arc<Session>, config: &Config) -> anyhow::Result<()> {
@@ -266,7 +267,7 @@ async fn sync_scratchpad_threads(session: &Arc<Session>, config: &Config) -> any
         return Ok(());
     };
 
-    let Some(repo_root) = find_repo_root_with_scratchpad(&config.cwd) else {
+    let Some(repo_root) = resolve_scratchpad_repo_root(&config.cwd) else {
         return Ok(());
     };
 
@@ -278,10 +279,8 @@ async fn sync_scratchpad_threads(session: &Arc<Session>, config: &Config) -> any
     for candidate in candidates {
         let canonical_path =
             dunce::canonicalize(&candidate.path).unwrap_or_else(|_| candidate.path.clone());
-        let thread_uuid = Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            canonical_path.to_string_lossy().as_bytes(),
-        );
+        let identity_key = scratchpad_identity_key(&repo_root, &candidate.logical_pad_name);
+        let thread_uuid = Uuid::new_v5(&Uuid::NAMESPACE_URL, identity_key.as_bytes());
         let Ok(thread_id) = ThreadId::from_string(&thread_uuid.to_string()) else {
             warn!(
                 "memory stage-1 scratchpad sync skipped invalid synthetic thread id for {}",
@@ -292,7 +291,7 @@ async fn sync_scratchpad_threads(session: &Arc<Session>, config: &Config) -> any
 
         let mut metadata_builder = ThreadMetadataBuilder::new(
             thread_id,
-            candidate.path.clone(),
+            canonical_path.clone(),
             candidate.updated_at,
             SessionSource::Exec,
         );
@@ -306,7 +305,9 @@ async fn sync_scratchpad_threads(session: &Arc<Session>, config: &Config) -> any
         metadata.title = scratchpad_title_from_path(candidate.path.as_path());
         metadata.first_user_message = Some(format!("scratchpad: {}", metadata.title));
 
-        if let Err(err) = state_db.upsert_thread(&metadata).await {
+        if let Err(err) =
+            upsert_scratchpad_thread(state_db, &metadata, config.memories.generate_memories).await
+        {
             warn!(
                 "memory stage-1 scratchpad sync failed upserting {}: {err}",
                 candidate.path.display()
@@ -323,10 +324,70 @@ fn has_scratchpad_stage_one_source(memories_config: &MemoriesConfig) -> bool {
         .contains(&MemoriesStageOneSource::Scratchpad)
 }
 
-fn find_repo_root_with_scratchpad(cwd: &Path) -> Option<PathBuf> {
+pub(super) fn resolve_scratchpad_repo_root(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()
         .find(|ancestor| ancestor.join("scratch").join("codex").is_dir())
-        .map(Path::to_path_buf)
+        .map(|ancestor| dunce::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf()))
+}
+
+async fn upsert_scratchpad_thread(
+    state_db: &codex_state::StateRuntime,
+    metadata: &codex_state::ThreadMetadata,
+    generate_memories: bool,
+) -> anyhow::Result<()> {
+    state_db.upsert_thread(metadata).await?;
+    let desired_memory_mode = if generate_memories {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    state_db
+        .set_thread_memory_mode(metadata.id, desired_memory_mode)
+        .await?;
+    Ok(())
+}
+
+fn scratchpad_logical_pad_name(path: &Path) -> String {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("scratchpad.md");
+
+    if file_name.starts_with("csp__") {
+        return file_name.to_string();
+    }
+    if let Some(index) = file_name.find("csp__") {
+        return file_name[index..].to_string();
+    }
+    if let Some((_, tail)) = file_name.rsplit_once("__") {
+        return tail.to_string();
+    }
+    file_name.to_string()
+}
+
+fn scratchpad_identity_key(repo_root: &Path, logical_pad_name: &str) -> String {
+    format!("{}::{logical_pad_name}", repo_root.display())
+}
+
+fn should_replace_scratchpad_candidate(
+    current: &ScratchpadCandidate,
+    candidate: &ScratchpadCandidate,
+) -> bool {
+    candidate.updated_at > current.updated_at
+        || (candidate.updated_at == current.updated_at
+            && scratchpad_candidate_rank(candidate.path.as_path())
+                > scratchpad_candidate_rank(current.path.as_path()))
+}
+
+fn scratchpad_candidate_rank(path: &Path) -> i32 {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "pads")
+    {
+        1
+    } else {
+        0
+    }
 }
 
 fn discover_scratchpad_candidates(
@@ -343,7 +404,7 @@ fn discover_scratchpad_candidates(
     let max_updated_at =
         now.saturating_sub(memories_config.min_rollout_idle_hours.saturating_mul(3_600));
 
-    let mut candidates = Vec::new();
+    let mut candidates_by_identity = HashMap::<String, ScratchpadCandidate>::new();
     for relative_dir in [
         Path::new("scratch").join("codex").join("pads"),
         Path::new("scratch").join("codex").join("backups"),
@@ -384,10 +445,26 @@ fn discover_scratchpad_candidates(
                 continue;
             }
 
-            candidates.push(ScratchpadCandidate { path, updated_at });
+            let logical_pad_name = scratchpad_logical_pad_name(&path);
+            let identity_key = scratchpad_identity_key(repo_root, &logical_pad_name);
+            let candidate = ScratchpadCandidate {
+                path,
+                updated_at,
+                logical_pad_name,
+            };
+            match candidates_by_identity.get_mut(&identity_key) {
+                Some(current) if should_replace_scratchpad_candidate(current, &candidate) => {
+                    *current = candidate;
+                }
+                Some(_) => {}
+                None => {
+                    candidates_by_identity.insert(identity_key, candidate);
+                }
+            }
         }
     }
 
+    let mut candidates = candidates_by_identity.into_values().collect::<Vec<_>>();
     candidates.sort_by(|a, b| {
         b.updated_at
             .cmp(&a.updated_at)
@@ -1093,13 +1170,24 @@ mod tests {
     use super::JobResult;
     use super::aggregate_stats;
     use super::build_scratchpad_rollout_summary;
+    use super::discover_scratchpad_candidates;
     use super::parse_scratchpad_document;
+    use super::scratchpad_logical_pad_name;
     use super::scratchpad_stage_one_output;
+    use super::upsert_scratchpad_thread;
+    use crate::config::types::MemoriesConfig;
+    use crate::config::types::MemoriesStageOneSource;
     use chrono::TimeZone;
     use chrono::Utc;
+    use codex_protocol::ThreadId;
+    use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::TokenUsage;
+    use codex_state::StateRuntime;
+    use codex_state::ThreadMetadataBuilder;
     use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     #[test]
     fn count_outcomes_sums_token_usage_across_all_jobs() {
@@ -1248,6 +1336,119 @@ mod tests {
             output
                 .raw_memory
                 .contains("CSP#2 -> ref:src/lib.rs:22 (touches)")
+        );
+    }
+
+    #[test]
+    fn scratchpad_logical_pad_name_uses_original_pad_name_for_backups() {
+        assert_eq!(
+            scratchpad_logical_pad_name(
+                PathBuf::from("csp__task__deadbeef__260101-000000Z.md").as_path()
+            ),
+            "csp__task__deadbeef__260101-000000Z.md"
+        );
+        assert_eq!(
+            scratchpad_logical_pad_name(
+                PathBuf::from(
+                    "20260306T010203Z__task-label__csp__task__deadbeef__260101-000000Z.md",
+                )
+                .as_path()
+            ),
+            "csp__task__deadbeef__260101-000000Z.md"
+        );
+    }
+
+    #[test]
+    fn discover_scratchpad_candidates_dedupes_pad_and_backup_versions() {
+        let temp = tempdir().expect("tempdir");
+        let repo_root = temp.path();
+        let pads_dir = repo_root.join("scratch/codex/pads");
+        let backups_dir = repo_root.join("scratch/codex/backups");
+        std::fs::create_dir_all(&pads_dir).expect("create pads dir");
+        std::fs::create_dir_all(&backups_dir).expect("create backups dir");
+
+        let pad_name = "csp__memory-sweep__deadbeef__260101-000000Z.md";
+        let pad_path = pads_dir.join(pad_name);
+        let backup_path = backups_dir.join(format!("20260306T010203Z__task__{pad_name}"));
+        let contents = "# Codex Scratchpad\n\
+task: memory-sweep\n\
+session_id: 019ca40f-d497-7783-9629-31903cea584e\n\
+created_at: 2026-02-28T12:03:50Z\n";
+        std::fs::write(&pad_path, contents).expect("write pad");
+        std::fs::write(&backup_path, contents).expect("write backup");
+
+        let memories_config = MemoriesConfig {
+            no_memories_if_mcp_or_web_search: false,
+            generate_memories: true,
+            use_memories: true,
+            max_raw_memories_for_consolidation: 16,
+            max_unused_days: 30,
+            max_rollout_age_days: 30,
+            max_rollouts_per_startup: 16,
+            min_rollout_idle_hours: 0,
+            extract_model: None,
+            consolidation_model: None,
+            stage_1_sources: vec![MemoriesStageOneSource::Scratchpad],
+        };
+
+        let candidates = discover_scratchpad_candidates(repo_root, &memories_config)
+            .expect("discover candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].logical_pad_name, pad_name);
+    }
+
+    #[tokio::test]
+    async fn upsert_scratchpad_thread_tracks_generate_memories_toggle() {
+        let codex_home = tempdir().expect("tempdir");
+        let runtime = StateRuntime::init(
+            codex_home.path().to_path_buf(),
+            "test-provider".to_string(),
+            None,
+        )
+        .await
+        .expect("initialize state runtime");
+        let thread_id =
+            ThreadId::from_string(&Uuid::new_v4().to_string()).expect("valid scratchpad thread id");
+        let timestamp = Utc
+            .timestamp_opt(1_701_000_000, 0)
+            .single()
+            .expect("timestamp");
+        let rollout_path = codex_home
+            .path()
+            .join("scratch/codex/pads/csp__memory-sweep__deadbeef__260101-000000Z.md");
+        let mut builder =
+            ThreadMetadataBuilder::new(thread_id, rollout_path, timestamp, SessionSource::Exec);
+        builder.updated_at = Some(timestamp);
+        builder.model_provider = Some("test-provider".to_string());
+        builder.cwd = codex_home.path().to_path_buf();
+        builder.cli_version = Some("test".to_string());
+        let mut metadata = builder.build("test-provider");
+        metadata.source = "scratchpad".to_string();
+        metadata.title = "scratchpad".to_string();
+        metadata.first_user_message = Some("scratchpad: scratchpad".to_string());
+
+        upsert_scratchpad_thread(&runtime, &metadata, false)
+            .await
+            .expect("upsert disabled scratchpad thread");
+        assert_eq!(
+            runtime
+                .get_thread_memory_mode(thread_id)
+                .await
+                .expect("read disabled mode")
+                .as_deref(),
+            Some("disabled")
+        );
+
+        upsert_scratchpad_thread(&runtime, &metadata, true)
+            .await
+            .expect("upsert enabled scratchpad thread");
+        assert_eq!(
+            runtime
+                .get_thread_memory_mode(thread_id)
+                .await
+                .expect("read enabled mode")
+                .as_deref(),
+            Some("enabled")
         );
     }
 }
