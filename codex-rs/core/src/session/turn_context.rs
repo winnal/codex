@@ -17,6 +17,7 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
+use codex_utils_output_truncation::TruncationPolicy;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 

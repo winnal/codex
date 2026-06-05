@@ -17,6 +17,7 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::ConfigRequirementsToml;
 use codex_config::config_toml::ConfigToml;
+use codex_config::config_toml::validate_prompt_retention_config;
 use codex_config::merge_toml_values;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigEdit;
@@ -128,6 +129,9 @@ impl ConfigManager {
         let effective_config_toml: ConfigToml = effective
             .try_into()
             .map_err(|err| ConfigManagerError::toml("invalid configuration", err))?;
+        validate_prompt_retention_config(&effective_config_toml).map_err(|message| {
+            ConfigManagerError::anyhow("invalid configuration", anyhow::anyhow!(message))
+        })?;
 
         let json_value = serde_json::to_value(&effective_config_toml)
             .map_err(|err| ConfigManagerError::json("failed to serialize configuration", err))?;
@@ -589,8 +593,12 @@ fn toml_value_to_value(value: &TomlValue) -> anyhow::Result<toml_edit::Value> {
     }
 }
 
-fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
-    let _: ConfigToml = value.clone().try_into()?;
+fn validate_config(value: &TomlValue) -> Result<(), String> {
+    let cfg: ConfigToml = value
+        .clone()
+        .try_into()
+        .map_err(|err: toml::de::Error| err.to_string())?;
+    validate_prompt_retention_config(&cfg)?;
     Ok(())
 }
 

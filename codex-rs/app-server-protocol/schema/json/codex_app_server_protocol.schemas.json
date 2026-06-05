@@ -7532,9 +7532,36 @@
               }
             ]
           },
+          "prompt_retention": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/PromptRetentionMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "review_model": {
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "rolling_context_reserve_percent": {
+            "format": "uint8",
+            "maximum": 90.0,
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "rolling_context_target_tokens": {
+            "format": "int64",
+            "minimum": 1.0,
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -7585,6 +7612,10 @@
             ]
           }
         },
+        "required": [
+          "rolling_context_reserve_percent",
+          "rolling_context_target_tokens"
+        ],
         "type": "object"
       },
       "ConfigBatchWriteParams": {
@@ -13436,6 +13467,25 @@
           "rows"
         ],
         "type": "object"
+      },
+      "PromptRetentionMode": {
+        "description": "Selects how Codex keeps the model prompt within the active context window.",
+        "oneOf": [
+          {
+            "description": "Preserve current behavior: automatically compact history into a summary.",
+            "enum": [
+              "compact"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Preserve the invariant prompt prefix and keep a rolling newest body suffix.",
+            "enum": [
+              "rolling"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "RateLimitReachedType": {
         "enum": [

@@ -32,6 +32,7 @@ use codex_config::config_toml::RealtimeAudioConfig;
 use codex_config::config_toml::RealtimeConfig;
 use codex_config::config_toml::ThreadStoreToml;
 use codex_config::config_toml::validate_model_providers;
+use codex_config::config_toml::validate_prompt_retention_config;
 use codex_config::loader::load_config_layers_state;
 use codex_config::loader::project_trust_key;
 use codex_config::permissions_toml::PermissionsToml;
@@ -83,6 +84,7 @@ use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::SandboxMode;
@@ -606,6 +608,16 @@ pub struct Config {
     /// Controls whether `model_auto_compact_token_limit` applies to the full
     /// active context or only tokens after the carried compaction-window prefix.
     pub model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope,
+
+    /// Prompt retention strategy. Defaults to current compact behavior.
+    pub prompt_retention: PromptRetentionMode,
+
+    /// Rolling-mode reserve as a percentage of the effective model context window.
+    pub rolling_context_reserve_percent: Option<u8>,
+
+    /// Rolling-mode absolute token target. When unset, rolling mode uses the
+    /// effective model context window minus the rolling reserve.
+    pub rolling_context_target_tokens: Option<i64>,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -3061,6 +3073,8 @@ impl Config {
             .clone()
             .filter(|value| !value.is_empty());
 
+        validate_prompt_retention_config(&cfg)
+            .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
         let model_providers =
             merge_configured_model_providers(built_in_model_providers(openai_base_url), cfg.model_providers)
                 .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))?;
@@ -3437,6 +3451,9 @@ impl Config {
             model_auto_compact_token_limit_scope: cfg
                 .model_auto_compact_token_limit_scope
                 .unwrap_or_default(),
+            prompt_retention: cfg.prompt_retention.unwrap_or_default(),
+            rolling_context_reserve_percent: cfg.rolling_context_reserve_percent,
+            rolling_context_target_tokens: cfg.rolling_context_target_tokens,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,

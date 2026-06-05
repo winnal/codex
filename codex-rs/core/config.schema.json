@@ -2288,6 +2288,25 @@
       },
       "type": "object"
     },
+    "PromptRetentionMode": {
+      "description": "Selects how Codex keeps the model prompt within the active context window.",
+      "oneOf": [
+        {
+          "description": "Preserve current behavior: automatically compact history into a summary.",
+          "enum": [
+            "compact"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Preserve the invariant prompt prefix and keep a rolling newest body suffix.",
+          "enum": [
+            "rolling"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "RawMcpServerConfig": {
       "additionalProperties": false,
       "description": "Raw MCP config shape used for deserialization and supported-field JSON Schema generation.\n\nFields that are accepted only to produce targeted validation errors should be skipped in the generated schema.\n\nKeep `TryFrom<RawMcpServerConfig> for McpServerConfig` exhaustively destructuring this struct so new TOML fields cannot be added here without updating the validation/mapping logic that produces [`McpServerConfig`].",
@@ -5096,6 +5115,14 @@
       },
       "type": "object"
     },
+    "prompt_retention": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/PromptRetentionMode"
+        }
+      ],
+      "description": "Prompt retention strategy. Defaults to current compact behavior."
+    },
     "realtime": {
       "allOf": [
         {
@@ -5108,6 +5135,19 @@
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
+    },
+    "rolling_context_reserve_percent": {
+      "description": "Rolling-mode reserve as a percentage of the effective model context window.",
+      "format": "uint8",
+      "maximum": 90.0,
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "rolling_context_target_tokens": {
+      "description": "Rolling-mode absolute token target. When unset, rolling mode uses the effective model context window minus the rolling reserve.",
+      "format": "int64",
+      "minimum": 1.0,
+      "type": "integer"
     },
     "sandbox_mode": {
       "allOf": [

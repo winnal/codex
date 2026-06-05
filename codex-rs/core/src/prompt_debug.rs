@@ -74,7 +74,8 @@ pub(crate) async fn build_prompt_input_from_session(
     input: Vec<UserInput>,
 ) -> CodexResult<Vec<ResponseItem>> {
     let turn_context = sess.new_default_turn().await;
-    sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+    let rolling_invariant_items = sess
+        .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
         .await;
 
     if !input.is_empty() {
@@ -84,12 +85,17 @@ pub(crate) async fn build_prompt_input_from_session(
             .await;
     }
 
-    let prompt_input = sess
-        .clone_history()
-        .await
-        .for_prompt(&turn_context.model_info.input_modalities);
     let router = built_tools(sess, turn_context.as_ref(), &CancellationToken::new()).await?;
     let base_instructions = sess.get_base_instructions().await;
+    let prompt_input = sess
+        .build_sampling_prompt_input(
+            turn_context.as_ref(),
+            &base_instructions,
+            &rolling_invariant_items,
+            None,
+        )
+        .await?
+        .into_input();
     let prompt = build_prompt(
         prompt_input,
         router.as_ref(),

@@ -25,6 +25,7 @@ use crate::context::AvailablePluginsInstructions;
 use crate::context::AvailableSkillsInstructions;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
+use crate::context::ExtensionContextualUserFragment;
 use crate::context::NetworkRuleSaved;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
@@ -82,6 +83,7 @@ use codex_protocol::approvals::NetworkPolicyRuleAction;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
@@ -141,7 +143,6 @@ use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
-use codex_utils_output_truncation::TruncationPolicy;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 use futures::prelude::*;
@@ -202,6 +203,7 @@ mod input_queue;
 mod mcp;
 mod multi_agents;
 mod review;
+mod rolling_prompt;
 mod rollout_reconstruction;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
@@ -215,6 +217,7 @@ use self::handlers::submission_loop;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
 use self::review::spawn_review_thread;
+pub(crate) use self::rolling_prompt::SamplingPromptInput;
 use self::session::AppServerClientMetadata;
 use self::session::Session;
 use self::session::SessionConfiguration;
@@ -2740,13 +2743,27 @@ impl Session {
         }
     }
 
+    pub(crate) async fn build_initial_context(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Vec<ResponseItem> {
+        self.build_initial_context_with_skill_side_effects(
+            turn_context,
+            SkillRenderSideEffects::ThreadStart {
+                session_telemetry: &self.services.session_telemetry,
+            },
+        )
+        .await
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "MCP app context rendering reads through the session-owned manager guard"
     )]
-    pub(crate) async fn build_initial_context(
+    async fn build_initial_context_with_skill_side_effects(
         &self,
         turn_context: &TurnContext,
+        skill_side_effects: SkillRenderSideEffects<'_>,
     ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
@@ -2850,17 +2867,19 @@ impl Session {
             }
         }
         if turn_context.config.include_skill_instructions {
+            let emit_skill_warning = matches!(
+                skill_side_effects,
+                SkillRenderSideEffects::ThreadStart { .. }
+            );
             let available_skills = build_available_skills(
                 &turn_context.turn_skills.outcome,
                 default_skill_metadata_budget(turn_context.model_info.context_window),
-                SkillRenderSideEffects::ThreadStart {
-                    session_telemetry: &self.services.session_telemetry,
-                },
+                skill_side_effects,
             );
             if let Some(available_skills) = available_skills {
                 let warning_message = available_skills.warning_message.clone();
                 let skills_instructions = AvailableSkillsInstructions::from(available_skills);
-                if let Some(warning_message) = warning_message {
+                if emit_skill_warning && let Some(warning_message) = warning_message {
                     self.send_event_raw(Event {
                         id: String::new(),
                         msg: EventMsg::Warning(WarningEvent {
@@ -2896,7 +2915,8 @@ impl Session {
                         developer_sections.push(fragment.text().to_string());
                     }
                     PromptSlot::ContextualUser => {
-                        contextual_user_sections.push(fragment.text().to_string());
+                        contextual_user_sections
+                            .push(ExtensionContextualUserFragment::new(fragment.text()).render());
                     }
                     PromptSlot::SeparateDeveloper => {
                         separate_developer_sections.push(fragment.text().to_string());
@@ -2931,24 +2951,28 @@ impl Session {
         let multi_agent_v2_usage_hint_text =
             multi_agents::usage_hint_text(turn_context, &session_source);
 
+        let build_developer_update_item = |sections| {
+            if turn_context.config.prompt_retention == PromptRetentionMode::Rolling {
+                crate::context_manager::updates::build_rolling_invariant_developer_update_item(
+                    sections,
+                )
+            } else {
+                crate::context_manager::updates::build_developer_update_item(sections)
+            }
+        };
+
         let mut items = Vec::with_capacity(4);
-        if let Some(developer_message) =
-            crate::context_manager::updates::build_developer_update_item(developer_sections)
-        {
+        if let Some(developer_message) = build_developer_update_item(developer_sections) {
             items.push(developer_message);
         }
         for section in separate_developer_sections {
-            if let Some(developer_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![section])
-            {
+            if let Some(developer_message) = build_developer_update_item(vec![section]) {
                 items.push(developer_message);
             }
         }
         if let Some(usage_hint_text) = multi_agent_v2_usage_hint_text
             && let Some(usage_hint_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    usage_hint_text.to_string(),
-                ])
+                build_developer_update_item(vec![usage_hint_text.to_string()])
         {
             items.push(usage_hint_message);
         }
@@ -2963,9 +2987,7 @@ impl Session {
             && let Some(developer_instructions) = turn_context.developer_instructions.as_deref()
             && !developer_instructions.is_empty()
             && let Some(guardian_developer_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    developer_instructions.to_string(),
-                ])
+                build_developer_update_item(vec![developer_instructions.to_string()])
         {
             items.push(guardian_developer_message);
         }
@@ -3006,7 +3028,7 @@ impl Session {
     pub(crate) async fn record_context_updates_and_set_reference_context_item(
         &self,
         turn_context: &TurnContext,
-    ) {
+    ) -> Vec<ResponseItem> {
         let reference_context_item = {
             let state = self.state.lock().await;
             state.reference_context_item()
@@ -3019,6 +3041,16 @@ impl Session {
             self.build_settings_update_items(reference_context_item.as_ref(), turn_context)
                 .await
         };
+        let rolling_invariant_items =
+            if turn_context.config.prompt_retention == PromptRetentionMode::Rolling {
+                if should_inject_full_context {
+                    context_items.clone()
+                } else {
+                    self.build_rolling_invariant_context(turn_context).await
+                }
+            } else {
+                Vec::new()
+            };
         let turn_context_item = turn_context.to_turn_context_item();
         if !context_items.is_empty() {
             self.record_conversation_items(turn_context, &context_items)
@@ -3033,6 +3065,7 @@ impl Session {
         // context items. This keeps later runtime diffing aligned with the current turn state.
         let mut state = self.state.lock().await;
         state.set_reference_context_item(Some(turn_context_item));
+        rolling_invariant_items
     }
 
     pub(crate) async fn update_token_usage_info(

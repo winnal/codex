@@ -14,12 +14,17 @@ use codex_protocol::models::is_image_close_tag_text;
 use codex_protocol::models::is_image_open_tag_text;
 use codex_protocol::models::is_local_image_close_tag_text;
 use codex_protocol::models::is_local_image_open_tag_text;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::REALTIME_CONVERSATION_OPEN_TAG;
+use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::context::ContextualUserFragment;
+use crate::context::RollingInvariantDeveloperContext;
 use crate::context::is_contextual_user_fragment;
 use crate::context::parse_visible_hook_prompt_message;
 use crate::web_search::web_search_action_detail;
@@ -27,6 +32,9 @@ use crate::web_search::web_search_action_detail;
 const CONTEXTUAL_DEVELOPER_PREFIXES: &[&str] = &[
     "<permissions instructions>",
     "<model_switch>",
+    APPS_INSTRUCTIONS_OPEN_TAG,
+    SKILLS_INSTRUCTIONS_OPEN_TAG,
+    PLUGINS_INSTRUCTIONS_OPEN_TAG,
     COLLABORATION_MODE_OPEN_TAG,
     REALTIME_CONVERSATION_OPEN_TAG,
     "<personality_spec>",
@@ -57,6 +65,9 @@ fn is_contextual_dev_fragment(content_item: &ContentItem) -> bool {
     let ContentItem::InputText { text } = content_item else {
         return false;
     };
+    if RollingInvariantDeveloperContext::matches_text(text) {
+        return true;
+    }
 
     let trimmed = text.trim_start();
     CONTEXTUAL_DEVELOPER_PREFIXES.iter().any(|prefix| {

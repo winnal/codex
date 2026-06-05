@@ -102,6 +102,7 @@ use codex_otel::THREAD_SKILLS_TRUNCATED_METRIC;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::config_types::Settings;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
@@ -184,7 +185,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration as StdDuration;
 
+mod extension_context_tests;
 mod guardian_tests;
+mod rolling_prompt_tests;
 
 struct InstructionsTestCase {
     slug: &'static str,
@@ -195,6 +198,17 @@ fn user_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
         role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+    }
+}
+
+fn developer_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
         content: vec![ContentItem::InputText {
             text: text.to_string(),
         }],

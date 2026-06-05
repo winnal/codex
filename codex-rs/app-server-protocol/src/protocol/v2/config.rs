@@ -6,6 +6,7 @@ use super::shared::default_enabled;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
@@ -13,6 +14,8 @@ use codex_protocol::config_types::WebSearchToolConfig;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
+use schemars::r#gen::SchemaGenerator;
+use schemars::schema::Schema;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -245,6 +248,11 @@ pub struct Config {
     pub model_context_window: Option<i64>,
     pub model_auto_compact_token_limit: Option<i64>,
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
+    pub prompt_retention: Option<PromptRetentionMode>,
+    #[schemars(schema_with = "optional_rolling_context_reserve_percent_schema")]
+    pub rolling_context_reserve_percent: Option<u8>,
+    #[schemars(schema_with = "optional_rolling_context_target_tokens_schema")]
+    pub rolling_context_target_tokens: Option<i64>,
     pub model_provider: Option<String>,
     #[experimental(nested)]
     pub approval_policy: Option<AskForApproval>,
@@ -272,6 +280,22 @@ pub struct Config {
     pub desktop: Option<HashMap<String, JsonValue>>,
     #[serde(default, flatten)]
     pub additional: HashMap<String, JsonValue>,
+}
+
+fn optional_rolling_context_reserve_percent_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<u8>::json_schema(generator);
+    if let Schema::Object(schema_object) = &mut schema {
+        schema_object.number().maximum = Some(90.0);
+    }
+    schema
+}
+
+fn optional_rolling_context_target_tokens_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<i64>::json_schema(generator);
+    if let Schema::Object(schema_object) = &mut schema {
+        schema_object.number().minimum = Some(1.0);
+    }
+    schema
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

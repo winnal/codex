@@ -7,12 +7,14 @@ use crate::context::PersonalitySpecInstructions;
 use crate::context::RealtimeEndInstructions;
 use crate::context::RealtimeStartInstructions;
 use crate::context::RealtimeStartWithInstructions;
+use crate::context::RollingInvariantDeveloperContext;
 use crate::session::PreviousTurnSettings;
 use crate::session::turn_context::TurnContext;
 use crate::shell::Shell;
 use codex_execpolicy::Policy;
 use codex_features::Feature;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
@@ -184,6 +186,25 @@ pub(crate) fn build_developer_update_item(text_sections: Vec<String>) -> Option<
     build_text_message("developer", text_sections)
 }
 
+pub(crate) fn build_rolling_invariant_developer_update_item(
+    mut text_sections: Vec<String>,
+) -> Option<ResponseItem> {
+    if text_sections.is_empty() {
+        return None;
+    }
+    text_sections.insert(0, RollingInvariantDeveloperContext.render());
+    build_developer_update_item(text_sections)
+}
+
+pub(crate) fn is_rolling_invariant_developer_content(content: &[ContentItem]) -> bool {
+    content.iter().any(|item| {
+        let ContentItem::InputText { text } = item else {
+            return false;
+        };
+        RollingInvariantDeveloperContext::matches_text(text)
+    })
+}
+
 pub(crate) fn build_contextual_user_message(text_sections: Vec<String>) -> Option<ResponseItem> {
     build_text_message("user", text_sections)
 }
@@ -233,7 +254,12 @@ pub(crate) fn build_settings_update_items(
     .collect();
 
     let mut items = Vec::with_capacity(2);
-    if let Some(developer_message) = build_developer_update_item(developer_update_sections) {
+    let developer_update_item = if next.config.prompt_retention == PromptRetentionMode::Rolling {
+        build_rolling_invariant_developer_update_item(developer_update_sections)
+    } else {
+        build_developer_update_item(developer_update_sections)
+    };
+    if let Some(developer_message) = developer_update_item {
         items.push(developer_message);
     }
     if let Some(contextual_user_message) = contextual_user_message {

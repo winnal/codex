@@ -135,6 +135,20 @@ impl ContextManager {
         self.history_version
     }
 
+    pub(crate) fn prompt_items_from_raw_items(
+        items: Vec<ResponseItem>,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItem> {
+        let mut history = Self {
+            items,
+            history_version: 0,
+            token_info: None,
+            reference_context_item: None,
+        };
+        history.normalize_history(input_modalities);
+        history.items
+    }
+
     // Estimate token usage using byte-based heuristics from the truncation helpers.
     // This is a coarse lower bound, not a tokenizer-accurate count.
     pub(crate) fn estimate_token_count(&self, turn_context: &TurnContext) -> Option<i64> {
@@ -156,7 +170,7 @@ impl ContextManager {
         let items_tokens = self
             .items
             .iter()
-            .map(estimate_item_token_count)
+            .map(estimate_response_item_token_count)
             .fold(0i64, i64::saturating_add);
 
         Some(base_tokens.saturating_add(items_tokens))
@@ -171,6 +185,7 @@ impl ContextManager {
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
             normalize::remove_corresponding_for(&mut self.items, &removed);
+            self.history_version = self.history_version.saturating_add(1);
         }
     }
 
@@ -284,7 +299,7 @@ impl ContextManager {
                     }
                 )
             })
-            .map(estimate_item_token_count)
+            .map(estimate_response_item_token_count)
             .fold(0i64, i64::saturating_add)
     }
 
@@ -310,7 +325,7 @@ impl ContextManager {
         let items_after_last_model_generated_tokens = self
             .items_after_last_model_generated_item()
             .iter()
-            .map(estimate_item_token_count)
+            .map(estimate_response_item_token_count)
             .fold(0i64, i64::saturating_add);
         if server_reasoning_included {
             last_tokens.saturating_add(items_after_last_model_generated_tokens)
@@ -339,7 +354,7 @@ impl ContextManager {
             estimated_tokens_of_items_added_since_last_successful_api_response:
                 items_after_last_model_generated
                     .iter()
-                    .map(estimate_item_token_count)
+                    .map(estimate_response_item_token_count)
                     .fold(0i64, i64::saturating_add),
             estimated_bytes_of_items_added_since_last_successful_api_response:
                 items_after_last_model_generated
@@ -505,7 +520,7 @@ fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
     encoded_len.saturating_mul(9).div_ceil(16)
 }
 
-fn estimate_item_token_count(item: &ResponseItem) -> i64 {
+pub(crate) fn estimate_response_item_token_count(item: &ResponseItem) -> i64 {
     let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
     approx_tokens_from_byte_count_i64(model_visible_bytes)
 }
@@ -533,7 +548,26 @@ static ORIGINAL_IMAGE_ESTIMATE_CACHE: LazyLock<BlockingLruCache<[u8; 20], Option
     });
 
 pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) -> i64 {
-    match item {
+    let raw = serde_json::to_string(item)
+        .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    let (image_payload_bytes, image_replacement_bytes) = image_data_url_estimate_adjustment(item);
+    let (encrypted_payload_bytes, encrypted_replacement_bytes) =
+        encrypted_function_output_estimate_adjustment(item);
+    let (encrypted_reasoning_payload_bytes, encrypted_reasoning_replacement_bytes) =
+        encrypted_reasoning_estimate_adjustment(item);
+    // Replace raw base64 payload bytes with model-visible estimates while
+    // preserving each item's JSON wrapper and non-encrypted summary/content.
+    raw.saturating_sub(image_payload_bytes)
+        .saturating_add(image_replacement_bytes)
+        .saturating_sub(encrypted_payload_bytes)
+        .saturating_add(encrypted_replacement_bytes)
+        .saturating_sub(encrypted_reasoning_payload_bytes)
+        .saturating_add(encrypted_reasoning_replacement_bytes)
+}
+
+fn encrypted_reasoning_estimate_adjustment(item: &ResponseItem) -> (i64, i64) {
+    let encrypted_content = match item {
         ResponseItem::Reasoning {
             encrypted_content: Some(content),
             ..
@@ -543,25 +577,13 @@ pub(crate) fn estimate_response_item_model_visible_bytes(item: &ResponseItem) ->
         }
         | ResponseItem::ContextCompaction {
             encrypted_content: Some(content),
-        } => i64::try_from(estimate_reasoning_length(content.len())).unwrap_or(i64::MAX),
-        item => {
-            let raw = serde_json::to_string(item)
-                .map(|serialized| i64::try_from(serialized.len()).unwrap_or(i64::MAX))
-                .unwrap_or_default();
-            let (image_payload_bytes, image_replacement_bytes) =
-                image_data_url_estimate_adjustment(item);
-            let (encrypted_payload_bytes, encrypted_replacement_bytes) =
-                encrypted_function_output_estimate_adjustment(item);
-            // Replace raw base64 payload bytes with a per-image estimate.
-            // We intentionally preserve the data URL prefix and JSON
-            // wrapper bytes already included in `raw`.
-            let raw = raw
-                .saturating_sub(image_payload_bytes)
-                .saturating_add(image_replacement_bytes);
-            raw.saturating_sub(encrypted_payload_bytes)
-                .saturating_add(encrypted_replacement_bytes)
-        }
-    }
+        } => content,
+        _ => return (0, 0),
+    };
+    (
+        i64::try_from(encrypted_content.len()).unwrap_or(i64::MAX),
+        i64::try_from(estimate_reasoning_length(encrypted_content.len())).unwrap_or(i64::MAX),
+    )
 }
 
 /// Returns the base64 payload byte length for inline image data URLs that are

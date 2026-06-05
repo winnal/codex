@@ -38,6 +38,7 @@ use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
@@ -154,6 +155,18 @@ pub struct ConfigToml {
     /// Controls whether the auto-compaction limit applies to the full context or
     /// only to tokens after the carried prefix in the current compaction window.
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
+
+    /// Prompt retention strategy. Defaults to current compact behavior.
+    pub prompt_retention: Option<PromptRetentionMode>,
+
+    /// Rolling-mode reserve as a percentage of the effective model context window.
+    #[schemars(range(min = 0, max = 90))]
+    pub rolling_context_reserve_percent: Option<u8>,
+
+    /// Rolling-mode absolute token target. When unset, rolling mode uses the
+    /// effective model context window minus the rolling reserve.
+    #[schemars(range(min = 1))]
+    pub rolling_context_target_tokens: Option<i64>,
 
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
@@ -914,6 +927,20 @@ pub fn validate_model_providers(
         provider
             .validate()
             .map_err(|message| format!("model_providers.{key}: {message}"))?;
+    }
+    Ok(())
+}
+
+pub fn validate_prompt_retention_config(cfg: &ConfigToml) -> Result<(), String> {
+    if let Some(reserve_percent) = cfg.rolling_context_reserve_percent
+        && reserve_percent > 90
+    {
+        return Err("rolling_context_reserve_percent must be at most 90".to_string());
+    }
+    if let Some(target_tokens) = cfg.rolling_context_target_tokens
+        && target_tokens < 1
+    {
+        return Err("rolling_context_target_tokens must be at least 1".to_string());
     }
     Ok(())
 }

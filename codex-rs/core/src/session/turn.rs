@@ -38,6 +38,7 @@ use crate::plugins::build_plugin_injections;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::PreviousTurnSettings;
+use crate::session::SamplingPromptInput;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -77,6 +78,7 @@ use codex_git_utils::get_git_repo_root;
 use codex_git_utils::get_git_repo_root_with_fs;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -118,6 +120,13 @@ use tracing::instrument;
 use tracing::trace;
 use tracing::trace_span;
 use tracing::warn;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingInputDrain {
+    None,
+    ToolContinuations,
+    All,
+}
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -164,7 +173,8 @@ pub(crate) async fn run_turn(
         return None;
     }
 
-    sess.record_context_updates_and_set_reference_context_item(turn_context.as_ref())
+    let rolling_invariant_items = sess
+        .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
         .await;
 
     let (injection_items, explicitly_enabled_connectors) =
@@ -173,7 +183,11 @@ pub(crate) async fn run_turn(
     if run_pending_session_start_hooks(&sess, &turn_context).await {
         return None;
     }
-    let mut can_drain_pending_input = input.is_empty();
+    let mut pending_input_drain = if input.is_empty() {
+        PendingInputDrain::All
+    } else {
+        PendingInputDrain::None
+    };
     if run_hooks_and_record_inputs(&sess, &turn_context, &input).await {
         return None;
     }
@@ -223,45 +237,60 @@ pub(crate) async fn run_turn(
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
-        let pending_input = if can_drain_pending_input {
-            sess.input_queue.get_pending_input(&sess.active_turn).await
-        } else {
-            Vec::new()
+        let pending_input = match pending_input_drain {
+            PendingInputDrain::None => Vec::new(),
+            PendingInputDrain::ToolContinuations => {
+                sess.input_queue
+                    .get_pending_tool_continuation_items(&sess.active_turn)
+                    .await
+            }
+            PendingInputDrain::All => sess.input_queue.get_pending_input(&sess.active_turn).await,
         };
 
         if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
             break;
         }
 
-        // Construct the input that we will send to the model.
-        let sampling_request_input: Vec<ResponseItem> = {
-            sess.clone_history()
-                .await
-                .for_prompt(&turn_context.model_info.input_modalities)
-        };
+        let base_instructions = sess.get_base_instructions().await;
+        let sampling_request_input = sess
+            .build_sampling_prompt_input(
+                turn_context.as_ref(),
+                &base_instructions,
+                &rolling_invariant_items,
+                /*rolling_target_scale_percent*/ None,
+            )
+            .await;
 
         let window_id = sess.services.model_client.current_window_id();
         let turn_metadata_header = turn_context
             .turn_metadata_state
             .current_header_value_for_model_request(&window_id);
-        match run_sampling_request(
-            Arc::clone(&sess),
-            Arc::clone(&turn_context),
-            Arc::clone(&turn_extension_data),
-            Arc::clone(&turn_diff_tracker),
-            &mut client_session,
-            turn_metadata_header.as_deref(),
-            sampling_request_input.clone(),
-            cancellation_token.child_token(),
-        )
-        .await
-        {
+        let (sampling_request_input, sampling_result) = match sampling_request_input {
+            Ok(sampling_request_input) => {
+                let sampling_result = run_sampling_request(
+                    Arc::clone(&sess),
+                    Arc::clone(&turn_context),
+                    Arc::clone(&turn_extension_data),
+                    Arc::clone(&turn_diff_tracker),
+                    &mut client_session,
+                    turn_metadata_header.as_deref(),
+                    sampling_request_input.clone(),
+                    base_instructions,
+                    rolling_invariant_items.clone(),
+                    cancellation_token.child_token(),
+                )
+                .await;
+                (sampling_request_input.into_input(), sampling_result)
+            }
+            Err(error) => (Vec::new(), Err(error)),
+        };
+        match sampling_result {
             Ok(sampling_request_output) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
-                can_drain_pending_input = true;
+                pending_input_drain = PendingInputDrain::All;
                 let has_pending_input = sess.input_queue.has_pending_input(&sess.active_turn).await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
                 let token_status =
@@ -290,7 +319,10 @@ pub(crate) async fn run_turn(
                 );
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
-                if token_limit_reached && needs_follow_up {
+                if token_limit_reached
+                    && needs_follow_up
+                    && turn_context.config.prompt_retention != PromptRetentionMode::Rolling
+                {
                     if let Err(err) = run_auto_compact(
                         &sess,
                         &turn_context,
@@ -317,7 +349,11 @@ pub(crate) async fn run_turn(
                         }
                         return None;
                     }
-                    can_drain_pending_input = !model_needs_follow_up;
+                    pending_input_drain = if model_needs_follow_up {
+                        PendingInputDrain::None
+                    } else {
+                        PendingInputDrain::All
+                    };
                     continue;
                 }
 
@@ -366,6 +402,14 @@ pub(crate) async fn run_turn(
                     }
                     break;
                 }
+                pending_input_drain = if turn_context.config.prompt_retention
+                    == PromptRetentionMode::Rolling
+                    && model_needs_follow_up
+                {
+                    PendingInputDrain::ToolContinuations
+                } else {
+                    PendingInputDrain::All
+                };
                 continue;
             }
             Err(CodexErr::TurnAborted) => {
@@ -786,6 +830,9 @@ async fn run_pre_sampling_compact(
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
 ) -> CodexResult<()> {
+    if turn_context.config.prompt_retention == PromptRetentionMode::Rolling {
+        return Ok(());
+    }
     maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?;
     let token_status = auto_compact_token_status(sess.as_ref(), turn_context.as_ref()).await;
     // Compact if the configured auto-compaction budget or usable context window is exhausted.
@@ -1003,12 +1050,12 @@ async fn run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
     turn_metadata_header: Option<&str>,
-    input: Vec<ResponseItem>,
+    input: SamplingPromptInput,
+    base_instructions: BaseInstructions,
+    rolling_invariant_items: Vec<ResponseItem>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     let router = built_tools(sess.as_ref(), turn_context.as_ref(), &cancellation_token).await?;
-
-    let base_instructions = sess.get_base_instructions().await;
 
     let tool_runtime = ToolCallRuntime::new(
         Arc::clone(&router),
@@ -1025,16 +1072,22 @@ async fn run_sampling_request(
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut initial_input = Some(input);
+    let mut rolling_context_window_retries = 0u8;
+    let mut rolling_target_scale_percent = None;
     loop {
-        let prompt_input = if let Some(input) = initial_input.take() {
+        let mut sampling_prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
-            sess.clone_history()
-                .await
-                .for_prompt(&turn_context.model_info.input_modalities)
+            sess.build_sampling_prompt_input(
+                turn_context.as_ref(),
+                &base_instructions,
+                &rolling_invariant_items,
+                rolling_target_scale_percent,
+            )
+            .await?
         };
         let prompt = build_prompt(
-            prompt_input,
+            std::mem::take(&mut sampling_prompt_input.input),
             router.as_ref(),
             turn_context.as_ref(),
             base_instructions.clone(),
@@ -1053,10 +1106,25 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
+                sess.commit_sampling_prompt_input(&sampling_prompt_input)
+                    .await;
                 return Ok(output);
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
+                if turn_context.config.prompt_retention == PromptRetentionMode::Rolling
+                    && rolling_context_window_retries < 1
+                {
+                    rolling_context_window_retries =
+                        rolling_context_window_retries.saturating_add(1);
+                    rolling_target_scale_percent = Some(
+                        rolling_target_scale_percent
+                            .map_or(90, |percent: u8| percent.saturating_mul(90) / 100)
+                            .max(1),
+                    );
+                    initial_input = None;
+                    continue;
+                }
                 return Err(CodexErr::ContextWindowExceeded);
             }
             Err(CodexErr::UsageLimitReached(e)) => {

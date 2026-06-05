@@ -205,6 +205,34 @@ impl InputQueue {
 
     #[expect(
         clippy::await_holding_invalid_type,
+        reason = "active turn checks and turn state updates must remain atomic"
+    )]
+    pub(crate) async fn get_pending_tool_continuation_items(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+    ) -> Vec<TurnInput> {
+        let mut active = active_turn.lock().await;
+        let Some(active_turn) = active.as_mut() else {
+            return Vec::new();
+        };
+        let mut turn_state = active_turn.turn_state.lock().await;
+        let pending_input = std::mem::take(&mut turn_state.pending_input.items);
+        let (tool_continuations, retained_input) = pending_input.into_iter().partition(|item| {
+            matches!(
+                item,
+                TurnInput::ResponseItem(
+                    ResponseItem::FunctionCallOutput { .. }
+                        | ResponseItem::CustomToolCallOutput { .. }
+                        | ResponseItem::ToolSearchOutput { .. }
+                )
+            )
+        });
+        turn_state.pending_input.items = retained_input;
+        tool_continuations
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state reads must remain atomic"
     )]
     pub(crate) async fn has_pending_input(&self, active_turn: &Mutex<Option<ActiveTurn>>) -> bool {
@@ -232,106 +260,5 @@ impl InputQueue {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_protocol::AgentPath;
-    use pretty_assertions::assert_eq;
-
-    fn make_mail(
-        author: AgentPath,
-        recipient: AgentPath,
-        content: &str,
-        trigger_turn: bool,
-    ) -> InterAgentCommunication {
-        InterAgentCommunication::new(
-            author,
-            recipient,
-            Vec::new(),
-            content.to_string(),
-            trigger_turn,
-        )
-    }
-
-    #[tokio::test]
-    async fn input_queue_notifies_mailbox_subscribers() {
-        let input_queue = InputQueue::new();
-        let mut mailbox_rx = input_queue.subscribe_mailbox().await;
-
-        input_queue
-            .enqueue_mailbox_communication(make_mail(
-                AgentPath::root(),
-                AgentPath::try_from("/root/worker").expect("agent path"),
-                "one",
-                /*trigger_turn*/ false,
-            ))
-            .await;
-        input_queue
-            .enqueue_mailbox_communication(make_mail(
-                AgentPath::root(),
-                AgentPath::try_from("/root/worker").expect("agent path"),
-                "two",
-                /*trigger_turn*/ false,
-            ))
-            .await;
-
-        mailbox_rx.changed().await.expect("mailbox update");
-    }
-
-    #[tokio::test]
-    async fn input_queue_drains_mailbox_in_delivery_order() {
-        let input_queue = InputQueue::new();
-        let mail_one = make_mail(
-            AgentPath::root(),
-            AgentPath::try_from("/root/worker").expect("agent path"),
-            "one",
-            /*trigger_turn*/ false,
-        );
-        let mail_two = make_mail(
-            AgentPath::try_from("/root/worker").expect("agent path"),
-            AgentPath::root(),
-            "two",
-            /*trigger_turn*/ false,
-        );
-
-        input_queue
-            .enqueue_mailbox_communication(mail_one.clone())
-            .await;
-        input_queue
-            .enqueue_mailbox_communication(mail_two.clone())
-            .await;
-
-        assert_eq!(
-            input_queue.drain_mailbox_input_items().await,
-            vec![
-                ResponseItem::from(mail_one.to_response_input_item()),
-                ResponseItem::from(mail_two.to_response_input_item())
-            ]
-        );
-        assert!(!input_queue.has_pending_mailbox_items().await);
-    }
-
-    #[tokio::test]
-    async fn input_queue_tracks_pending_trigger_turn_mail() {
-        let input_queue = InputQueue::new();
-
-        input_queue
-            .enqueue_mailbox_communication(make_mail(
-                AgentPath::root(),
-                AgentPath::try_from("/root/worker").expect("agent path"),
-                "queued",
-                /*trigger_turn*/ false,
-            ))
-            .await;
-        assert!(!input_queue.has_trigger_turn_mailbox_items().await);
-
-        input_queue
-            .enqueue_mailbox_communication(make_mail(
-                AgentPath::root(),
-                AgentPath::try_from("/root/worker").expect("agent path"),
-                "wake",
-                /*trigger_turn*/ true,
-            ))
-            .await;
-        assert!(input_queue.has_trigger_turn_mailbox_items().await);
-    }
-}
+#[path = "input_queue_tests.rs"]
+mod tests;

@@ -244,17 +244,26 @@ fn non_last_reasoning_tokens_return_zero_when_no_user_messages() {
 
 #[test]
 fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
+    let first = reasoning_with_encrypted_content(/*len*/ 900);
+    let second = reasoning_with_encrypted_content(/*len*/ 1_000);
+    let after_last_user = reasoning_with_encrypted_content(/*len*/ 2_000);
     let history = create_history_with_items(vec![
-        reasoning_with_encrypted_content(/*len*/ 900),
+        first.clone(),
         user_msg("first"),
-        reasoning_with_encrypted_content(/*len*/ 1_000),
+        second.clone(),
         user_msg("second"),
-        reasoning_with_encrypted_content(/*len*/ 2_000),
+        after_last_user.clone(),
     ]);
-    // first: (900 * 0.75 - 650) / 4 = 6.25 tokens
-    // second: (1000 * 0.75 - 650) / 4 = 25 tokens
-    // first + second = 62.5
-    assert_eq!(history.get_non_last_reasoning_items_tokens(), 32);
+    let expected = estimate_response_item_token_count(&first)
+        .saturating_add(estimate_response_item_token_count(&second));
+    let incorrectly_included =
+        expected.saturating_add(estimate_response_item_token_count(&after_last_user));
+
+    assert_eq!(history.get_non_last_reasoning_items_tokens(), expected);
+    assert_ne!(
+        history.get_non_last_reasoning_items_tokens(),
+        incorrectly_included
+    );
 }
 
 #[test]
@@ -264,15 +273,16 @@ fn items_after_last_model_generated_tokens_include_user_and_tool_output() {
         user_msg("new user message"),
         custom_tool_call_output("call-tail", "new tool output"),
     ]);
-    let expected_tokens = estimate_item_token_count(&user_msg("new user message")).saturating_add(
-        estimate_item_token_count(&custom_tool_call_output("call-tail", "new tool output")),
-    );
+    let expected_tokens = estimate_response_item_token_count(&user_msg("new user message"))
+        .saturating_add(estimate_response_item_token_count(
+            &custom_tool_call_output("call-tail", "new tool output"),
+        ));
 
     assert_eq!(
         history
             .items_after_last_model_generated_item()
             .iter()
-            .map(estimate_item_token_count)
+            .map(estimate_response_item_token_count)
             .fold(0i64, i64::saturating_add),
         expected_tokens
     );
@@ -286,7 +296,7 @@ fn items_after_last_model_generated_tokens_are_zero_without_model_generated_item
         history
             .items_after_last_model_generated_item()
             .iter()
-            .map(estimate_item_token_count)
+            .map(estimate_response_item_token_count)
             .fold(0i64, i64::saturating_add),
         0
     );
@@ -354,8 +364,8 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
 
     assert_eq!(
         history.get_total_token_usage(/*server_reasoning_included*/ true),
-        100 + estimate_item_token_count(&added_user)
-            + estimate_item_token_count(&added_tool_output)
+        100 + estimate_response_item_token_count(&added_user)
+            + estimate_response_item_token_count(&added_tool_output)
     );
 }
 
@@ -1752,6 +1762,30 @@ fn encrypted_function_output_uses_plaintext_byte_estimate() {
         + estimate_encrypted_function_output_length(encrypted_content.len()) as i64;
 
     assert_eq!(estimated, expected);
+}
+
+#[test]
+fn encrypted_reasoning_estimate_preserves_summary_overhead() {
+    let encrypted_content = "A".repeat(1_868);
+    let item = ResponseItem::Reasoning {
+        id: String::new(),
+        summary: vec![ReasoningItemReasoningSummary::SummaryText {
+            text: "SUMMARY_SENTINEL ".repeat(12_000),
+        }],
+        content: None,
+        encrypted_content: Some(encrypted_content.clone()),
+    };
+
+    let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
+    let estimated = estimate_response_item_model_visible_bytes(&item);
+    let expected = raw_len - encrypted_content.len() as i64
+        + estimate_reasoning_length(encrypted_content.len()) as i64;
+
+    assert_eq!(estimated, expected);
+    assert!(
+        estimated > estimate_reasoning_length(encrypted_content.len()) as i64,
+        "reasoning estimate must include serialized summary overhead"
+    );
 }
 
 #[test]

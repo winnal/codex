@@ -236,6 +236,55 @@ async fn batch_write_rejects_legacy_profile_selector() -> Result<()> {
 }
 
 #[tokio::test]
+async fn batch_write_rejects_invalid_prompt_retention_fields() -> Result<()> {
+    let tmp = tempdir().expect("tempdir");
+    let path = tmp.path().join(CONFIG_TOML_FILE);
+    let service = ConfigManager::without_managed_config_for_tests(tmp.path().to_path_buf());
+
+    for (key_path, value, expected_message) in [
+        (
+            "rolling_context_reserve_percent",
+            serde_json::json!(91),
+            "rolling_context_reserve_percent must be at most 90",
+        ),
+        (
+            "rolling_context_target_tokens",
+            serde_json::json!(0),
+            "rolling_context_target_tokens must be at least 1",
+        ),
+        (
+            "prompt_retention",
+            serde_json::json!("sideways"),
+            "unknown variant `sideways`",
+        ),
+    ] {
+        std::fs::write(&path, "")?;
+        let error = service
+            .batch_write(ConfigBatchWriteParams {
+                edits: vec![codex_app_server_protocol::ConfigEdit {
+                    key_path: key_path.to_string(),
+                    value,
+                    merge_strategy: MergeStrategy::Replace,
+                }],
+                file_path: Some(path.display().to_string()),
+                expected_version: None,
+                reload_user_config: false,
+            })
+            .await
+            .expect_err("invalid rolling config write should fail");
+
+        assert_eq!(
+            error.write_error_code(),
+            Some(ConfigWriteErrorCode::ConfigValidationError)
+        );
+        assert!(error.to_string().contains(expected_message), "{error}");
+        assert_eq!(std::fs::read_to_string(&path)?, "");
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn write_value_supports_nested_app_paths() -> Result<()> {
     let tmp = tempdir().expect("tempdir");
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;

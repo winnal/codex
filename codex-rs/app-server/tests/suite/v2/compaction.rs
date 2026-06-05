@@ -248,6 +248,80 @@ async fn auto_compaction_remote_emits_started_and_completed_items() -> Result<()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_server_thread_rolling_mode_skips_auto_compaction() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let sse1 = responses::sse(vec![
+        responses::ev_assistant_message("m1", "FIRST_REPLY"),
+        responses::ev_completed_with_tokens("r1", /*total_tokens*/ 70_000),
+    ]);
+    let sse2 = responses::sse(vec![
+        responses::ev_assistant_message("m2", "SECOND_REPLY"),
+        responses::ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
+    ]);
+    let sse3 = responses::sse(vec![
+        responses::ev_assistant_message("m3", "FINAL_REPLY"),
+        responses::ev_completed_with_tokens("r3", /*total_tokens*/ 120),
+    ]);
+    let responses_log = responses::mount_sse_sequence(&server, vec![sse1, sse2, sse3]).await;
+    let compact_mock =
+        responses::mount_compact_json_once(&server, serde_json::json!({ "output": [] })).await;
+
+    let codex_home = TempDir::new()?;
+    write_mock_responses_config_toml(
+        codex_home.path(),
+        &server.uri(),
+        &BTreeMap::default(),
+        AUTO_COMPACT_LIMIT,
+        /*requires_openai_auth*/ None,
+        "mock_provider",
+        COMPACT_PROMPT,
+    )?;
+    let config_path = codex_home.path().join("config.toml");
+    let config_toml = std::fs::read_to_string(&config_path)?;
+    let config_toml = format!(
+        r#"
+prompt_retention = "rolling"
+rolling_context_reserve_percent = 0
+rolling_context_target_tokens = 50000
+
+{config_toml}"#
+    );
+    std::fs::write(config_path, config_toml)?;
+
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_id = start_thread(&mut mcp).await?;
+    for message in ["first", "second", "third"] {
+        send_turn_and_wait(&mut mcp, &thread_id, message).await?;
+    }
+
+    assert!(
+        compact_mock.requests().is_empty(),
+        "rolling app-server threads must not call summary compaction"
+    );
+
+    let response_requests = responses_log.requests();
+    assert_eq!(response_requests.len(), 3);
+    for request in response_requests {
+        let metadata = request
+            .header("x-codex-turn-metadata")
+            .as_deref()
+            .map(parse_json_header)
+            .unwrap_or_else(|| panic!("turn request should include turn metadata"));
+        assert_eq!(metadata["request_kind"].as_str(), Some("turn"));
+        assert!(
+            metadata.get("compaction").is_none(),
+            "rolling app-server turns must not carry compaction metadata"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_compact_start_triggers_compaction_and_returns_empty_response() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

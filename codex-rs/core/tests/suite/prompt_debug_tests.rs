@@ -3,6 +3,7 @@ use codex_core::LoadedAgentsMd;
 use codex_core::build_prompt_input;
 use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
@@ -58,6 +59,42 @@ async fn build_prompt_input_includes_context_and_user_message() -> Result<()> {
             text.contains("Project-specific test instructions")
         })
     }));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn build_prompt_input_uses_rolling_retention_mode() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let cwd = TempDir::new()?;
+    let mut config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(cwd.path().to_path_buf()),
+            codex_self_exe: Some(std::env::current_exe()?),
+            ..ConfigOverrides::default()
+        })
+        .build()
+        .await?;
+    config.prompt_retention = PromptRetentionMode::Rolling;
+    config.rolling_context_reserve_percent = Some(0);
+    config.rolling_context_target_tokens = Some(1);
+
+    let err = build_prompt_input(
+        config,
+        vec![UserInput::Text {
+            text: "hello from debug prompt".to_string(),
+            text_elements: Vec::new(),
+        }],
+        /*state_db*/ None,
+    )
+    .await
+    .expect_err("rolling debug prompt should honor the tiny rolling target");
+
+    assert!(
+        err.to_string().contains("model's context window"),
+        "unexpected error: {err:#}"
+    );
 
     Ok(())
 }

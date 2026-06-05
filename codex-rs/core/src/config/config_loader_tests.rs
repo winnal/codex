@@ -29,6 +29,7 @@ use codex_config::loader::load_config_layers_state;
 use codex_config::loader::load_requirements_toml;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_exec_server::LOCAL_FS;
+use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
@@ -149,6 +150,121 @@ async fn cli_overrides_resolve_relative_paths_against_cwd() -> std::io::Result<(
 
     let expected = AbsolutePathBuf::resolve_path_against_base("run-logs", cwd_path);
     assert_eq!(config.log_dir, expected.to_path_buf());
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompt_retention_defaults_to_compact_without_budget_overrides() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().join("home");
+    let cwd = tmp.path().join("work");
+    tokio::fs::create_dir_all(&codex_home).await?;
+    tokio::fs::create_dir_all(&cwd).await?;
+    tokio::fs::write(codex_home.join(CONFIG_TOML_FILE), "").await?;
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home)
+        .fallback_cwd(Some(cwd))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .build()
+        .await?;
+
+    assert_eq!(config.prompt_retention, PromptRetentionMode::Compact);
+    assert_eq!(config.rolling_context_reserve_percent, None);
+    assert_eq!(config.rolling_context_target_tokens, None);
+    assert_eq!(config.model_context_window, None);
+    assert_eq!(config.model_auto_compact_token_limit, None);
+    assert_eq!(config.tool_output_token_limit, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompt_retention_config_resolves_rolling_fields() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().join("home");
+    let cwd = tmp.path().join("work");
+    tokio::fs::create_dir_all(&codex_home).await?;
+    tokio::fs::create_dir_all(&cwd).await?;
+    tokio::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        r#"
+	prompt_retention = "rolling"
+	rolling_context_reserve_percent = 15
+	rolling_context_target_tokens = 12345
+	"#,
+    )
+    .await?;
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home)
+        .fallback_cwd(Some(cwd))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .build()
+        .await?;
+
+    assert_eq!(config.prompt_retention, PromptRetentionMode::Rolling);
+    assert_eq!(config.rolling_context_reserve_percent, Some(15));
+    assert_eq!(config.rolling_context_target_tokens, Some(12_345));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rolling_context_reserve_percent_rejects_values_above_90() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().join("home");
+    let cwd = tmp.path().join("work");
+    tokio::fs::create_dir_all(&codex_home).await?;
+    tokio::fs::create_dir_all(&cwd).await?;
+    tokio::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        "rolling_context_reserve_percent = 91\n",
+    )
+    .await?;
+
+    let err = ConfigBuilder::default()
+        .codex_home(codex_home)
+        .fallback_cwd(Some(cwd))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .build()
+        .await
+        .expect_err("reserve above 90 should be rejected");
+
+    assert_eq!(
+        err.to_string(),
+        "rolling_context_reserve_percent must be at most 90"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn rolling_context_target_tokens_rejects_non_positive_values() -> anyhow::Result<()> {
+    let tmp = tempdir()?;
+    let codex_home = tmp.path().join("home");
+    let cwd = tmp.path().join("work");
+    tokio::fs::create_dir_all(&codex_home).await?;
+    tokio::fs::create_dir_all(&cwd).await?;
+    tokio::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        "rolling_context_target_tokens = 0\n",
+    )
+    .await?;
+
+    let err = ConfigBuilder::default()
+        .codex_home(codex_home)
+        .fallback_cwd(Some(cwd))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .build()
+        .await
+        .expect_err("non-positive target should be rejected");
+
+    assert_eq!(
+        err.to_string(),
+        "rolling_context_target_tokens must be at least 1"
+    );
+
     Ok(())
 }
 

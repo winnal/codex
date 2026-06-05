@@ -36,6 +36,20 @@ pub enum AutoCompactTokenLimitScope {
     BodyAfterPrefix,
 }
 
+/// Selects how Codex keeps the model prompt within the active context window.
+#[derive(
+    Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PromptRetentionMode {
+    /// Preserve current behavior: automatically compact history into a summary.
+    #[default]
+    Compact,
+    /// Preserve the invariant prompt prefix and keep a rolling newest body suffix.
+    Rolling,
+}
+
 /// A summary of the reasoning performed by the model. This can be useful for
 /// debugging and understanding the model's reasoning process.
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries
