@@ -102,7 +102,7 @@ async fn input_queue_tracks_pending_trigger_turn_mail() {
 }
 
 #[tokio::test]
-async fn input_queue_drains_tool_continuations_without_draining_user_context_or_mailbox_input() {
+async fn input_queue_drains_model_follow_up_with_tool_continuations_first() {
     let input_queue = InputQueue::new();
     let active_turn = Mutex::new(Some(ActiveTurn::default()));
     let turn_state = {
@@ -149,18 +149,10 @@ async fn input_queue_drains_tool_continuations_without_draining_user_context_or_
         .await;
 
     assert_eq!(
-        vec![tool_output],
+        vec![tool_output, user_input, context_input],
         input_queue
-            .get_pending_tool_continuation_items(&active_turn)
+            .get_pending_input_for_model_follow_up(&active_turn)
             .await
     );
     assert!(input_queue.has_pending_mailbox_items().await);
-    assert_eq!(
-        vec![
-            user_input,
-            context_input,
-            TurnInput::ResponseItem(ResponseItem::from(mailbox.to_response_input_item())),
-        ],
-        input_queue.get_pending_input(&active_turn).await
-    );
 }

@@ -124,7 +124,7 @@ use tracing::warn;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PendingInputDrain {
     None,
-    ToolContinuations,
+    ToolContinuationsFirst,
     All,
 }
 
@@ -239,9 +239,9 @@ pub(crate) async fn run_turn(
         // may support this, the model might not.
         let pending_input = match pending_input_drain {
             PendingInputDrain::None => Vec::new(),
-            PendingInputDrain::ToolContinuations => {
+            PendingInputDrain::ToolContinuationsFirst => {
                 sess.input_queue
-                    .get_pending_tool_continuation_items(&sess.active_turn)
+                    .get_pending_input_for_model_follow_up(&sess.active_turn)
                     .await
             }
             PendingInputDrain::All => sess.input_queue.get_pending_input(&sess.active_turn).await,
@@ -288,9 +288,16 @@ pub(crate) async fn run_turn(
             Ok(sampling_request_output) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
+                    pending_input_drain: model_follow_up_pending_input_drain,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
-                pending_input_drain = PendingInputDrain::All;
+                pending_input_drain = if model_needs_follow_up
+                    && turn_context.config.prompt_retention == PromptRetentionMode::Rolling
+                {
+                    model_follow_up_pending_input_drain
+                } else {
+                    PendingInputDrain::All
+                };
                 let has_pending_input = sess.input_queue.has_pending_input(&sess.active_turn).await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
                 let token_status =
@@ -402,14 +409,6 @@ pub(crate) async fn run_turn(
                     }
                     break;
                 }
-                pending_input_drain = if turn_context.config.prompt_retention
-                    == PromptRetentionMode::Rolling
-                    && model_needs_follow_up
-                {
-                    PendingInputDrain::ToolContinuations
-                } else {
-                    PendingInputDrain::All
-                };
                 continue;
             }
             Err(CodexErr::TurnAborted) => {
@@ -1270,6 +1269,7 @@ pub(crate) async fn built_tools(
 #[derive(Debug)]
 struct SamplingRequestResult {
     needs_follow_up: bool,
+    pending_input_drain: PendingInputDrain,
     last_agent_message: Option<String>,
 }
 
@@ -1880,6 +1880,7 @@ async fn try_run_sampling_request(
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
+    let mut pending_input_drain = PendingInputDrain::All;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
     let mut active_tool_argument_diff_consumer: Option<(
@@ -2023,11 +2024,15 @@ async fn try_run_sampling_request(
                 if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
                 }
-                needs_follow_up |= output_result.needs_follow_up;
+                if output_result.needs_follow_up {
+                    needs_follow_up = true;
+                    pending_input_drain = PendingInputDrain::ToolContinuationsFirst;
+                }
                 // todo: remove before stabilizing multi-agent v2
                 if preempt_for_mailbox_mail && sess.input_queue.has_pending_mailbox_items().await {
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
+                        pending_input_drain: PendingInputDrain::All,
                         last_agent_message,
                     });
                 }
@@ -2161,9 +2166,11 @@ async fn try_run_sampling_request(
                 should_emit_turn_diff = true;
                 if let Some(false) = end_turn {
                     needs_follow_up = true;
+                    pending_input_drain = PendingInputDrain::ToolContinuationsFirst;
                 }
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
+                    pending_input_drain,
                     last_agent_message,
                 });
             }

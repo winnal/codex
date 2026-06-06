@@ -261,6 +261,74 @@ fn rolling_prompt_keeps_adjacent_tool_call_and_output_atomic() {
 }
 
 #[test]
+fn rolling_prompt_keeps_tool_followup_and_queued_user_input_atomic() {
+    let history = history(vec![
+        user_msg(&"old ".repeat(200)),
+        function_call("call-1"),
+        function_output("call-1", "ok"),
+        user_msg("queued steer"),
+    ]);
+    let state = RollingPromptState::default();
+
+    let result = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(120),
+            reserve_percent: Some(10),
+            target_tokens: None,
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+        },
+    )
+    .expect("tool follow-up and queued input frontier should fit");
+
+    assert_eq!(
+        result.prompt_input,
+        vec![
+            function_call("call-1"),
+            function_output("call-1", "ok"),
+            user_msg("queued steer"),
+        ]
+    );
+}
+
+#[test]
+fn rolling_prompt_does_not_detach_later_queued_input_from_tool_followup_under_pressure() {
+    let history = history(vec![
+        function_call("call-1"),
+        function_output("call-1", "ok"),
+        user_msg(&"queued-one ".repeat(400)),
+        user_msg("queued two"),
+    ]);
+    let state = RollingPromptState::default();
+
+    let error = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(120),
+            reserve_percent: Some(0),
+            target_tokens: Some(30),
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+        },
+    )
+    .expect_err("rolling prompt should not detach later queued input from its tool follow-up");
+
+    assert!(matches!(
+        error,
+        RollingPromptError::FrontierExceedsBudget { .. }
+    ));
+}
+
+#[test]
 fn rolling_prompt_keeps_non_adjacent_parallel_tool_calls_atomic() {
     let history = history(vec![
         user_msg(&"old ".repeat(200)),

@@ -181,8 +181,7 @@ async fn rolling_mode_followup_projects_default_tool_output_limit_to_item_cap() 
 
 #[cfg_attr(windows, ignore = "uses POSIX sleep command")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rolling_mode_defers_queued_user_input_and_context_until_tool_followup_preserves_output()
--> Result<()> {
+async fn rolling_mode_drains_queued_user_input_and_context_with_tool_followup() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -207,10 +206,6 @@ async fn rolling_mode_defers_queued_user_input_and_context_until_tool_followup_p
                 responses::ev_assistant_message("msg-2", "rolling tool continuation done"),
                 responses::ev_completed("resp-2"),
             ]),
-            sse(vec![
-                responses::ev_assistant_message("msg-3", "rolling queued prompt done"),
-                responses::ev_completed("resp-3"),
-            ]),
         ],
     )
     .await;
@@ -221,7 +216,7 @@ async fn rolling_mode_defers_queued_user_input_and_context_until_tool_followup_p
             config.base_instructions = Some("base".to_string());
             config.prompt_retention = PromptRetentionMode::Rolling;
             config.rolling_context_reserve_percent = Some(0);
-            config.rolling_context_target_tokens = Some(12_000);
+            config.rolling_context_target_tokens = Some(50_000);
             config.model_auto_compact_token_limit = Some(1);
             config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::Total;
             config.tool_output_token_limit = Some(20_000);
@@ -293,30 +288,27 @@ async fn rolling_mode_defers_queued_user_input_and_context_until_tool_followup_p
     wait_for_turn_complete(&test.codex, &first_turn_id).await?;
 
     let captured = requests.requests();
-    assert_eq!(captured.len(), 3);
+    assert_eq!(captured.len(), 2);
     let tool_follow_up = &captured[1];
     let output = tool_follow_up
         .function_call_output_text(call_id)
-        .context("tool continuation should include the shell output before queued input")?;
+        .context("tool follow-up should include the shell output")?;
     assert!(
         output.contains("ROLLCTX_PENDING_TOOL_OUTPUT"),
-        "tool continuation should preserve the projected shell output"
+        "tool follow-up should preserve the projected shell output"
+    );
+    let follow_up_user_texts = tool_follow_up.message_input_texts("user");
+    assert!(
+        follow_up_user_texts
+            .iter()
+            .any(|text| text.contains("ROLLCTX_QUEUED_USER_PROMPT")),
+        "rolling tool follow-up should include queued user input: {follow_up_user_texts:?}"
     );
     assert!(
-        !tool_follow_up.body_contains_text("ROLLCTX_QUEUED_USER_PROMPT"),
-        "rolling tool continuation should not drain newer user input first"
-    );
-    assert!(
-        !tool_follow_up.body_contains_text("ROLLCTX_QUEUED_ADDITIONAL_CONTEXT"),
-        "rolling tool continuation should not detach queued additional_context from queued user input"
-    );
-    assert!(
-        captured[2].body_contains_text("ROLLCTX_QUEUED_USER_PROMPT"),
-        "queued input should be processed after the tool continuation"
-    );
-    assert!(
-        captured[2].body_contains_text("ROLLCTX_QUEUED_ADDITIONAL_CONTEXT"),
-        "queued additional_context should be processed with its queued input"
+        follow_up_user_texts
+            .iter()
+            .any(|text| text.contains("ROLLCTX_QUEUED_ADDITIONAL_CONTEXT")),
+        "rolling tool follow-up should keep queued additional_context with queued input: {follow_up_user_texts:?}"
     );
 
     Ok(())

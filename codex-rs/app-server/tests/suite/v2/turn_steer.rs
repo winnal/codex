@@ -12,6 +12,7 @@ use codex_app_server::INPUT_TOO_LARGE_ERROR_CODE;
 use codex_app_server::INVALID_PARAMS_ERROR_CODE;
 use codex_app_server_protocol::AdditionalContextEntry;
 use codex_app_server_protocol::AdditionalContextKind;
+use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCNotification;
@@ -217,7 +218,7 @@ async fn turn_steer_rejects_oversized_text_input() -> Result<()> {
 }
 
 #[tokio::test]
-async fn turn_steer_returns_active_turn_id() -> Result<()> {
+async fn turn_steer_reaches_rolling_tool_follow_up_request() -> Result<()> {
     #[cfg(target_os = "windows")]
     let shell_command = vec![
         "powershell".to_string(),
@@ -247,6 +248,19 @@ async fn turn_steer_returns_active_turn_id() -> Result<()> {
         &codex_home,
         &server.uri(),
         &server.uri(),
+    )?;
+    let config_path = codex_home.join("config.toml");
+    let config_toml = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+prompt_retention = "rolling"
+rolling_context_reserve_percent = 0
+rolling_context_target_tokens = 50000
+
+{config_toml}"#
+        ),
     )?;
     mount_analytics_capture(&server, &codex_home).await?;
 
@@ -291,10 +305,29 @@ async fn turn_steer_returns_active_turn_id() -> Result<()> {
     )
     .await??;
 
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let notification = mcp
+                .read_stream_until_notification_message("item/started")
+                .await?;
+            let params = notification.params.expect("item/started params");
+            let item_started: ItemStartedNotification =
+                serde_json::from_value(params).expect("deserialize item/started notification");
+            let ThreadItem::CommandExecution { id, status, .. } = item_started.item else {
+                continue;
+            };
+            if id == "call_sleep" {
+                assert_eq!(status, CommandExecutionStatus::InProgress);
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+
     let steer_req = mcp
         .send_turn_steer_request(TurnSteerParams {
             thread_id: thread.id.clone(),
-            client_user_message_id: Some("client-steer-message-1".to_string()),
+            client_user_message_id: Some("client-message-1".to_string()),
             input: vec![V2UserInput::Text {
                 text: "steer".to_string(),
                 text_elements: Vec::new(),
@@ -326,7 +359,7 @@ async fn turn_steer_returns_active_turn_id() -> Result<()> {
             else {
                 continue;
             };
-            if client_id == Some("client-steer-message-1".to_string()) {
+            if client_id == Some("client-message-1".to_string()) {
                 assert_eq!(
                     content,
                     vec![V2UserInput::Text {
@@ -358,6 +391,50 @@ async fn turn_steer_returns_active_turn_id() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    let requests = server
+        .received_requests()
+        .await
+        .context("failed to fetch received requests")?;
+    let response_requests = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/responses"))
+        .collect::<Vec<_>>();
+    assert_eq!(response_requests.len(), 2);
+    let follow_up_body = response_requests[1]
+        .body_json::<Value>()
+        .context("request body should be JSON")?;
+    let follow_up_input = follow_up_body
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("follow-up request should include input");
+    let tool_output_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some("call_sleep")
+        })
+        .expect("rolling tool follow-up request should include shell output");
+    let steered_user_index = follow_up_input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && item.get("role").and_then(Value::as_str) == Some("user")
+                && item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| {
+                        content.iter().any(|span| {
+                            span.get("type").and_then(Value::as_str) == Some("input_text")
+                                && span.get("text").and_then(Value::as_str) == Some("steer")
+                        })
+                    })
+        })
+        .expect("rolling tool follow-up request should include steered user input");
+    assert!(
+        tool_output_index < steered_user_index,
+        "rolling tool follow-up should send shell output before steered user input: {follow_up_input:#?}"
+    );
 
     Ok(())
 }

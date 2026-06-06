@@ -430,9 +430,21 @@ fn rolling_groups(
 
         if let Some(span_end) = dependency_spans.get(&index).copied() {
             if index >= raw_start_index {
+                let group_end = if call_key(item).is_some_and(|key| {
+                    matches!(key.kind, ToolPairKind::Function | ToolPairKind::ToolSearch)
+                }) {
+                    span_end
+                        .checked_add(1)
+                        .and_then(|next_index| {
+                            following_turn_input_run_end(raw_items, next_index, invariant_prefix)
+                        })
+                        .unwrap_or(span_end)
+                } else {
+                    span_end
+                };
                 groups.push(RawRollingGroup {
                     raw_start_index: index,
-                    items: raw_items[index..=span_end]
+                    items: raw_items[index..=group_end]
                         .iter()
                         .enumerate()
                         .filter(|&(offset, _item)| {
@@ -445,6 +457,8 @@ fn rolling_groups(
                         .map(|(_offset, item)| item.clone())
                         .collect(),
                 });
+                index = group_end + 1;
+                continue;
             }
             index = span_end + 1;
             continue;
@@ -484,6 +498,32 @@ fn rolling_groups(
     }
 
     groups
+}
+
+fn following_turn_input_run_end(
+    raw_items: &[ResponseItem],
+    index: usize,
+    invariant_prefix: &[ResponseItem],
+) -> Option<usize> {
+    let mut scan = index;
+    let mut run_end = None;
+    while let Some(item) = raw_items.get(scan) {
+        if is_historical_context_item_at(raw_items, scan, invariant_prefix) {
+            break;
+        }
+        if let Some(group_end) = turn_context_group_end(raw_items, scan, invariant_prefix) {
+            run_end = Some(group_end);
+            scan = group_end + 1;
+            continue;
+        }
+        if matches!(item, ResponseItem::Message { role, .. } if role == "user") {
+            run_end = Some(scan);
+            scan += 1;
+            continue;
+        }
+        break;
+    }
+    run_end
 }
 
 fn turn_context_group_end(

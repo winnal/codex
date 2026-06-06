@@ -207,27 +207,35 @@ impl InputQueue {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
     )]
-    pub(crate) async fn get_pending_tool_continuation_items(
+    pub(crate) async fn get_pending_input_for_model_follow_up(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
     ) -> Vec<TurnInput> {
         let mut active = active_turn.lock().await;
-        let Some(active_turn) = active.as_mut() else {
-            return Vec::new();
+        let pending_input = match active.as_mut() {
+            Some(active_turn) => {
+                let mut turn_state = active_turn.turn_state.lock().await;
+                turn_state.pending_input.items.split_off(0)
+            }
+            None => Vec::new(),
         };
-        let mut turn_state = active_turn.turn_state.lock().await;
-        let pending_input = std::mem::take(&mut turn_state.pending_input.items);
-        let (tool_continuations, retained_input) = pending_input.into_iter().partition(|item| {
-            matches!(
+        let mut tool_continuations = Vec::new();
+        let mut other_input = Vec::new();
+        for item in pending_input {
+            if matches!(
                 item,
                 TurnInput::ResponseItem(
                     ResponseItem::FunctionCallOutput { .. }
                         | ResponseItem::CustomToolCallOutput { .. }
                         | ResponseItem::ToolSearchOutput { .. }
                 )
-            )
-        });
-        turn_state.pending_input.items = retained_input;
+            ) {
+                tool_continuations.push(item);
+            } else {
+                other_input.push(item);
+            }
+        }
+        tool_continuations.extend(other_input);
         tool_continuations
     }
 
