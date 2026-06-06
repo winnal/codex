@@ -430,9 +430,18 @@ fn rolling_groups(
 
         if let Some(span_end) = dependency_spans.get(&index).copied() {
             if index >= raw_start_index {
-                let group_end = if call_key(item).is_some_and(|key| {
-                    matches!(key.kind, ToolPairKind::Function | ToolPairKind::ToolSearch)
-                }) {
+                let carries_following_turn_input = raw_items[index..=span_end].iter().any(|item| {
+                    match call_key(item).map(|key| key.kind) {
+                        Some(ToolPairKind::Function | ToolPairKind::ToolSearch) => true,
+                        Some(ToolPairKind::Custom) => matches!(
+                            item,
+                            ResponseItem::CustomToolCall { name, .. }
+                                if name == codex_code_mode::PUBLIC_TOOL_NAME
+                        ),
+                        None => false,
+                    }
+                });
+                let group_end = if carries_following_turn_input {
                     span_end
                         .checked_add(1)
                         .and_then(|next_index| {

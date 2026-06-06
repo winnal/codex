@@ -122,10 +122,28 @@ pub(super) fn custom_tool_call(call_id: &str) -> ResponseItem {
     }
 }
 
+pub(super) fn code_mode_custom_tool_call(call_id: &str) -> ResponseItem {
+    ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: call_id.to_string(),
+        name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
+        input: "input".to_string(),
+    }
+}
+
 pub(super) fn custom_tool_output(call_id: &str, output: &str) -> ResponseItem {
     ResponseItem::CustomToolCallOutput {
         call_id: call_id.to_string(),
         name: Some("custom".to_string()),
+        output: FunctionCallOutputPayload::from_text(output.to_string()),
+    }
+}
+
+pub(super) fn code_mode_custom_tool_output(call_id: &str, output: &str) -> ResponseItem {
+    ResponseItem::CustomToolCallOutput {
+        call_id: call_id.to_string(),
+        name: Some(codex_code_mode::PUBLIC_TOOL_NAME.to_string()),
         output: FunctionCallOutputPayload::from_text(output.to_string()),
     }
 }

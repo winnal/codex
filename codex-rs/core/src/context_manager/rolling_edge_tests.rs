@@ -473,6 +473,112 @@ fn rolling_prompt_keeps_multiple_outputs_for_one_custom_tool_call() {
 }
 
 #[test]
+fn rolling_prompt_keeps_code_mode_custom_followup_and_queued_user_input_atomic() {
+    let history = history(vec![
+        user_msg(&"old ".repeat(200)),
+        code_mode_custom_tool_call("call-1"),
+        code_mode_custom_tool_output("call-1", "ok"),
+        user_msg("queued steer"),
+    ]);
+    let state = RollingPromptState::default();
+
+    let result = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(120),
+            reserve_percent: Some(10),
+            target_tokens: None,
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+        },
+    )
+    .expect("code-mode custom follow-up and queued input frontier should fit");
+
+    assert_eq!(
+        result.prompt_input,
+        vec![
+            code_mode_custom_tool_call("call-1"),
+            code_mode_custom_tool_output("call-1", "ok"),
+            user_msg("queued steer"),
+        ]
+    );
+}
+
+#[test]
+fn rolling_prompt_does_not_detach_queued_input_from_code_mode_custom_followup_under_pressure() {
+    let history = history(vec![
+        code_mode_custom_tool_call("call-1"),
+        code_mode_custom_tool_output("call-1", "ok"),
+        user_msg(&"queued-one ".repeat(400)),
+        user_msg("queued two"),
+    ]);
+    let state = RollingPromptState::default();
+
+    let error = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(120),
+            reserve_percent: Some(0),
+            target_tokens: Some(30),
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+        },
+    )
+    .expect_err(
+        "rolling prompt should not detach queued input from its code-mode custom follow-up",
+    );
+
+    assert!(matches!(
+        error,
+        RollingPromptError::FrontierExceedsBudget { .. }
+    ));
+}
+
+#[test]
+fn rolling_prompt_does_not_detach_queued_input_from_mixed_custom_followup_under_pressure() {
+    let history = history(vec![
+        custom_tool_call("custom-call-1"),
+        code_mode_custom_tool_call("code-call-1"),
+        custom_tool_output("custom-call-1", "ok"),
+        code_mode_custom_tool_output("code-call-1", "ok"),
+        user_msg(&"queued-one ".repeat(400)),
+        user_msg("queued two"),
+    ]);
+    let state = RollingPromptState::default();
+
+    let error = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(120),
+            reserve_percent: Some(0),
+            target_tokens: Some(30),
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+        },
+    )
+    .expect_err(
+        "rolling prompt should not detach queued input from a mixed custom span containing code-mode",
+    );
+
+    assert!(matches!(
+        error,
+        RollingPromptError::FrontierExceedsBudget { .. }
+    ));
+}
+
+#[test]
 fn rolling_prompt_budgets_actual_custom_tool_output_size_used_by_code_mode() {
     let code_mode_output = "x".repeat(20_000);
     let output_item = custom_tool_output("call-1", &code_mode_output);
