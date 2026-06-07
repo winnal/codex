@@ -50,6 +50,10 @@ impl PairwiseSummaryRequest {
         summary_text: String,
     ) {
         state.raw_history_start_index = state.raw_history_start_index.max(self.raw_end_exclusive);
+        self.add_to_summary_cache(state, summary_text);
+    }
+
+    pub(crate) fn add_to_summary_cache(self, state: &mut RollingPromptState, summary_text: String) {
         state.add_pairwise_summary(PairwiseNode::summary_with_text(
             CoverageInterval::new(self.raw_start_index, self.raw_end_exclusive),
             self.level,
@@ -60,12 +64,26 @@ impl PairwiseSummaryRequest {
 }
 
 impl RollingPromptState {
+    pub(crate) fn commit_pairwise_summary_cache(&mut self, projected: &Self) {
+        if self.history_version != projected.history_version {
+            return;
+        }
+
+        if self.projection_basis_fingerprint != projected.projection_basis_fingerprint {
+            self.projection_basis_fingerprint = projected.projection_basis_fingerprint;
+            self.raw_history_start_index = 0;
+            self.pairwise_summaries.clear();
+        }
+
+        for summary in projected.pairwise_summaries.iter().cloned() {
+            self.add_pairwise_summary(summary);
+        }
+    }
+
     pub(crate) fn with_pairwise_summaries_from_projection(&self, projected: &Self) -> Self {
         let mut state = self.clone();
-        if self.history_version == projected.history_version
-            && self.projection_basis_fingerprint == projected.projection_basis_fingerprint
-        {
-            state.pairwise_summaries = projected.pairwise_summaries.clone();
+        if self.history_version == projected.history_version {
+            state.commit_pairwise_summary_cache(projected);
         }
         state
     }

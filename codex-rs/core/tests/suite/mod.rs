@@ -99,6 +99,7 @@ mod rolling_prompt;
 mod rolling_prompt_compaction;
 mod rolling_prompt_context;
 mod rolling_prompt_pairwise;
+mod rolling_prompt_pairwise_bootstrap;
 mod rolling_prompt_projection;
 mod rolling_prompt_projection_deferred_tools;
 mod rolling_prompt_projection_mcp_code;

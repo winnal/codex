@@ -27,6 +27,7 @@ const DEFAULT_SUMMARY_GROUP_TOKEN_CAP: usize = ROLLCTX_SUMMARY_GROUP_TOKEN_CAP_M
 const DEFAULT_MAX_SUMMARY_LEVELS: u8 = 8;
 const DEFAULT_COMPACT_WHEN_LEVEL_GROUP_COUNT_GT: usize = 2;
 const MAX_PAIR_SUMMARIES_PER_SAMPLING_ATTEMPT: usize = 2;
+const MAX_BOOTSTRAP_PAIR_SUMMARIES_PER_SAMPLING_ATTEMPT: usize = 16;
 const DEFAULT_ROLLCTX_PAIR_SUMMARY_INPUT_TOKEN_CAP: i64 = 22_000;
 
 #[derive(Clone, Debug)]
@@ -160,13 +161,88 @@ impl Session {
                     mut projected_state,
                 } => {
                     if generated_summaries >= MAX_PAIR_SUMMARIES_PER_SAMPLING_ATTEMPT {
-                        return Err(CodexErr::ContextWindowExceeded);
+                        self.commit_pairwise_summary_cache_from_projection(&candidate_state)
+                            .await;
+                        return self
+                            .build_sampling_prompt_input_with_bootstrap_pair_summaries(
+                                turn_context,
+                                base_instructions,
+                                rolling_invariant_items,
+                                rolling_target_scale_percent,
+                                client_session,
+                            )
+                            .await;
                     }
                     let summary_text = self
                         .run_rollctx_pair_summary_request(turn_context, client_session, &request)
                         .await?;
                     request.add_to_projected_state(&mut projected_state, summary_text);
+                    self.commit_pairwise_summary_cache_from_projection(&projected_state)
+                        .await;
                     candidate_state = projected_state;
+                    generated_summaries = generated_summaries.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    async fn build_sampling_prompt_input_with_bootstrap_pair_summaries(
+        &self,
+        turn_context: &TurnContext,
+        base_instructions: &BaseInstructions,
+        rolling_invariant_items: &[ResponseItem],
+        rolling_target_scale_percent: Option<u8>,
+        client_session: &ModelClientSession,
+    ) -> CodexResult<SamplingPromptInput> {
+        let mut generated_summaries = 0usize;
+        loop {
+            let (history, candidate_state) = {
+                let state = self.state.lock().await;
+                (state.history.clone(), state.rolling_prompt_state.clone())
+            };
+
+            let outcome = build_rolling_prompt_with_live_summaries(
+                &history,
+                &candidate_state,
+                rolling_prompt_params(
+                    turn_context,
+                    base_instructions,
+                    rolling_invariant_items,
+                    rolling_target_scale_percent,
+                ),
+            )
+            .map_err(|error| rolling_prompt_error_to_codex_err(error, turn_context))?;
+
+            match outcome {
+                RollingPromptBuildOutcome::Ready(result) => {
+                    debug!(
+                        turn_id = %turn_context.sub_id,
+                        estimated_prompt_tokens = result.estimated_prompt_tokens,
+                        dropped_body_items = result.dropped_body_items,
+                        raw_history_start_index = result.raw_history_start_index,
+                        target_tokens = result.target_tokens,
+                        backoff_applied = result.backoff_applied,
+                        bootstrap_pair_summaries_generated = generated_summaries,
+                        "built rolling sampling prompt after bootstrap pair summaries"
+                    );
+                    return Ok(SamplingPromptInput::rolling(
+                        result.prompt_input,
+                        result.projected_state,
+                    ));
+                }
+                RollingPromptBuildOutcome::NeedsPairSummary {
+                    request,
+                    mut projected_state,
+                } => {
+                    if generated_summaries >= MAX_BOOTSTRAP_PAIR_SUMMARIES_PER_SAMPLING_ATTEMPT {
+                        return Err(CodexErr::ContextWindowExceeded);
+                    }
+                    let summary_text = self
+                        .run_rollctx_pair_summary_request(turn_context, client_session, &request)
+                        .await?;
+                    request.add_to_summary_cache(&mut projected_state, summary_text);
+                    self.commit_pairwise_summary_cache_from_projection(&projected_state)
+                        .await;
                     generated_summaries = generated_summaries.saturating_add(1);
                 }
             }
@@ -231,6 +307,18 @@ impl Session {
             state
                 .rolling_prompt_state
                 .commit_projection(projected_state, raw_history_len);
+        }
+    }
+
+    async fn commit_pairwise_summary_cache_from_projection(
+        &self,
+        projected_state: &RollingPromptState,
+    ) {
+        let mut state = self.state.lock().await;
+        if state.history.history_version() == projected_state.history_version {
+            state
+                .rolling_prompt_state
+                .commit_pairwise_summary_cache(projected_state);
         }
     }
 

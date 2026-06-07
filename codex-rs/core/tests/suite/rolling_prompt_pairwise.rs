@@ -308,24 +308,14 @@ async fn rolling_pairwise_mocked_side_channel_stress_respects_cap_and_commit_sem
             ),
             sse(vec![
                 responses::ev_assistant_message(
-                    "replay-a",
-                    "FAIL_PAIRWISE_SUMMARY_SENTINEL_REPLAY_A",
+                    "replay-summary-a",
+                    "FAIL_REPLAY_PAIRWISE_SUMMARY_SENTINEL_A",
                 ),
-                responses::ev_completed("replay-resp-a"),
+                responses::ev_completed("replay-summary-resp-a"),
             ]),
             sse(vec![
-                responses::ev_assistant_message(
-                    "replay-b",
-                    "FAIL_PAIRWISE_SUMMARY_SENTINEL_REPLAY_B",
-                ),
-                responses::ev_completed("replay-resp-b"),
-            ]),
-            sse(vec![
-                responses::ev_assistant_message(
-                    "replay-c",
-                    "FAIL_PAIRWISE_SUMMARY_SENTINEL_REPLAY_C",
-                ),
-                responses::ev_completed("replay-resp-c"),
+                responses::ev_assistant_message("replay", "normal replay done"),
+                responses::ev_completed("replay-resp"),
             ]),
         ],
     )
@@ -346,69 +336,16 @@ async fn rolling_pairwise_mocked_side_channel_stress_respects_cap_and_commit_sem
     wait_for_turn_complete(&test.codex, &replay_turn_id).await?;
 
     let captured = requests.requests();
-    assert!(captured.len() >= 5, "captured requests: {captured:#?}");
+    assert_eq!(captured.len(), 5);
     assert_eq!(captured[1].body_json()["tools"], json!([]));
-    assert_eq!(captured[3].body_json()["tools"], json!([]));
     assert!(captured[1].body_contains_text("FAIL_USER_SENTINEL"));
-    assert!(captured[3].body_contains_text("FAIL_USER_SENTINEL"));
+    assert_eq!(captured[3].body_json()["tools"], json!([]));
+    assert!(!captured[3].body_contains_text("FAIL_USER_SENTINEL"));
     let replay_turn_request = captured.last().expect("replay turn request");
-    assert!(replay_turn_request.body_contains_text("FAIL_PAIRWISE_SUMMARY_SENTINEL_REPLAY"));
+    let replay_metadata = turn_metadata(replay_turn_request)?;
+    assert_eq!(replay_metadata["request_kind"].as_str(), Some("turn"));
+    assert!(replay_turn_request.body_contains_text("FAIL_PAIRWISE_SUMMARY_SENTINEL"));
     assert!(!replay_turn_request.body_contains_text("FAIL_USER_SENTINEL"));
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn caps_foreground_summary_requests() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_mock_server().await;
-    let requests = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                responses::ev_assistant_message("seed-a", "CAP_ASSISTANT_SENTINEL_A"),
-                responses::ev_assistant_message("seed-b", "CAP_ASSISTANT_SENTINEL_B"),
-                responses::ev_assistant_message("seed-c", "CAP_ASSISTANT_SENTINEL_C"),
-                responses::ev_assistant_message("seed-d", "CAP_ASSISTANT_SENTINEL_D"),
-                responses::ev_assistant_message("seed-e", "CAP_ASSISTANT_SENTINEL_E"),
-                responses::ev_assistant_message("seed-f", "CAP_ASSISTANT_SENTINEL_F"),
-                responses::ev_completed("seed-resp"),
-            ]),
-            sse(vec![
-                responses::ev_output_text_delta("CAP_SUMMARY_ONE"),
-                responses::ev_completed("summary-resp-1"),
-            ]),
-            sse(vec![
-                responses::ev_output_text_delta("CAP_SUMMARY_TWO"),
-                responses::ev_completed("summary-resp-2"),
-            ]),
-        ],
-    )
-    .await;
-    let test = test_codex()
-        .with_config(configure_pairwise)
-        .build(&server)
-        .await?;
-
-    let seed_turn_id = submit_text_turn(&test, "CAP_USER_SENTINEL").await?;
-    wait_for_turn_complete(&test.codex, &seed_turn_id).await?;
-    let pairwise_turn_id = submit_text_turn(&test, "CAP_HOT_SENTINEL").await?;
-    let error = wait_for_turn_complete(&test.codex, &pairwise_turn_id)
-        .await
-        .expect_err("third foreground summary should be blocked by the cap");
-
-    assert!(
-        error
-            .to_string()
-            .contains("Codex ran out of room in the model's context window")
-    );
-    let captured = requests.requests();
-    assert_eq!(captured.len(), 3);
-    assert!(captured[1].body_contains_text("CAP_USER_SENTINEL"));
-    assert!(captured[2].body_contains_text("CAP_ASSISTANT_SENTINEL_B"));
-    assert_eq!(captured[1].body_json()["tools"], json!([]));
-    assert_eq!(captured[2].body_json()["tools"], json!([]));
 
     Ok(())
 }

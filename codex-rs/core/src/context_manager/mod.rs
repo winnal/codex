@@ -25,3 +25,7 @@ pub(crate) use rolling_pairwise::PairwiseSummaryRequest;
 #[cfg(test)]
 #[path = "rolling_pairwise_stress_tests.rs"]
 mod pairwise_stress_tests;
+
+#[cfg(test)]
+#[path = "rolling_pairwise_bootstrap_tests.rs"]
+mod pairwise_bootstrap_tests;
