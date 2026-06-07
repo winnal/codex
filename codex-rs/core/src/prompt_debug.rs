@@ -3,6 +3,8 @@ use std::sync::Arc;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
 use codex_login::AuthManager;
+use codex_protocol::config_types::PromptRetentionMode;
+use codex_protocol::config_types::RollingCompactionMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseInputItem;
@@ -74,6 +76,13 @@ pub(crate) async fn build_prompt_input_from_session(
     input: Vec<UserInput>,
 ) -> CodexResult<Vec<ResponseItem>> {
     let turn_context = sess.new_default_turn().await;
+    if turn_context.config.prompt_retention == PromptRetentionMode::Rolling
+        && turn_context.config.rolling_compaction == RollingCompactionMode::Pairwise
+    {
+        return Err(CodexErr::UnsupportedOperation(
+            "debug prompt-input does not support pairwise rolling compaction because it requires live model-generated summaries".to_string(),
+        ));
+    }
     let rolling_invariant_items = sess
         .record_context_updates_and_set_reference_context_item(turn_context.as_ref())
         .await;

@@ -7,7 +7,9 @@ use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::PromptRetentionMode;
+use codex_protocol::config_types::ROLLCTX_SUMMARY_GROUP_TOKEN_CAP_MAX;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::RollingCompactionMode;
 use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WebSearchToolConfig;
@@ -253,6 +255,15 @@ pub struct Config {
     pub rolling_context_reserve_percent: Option<u8>,
     #[schemars(schema_with = "optional_rolling_context_target_tokens_schema")]
     pub rolling_context_target_tokens: Option<i64>,
+    pub rolling_compaction: Option<RollingCompactionMode>,
+    #[schemars(schema_with = "optional_positive_i64_schema")]
+    pub protected_hot_exact_tokens: Option<i64>,
+    #[schemars(schema_with = "optional_summary_group_token_cap_schema")]
+    pub summary_group_token_cap: Option<i64>,
+    #[schemars(schema_with = "optional_positive_u8_schema")]
+    pub max_summary_levels: Option<u8>,
+    #[schemars(schema_with = "optional_compact_pair_threshold_schema")]
+    pub compact_when_level_group_count_gt: Option<usize>,
     pub model_provider: Option<String>,
     #[experimental(nested)]
     pub approval_policy: Option<AskForApproval>,
@@ -294,6 +305,38 @@ fn optional_rolling_context_target_tokens_schema(generator: &mut SchemaGenerator
     let mut schema = Option::<i64>::json_schema(generator);
     if let Schema::Object(schema_object) = &mut schema {
         schema_object.number().minimum = Some(1.0);
+    }
+    schema
+}
+
+fn optional_positive_i64_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<i64>::json_schema(generator);
+    if let Schema::Object(schema_object) = &mut schema {
+        schema_object.number().minimum = Some(1.0);
+    }
+    schema
+}
+
+fn optional_positive_u8_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<u8>::json_schema(generator);
+    if let Schema::Object(schema_object) = &mut schema {
+        schema_object.number().minimum = Some(1.0);
+    }
+    schema
+}
+
+fn optional_summary_group_token_cap_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = optional_positive_i64_schema(generator);
+    if let Schema::Object(schema_object) = &mut schema {
+        schema_object.number().maximum = Some(ROLLCTX_SUMMARY_GROUP_TOKEN_CAP_MAX as f64);
+    }
+    schema
+}
+
+fn optional_compact_pair_threshold_schema(generator: &mut SchemaGenerator) -> Schema {
+    let mut schema = Option::<usize>::json_schema(generator);
+    if let Schema::Object(schema_object) = &mut schema {
+        schema_object.number().minimum = Some(2.0);
     }
     schema
 }

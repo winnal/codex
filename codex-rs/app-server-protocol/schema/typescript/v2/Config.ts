@@ -6,6 +6,7 @@ import type { ForcedLoginMethod } from "../ForcedLoginMethod";
 import type { PromptRetentionMode } from "../PromptRetentionMode";
 import type { ReasoningEffort } from "../ReasoningEffort";
 import type { ReasoningSummary } from "../ReasoningSummary";
+import type { RollingCompactionMode } from "../RollingCompactionMode";
 import type { Verbosity } from "../Verbosity";
 import type { WebSearchMode } from "../WebSearchMode";
 import type { JsonValue } from "../serde_json/JsonValue";
@@ -17,7 +18,7 @@ import type { SandboxMode } from "./SandboxMode";
 import type { SandboxWorkspaceWrite } from "./SandboxWorkspaceWrite";
 import type { ToolsV2 } from "./ToolsV2";
 
-export type Config = {model: string | null, review_model: string | null, model_context_window: bigint | null, model_auto_compact_token_limit: bigint | null, model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope | null, prompt_retention: PromptRetentionMode | null, rolling_context_reserve_percent: number | null, rolling_context_target_tokens: bigint | null, model_provider: string | null, approval_policy: AskForApproval | null, /**
+export type Config = {model: string | null, review_model: string | null, model_context_window: bigint | null, model_auto_compact_token_limit: bigint | null, model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope | null, prompt_retention: PromptRetentionMode | null, rolling_context_reserve_percent: number | null, rolling_context_target_tokens: bigint | null, rolling_compaction: RollingCompactionMode | null, protected_hot_exact_tokens: bigint | null, summary_group_token_cap: bigint | null, max_summary_levels: number | null, compact_when_level_group_count_gt: number | null, model_provider: string | null, approval_policy: AskForApproval | null, /**
  * [UNSTABLE] Optional default for where approval requests are routed for
  * review.
  */

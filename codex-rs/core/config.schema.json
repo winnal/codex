@@ -2546,6 +2546,25 @@
         }
       ]
     },
+    "RollingCompactionMode": {
+      "description": "Selects optional compaction behavior layered on top of rolling prompt retention.",
+      "oneOf": [
+        {
+          "description": "Do not summarize cold rolling groups.",
+          "enum": [
+            "disabled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Summarize sealed cold rolling groups with pairwise tree compaction.",
+          "enum": [
+            "pairwise"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "SandboxMode": {
       "enum": [
         "read-only",
@@ -4470,6 +4489,12 @@
       "description": "Compact prompt used for history compaction.",
       "type": "string"
     },
+    "compact_when_level_group_count_gt": {
+      "description": "Compact a level when it has more than this many groups.",
+      "format": "uint",
+      "minimum": 2.0,
+      "type": "integer"
+    },
     "debug": {
       "allOf": [
         {
@@ -4911,6 +4936,12 @@
       "description": "User-level marketplace entries keyed by marketplace name.",
       "type": "object"
     },
+    "max_summary_levels": {
+      "description": "Maximum pairwise summary levels to build.",
+      "format": "uint8",
+      "minimum": 1.0,
+      "type": "integer"
+    },
     "mcp_oauth_callback_port": {
       "description": "Optional fixed port for the local HTTP callback server used during MCP OAuth login. When unset, Codex will bind to an ephemeral port chosen by the OS.",
       "format": "uint16",
@@ -5123,6 +5154,12 @@
       ],
       "description": "Prompt retention strategy. Defaults to current compact behavior."
     },
+    "protected_hot_exact_tokens": {
+      "description": "Minimum exact hot suffix retained before pairwise cold-group compaction.",
+      "format": "int64",
+      "minimum": 1.0,
+      "type": "integer"
+    },
     "realtime": {
       "allOf": [
         {
@@ -5135,6 +5172,14 @@
     "review_model": {
       "description": "Review model override used by the `/review` feature.",
       "type": "string"
+    },
+    "rolling_compaction": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/RollingCompactionMode"
+        }
+      ],
+      "description": "Optional compaction strategy layered on top of rolling prompt retention."
     },
     "rolling_context_reserve_percent": {
       "description": "Rolling-mode reserve as a percentage of the effective model context window.",
@@ -5203,6 +5248,13 @@
         }
       ],
       "description": "Directory where Codex stores the SQLite state DB. Defaults to `$CODEX_SQLITE_HOME` when set. Otherwise uses `$CODEX_HOME`."
+    },
+    "summary_group_token_cap": {
+      "description": "Maximum token budget for one pairwise summary group.",
+      "format": "int64",
+      "maximum": 512.0,
+      "minimum": 1.0,
+      "type": "integer"
     },
     "suppress_unstable_features_warning": {
       "description": "Suppress warnings about unstable (under development) features.",

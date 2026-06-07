@@ -1,3 +1,4 @@
+use super::super::rolling_summary_tree::CoverageInterval;
 use super::test_support::*;
 use super::*;
 use codex_protocol::openai_models::default_input_modalities;
@@ -27,6 +28,7 @@ fn rolling_prompt_filters_historical_context_and_keeps_current_prefix_once() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("rolling prompt should fit");
@@ -63,6 +65,7 @@ fn rolling_prompt_keeps_literal_user_messages_that_only_start_like_context() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("literal user messages should fit");
@@ -89,6 +92,7 @@ fn rolling_prompt_does_not_drop_literal_user_message_equal_to_current_prefix() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("literal user message matching current prefix should fit");
@@ -118,6 +122,7 @@ fn rolling_prompt_keeps_turn_input_context_and_user_prompt_atomic() {
             target_tokens: Some(80),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect_err("turn prelude and user prompt should fail as one newest frontier");
@@ -149,6 +154,7 @@ fn rolling_prompt_keeps_newest_suffix_and_advances_raw_cursor() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("newest frontier should fit");
@@ -172,6 +178,7 @@ fn rolling_prompt_keeps_newest_suffix_and_advances_raw_cursor() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("larger later budget should still not reintroduce old items");
@@ -197,6 +204,7 @@ fn rolling_prompt_resets_cursor_after_history_rewrite() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("newest frontier should fit");
@@ -219,6 +227,7 @@ fn rolling_prompt_resets_cursor_after_history_rewrite() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("history rewrite should reset cursor coordinates");
@@ -250,6 +259,7 @@ fn rolling_prompt_keeps_adjacent_tool_call_and_output_atomic() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("call/output frontier should fit");
@@ -282,6 +292,7 @@ fn rolling_prompt_keeps_tool_followup_and_queued_user_input_atomic() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("tool follow-up and queued input frontier should fit");
@@ -318,6 +329,7 @@ fn rolling_prompt_does_not_detach_later_queued_input_from_tool_followup_under_pr
             target_tokens: Some(30),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect_err("rolling prompt should not detach later queued input from its tool follow-up");
@@ -351,6 +363,7 @@ fn rolling_prompt_keeps_non_adjacent_parallel_tool_calls_atomic() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("parallel call/output batch should fit");
@@ -384,6 +397,7 @@ fn rolling_prompt_drops_old_in_flight_tool_call_when_newer_body_exists() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("newer body should fit without stale in-flight call");
@@ -413,6 +427,7 @@ fn rolling_prompt_keeps_local_shell_call_and_output_atomic() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("local shell call/output frontier should fit");
@@ -444,6 +459,7 @@ fn rolling_prompt_keeps_custom_tool_call_and_output_atomic() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("custom call/output frontier should fit");
@@ -478,6 +494,7 @@ fn rolling_prompt_keeps_tool_search_call_and_output_atomic() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("tool search call/output frontier should fit");
@@ -506,6 +523,7 @@ fn rolling_prompt_keeps_server_tool_search_output_without_matching_call() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("server-executed search output is valid model-visible history");
@@ -535,6 +553,7 @@ fn rolling_prompt_skips_orphan_tool_outputs() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("new body should fit without orphan outputs");
@@ -563,6 +582,7 @@ fn rolling_prompt_clamps_cursor_to_raw_history_len() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("clamped cursor should produce a valid prompt");
@@ -590,6 +610,7 @@ fn rolling_prompt_errors_when_newest_frontier_exceeds_budget() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect_err("oversized newest frontier should fail clearly");
@@ -619,6 +640,7 @@ fn rolling_prompt_drops_old_item_that_exceeds_per_item_limit() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("oversized old item should be ejected");
@@ -652,6 +674,7 @@ fn rolling_prompt_accepts_newest_item_above_ten_kb_when_estimated_under_token_li
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("item below the 10K-token cap should be retained even above 10KB");
@@ -676,6 +699,7 @@ fn rolling_prompt_errors_when_newest_item_exceeds_per_item_limit() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect_err("oversized newest item should fail clearly");
@@ -701,6 +725,7 @@ fn rolling_prompt_applies_backoff_to_target_metadata() {
             target_tokens: None,
             target_scale_percent: Some(90),
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("backoff prompt should fit");
@@ -728,6 +753,7 @@ fn rolling_prompt_backoff_drops_oldest_group_that_fit_before_retry() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("normal prompt should keep both groups");
@@ -747,6 +773,7 @@ fn rolling_prompt_backoff_drops_oldest_group_that_fit_before_retry() {
             target_tokens: None,
             target_scale_percent: Some(90),
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("backoff prompt should keep the newest frontier");
@@ -754,4 +781,296 @@ fn rolling_prompt_backoff_drops_oldest_group_that_fit_before_retry() {
     assert_eq!(retry.prompt_input, vec![newest]);
     assert_eq!(retry.raw_history_start_index, 1);
     assert_eq!(retry.backoff_applied, true);
+}
+
+fn pairwise_params() -> PairwiseRollingPromptParams {
+    PairwiseRollingPromptParams {
+        protected_hot_exact_tokens: Some(1),
+        summary_group_token_cap: 1_000,
+        max_summary_levels: 3,
+        compact_when_level_group_count_gt: 2,
+    }
+}
+
+fn pairwise_summary(start: usize, end: usize, level: u8, text: &str) -> PairwiseNode {
+    PairwiseNode::summary_with_text(
+        CoverageInterval::new(start, end),
+        level,
+        1_000,
+        text.to_string(),
+    )
+}
+
+#[test]
+fn rolling_prompt_pairwise_projects_summaries_and_exact_hot_suffix_by_coverage() {
+    let history = history(vec![
+        user_msg("G0_SENTINEL"),
+        user_msg("G1_SENTINEL"),
+        user_msg("G2_SENTINEL"),
+        user_msg("G3_SENTINEL"),
+        user_msg("G4_SENTINEL"),
+        user_msg("G5_SENTINEL"),
+        user_msg("G6_SENTINEL"),
+        user_msg("G7_SENTINEL"),
+    ]);
+    let state = RollingPromptState::default();
+
+    let result = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(10_000),
+            reserve_percent: Some(0),
+            target_tokens: None,
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+            pairwise_compaction: Some(pairwise_params()),
+        },
+    )
+    .expect("pairwise prompt should fit");
+
+    let prompt = serde_json::to_string(&result.prompt_input).expect("serialize prompt");
+    let summary_0123 = prompt.find("raw[0..4)").expect("S0123 summary");
+    let summary_45 = prompt.find("raw[4..6)").expect("S45 summary");
+    let exact_g6 = prompt.find("G6_SENTINEL").expect("G6 exact");
+    let exact_g7 = prompt.find("G7_SENTINEL").expect("G7 exact");
+    assert!(summary_0123 < summary_45);
+    assert!(summary_45 < exact_g6);
+    assert!(exact_g6 < exact_g7);
+    assert!(!prompt.contains("G0_SENTINEL"));
+    assert!(!prompt.contains("G1_SENTINEL"));
+    assert!(!prompt.contains("G2_SENTINEL"));
+    assert!(!prompt.contains("G3_SENTINEL"));
+    assert!(!prompt.contains("G4_SENTINEL"));
+    assert!(!prompt.contains("G5_SENTINEL"));
+}
+
+#[test]
+fn rolling_prompt_pairwise_generated_parent_retires_child_summaries() {
+    let history = history(vec![
+        user_msg("G0_SENTINEL"),
+        user_msg("G1_SENTINEL"),
+        user_msg("G2_SENTINEL"),
+        user_msg("G3_SENTINEL"),
+        user_msg("G4_SENTINEL"),
+        user_msg("G5_SENTINEL"),
+    ]);
+    let input_modalities = default_input_modalities();
+    let base_instructions = base_instructions();
+    let params = RollingPromptParams {
+        input_modalities: &input_modalities,
+        base_instructions: &base_instructions,
+        invariant_prefix: Vec::new(),
+        effective_context_window: Some(10_000),
+        reserve_percent: Some(0),
+        target_tokens: None,
+        target_scale_percent: None,
+        tool_output_limit_tokens: 10_000,
+        pairwise_compaction: Some(pairwise_params()),
+    };
+    let mut state = RollingPromptState {
+        history_version: history.history_version(),
+        projection_basis_fingerprint: projection_basis_fingerprint(&params, 10_000, &[]),
+        pairwise_summaries: vec![
+            pairwise_summary(0, 2, 1, "S01_SENTINEL"),
+            pairwise_summary(2, 4, 1, "S23_SENTINEL"),
+        ],
+        ..RollingPromptState::default()
+    };
+    PairwiseSummaryRequest {
+        input: Vec::new(),
+        raw_start_index: 0,
+        raw_end_exclusive: 4,
+        level: 2,
+        token_estimate: 1_000,
+    }
+    .add_to_projected_state(&mut state, "S0123_SENTINEL".to_string());
+
+    assert_eq!(
+        state.pairwise_summaries,
+        vec![pairwise_summary(0, 4, 2, "S0123_SENTINEL")]
+    );
+
+    let result = build_rolling_prompt(&history, &state, params)
+        .expect("canonical parent summary should produce an exact-once prompt");
+
+    let prompt = serde_json::to_string(&result.prompt_input).expect("serialize prompt");
+    assert!(prompt.contains("S0123_SENTINEL"));
+    assert!(!prompt.contains("S01_SENTINEL"));
+    assert!(!prompt.contains("S23_SENTINEL"));
+    assert!(!prompt.contains("G0_SENTINEL"));
+    assert!(!prompt.contains("G1_SENTINEL"));
+    assert!(!prompt.contains("G2_SENTINEL"));
+    assert!(!prompt.contains("G3_SENTINEL"));
+    assert!(prompt.contains("G4_SENTINEL"));
+    assert!(prompt.contains("G5_SENTINEL"));
+}
+
+#[test]
+fn rolling_prompt_pairwise_retry_scale_keeps_existing_summaries() {
+    let history = history(vec![
+        user_msg("G0_SENTINEL"),
+        user_msg("G1_SENTINEL"),
+        user_msg("G2_SENTINEL"),
+        user_msg("HOT_SENTINEL"),
+    ]);
+    let input_modalities = default_input_modalities();
+    let base_instructions = base_instructions();
+    let initial_params = RollingPromptParams {
+        input_modalities: &input_modalities,
+        base_instructions: &base_instructions,
+        invariant_prefix: Vec::new(),
+        effective_context_window: Some(10_000),
+        reserve_percent: Some(0),
+        target_tokens: None,
+        target_scale_percent: None,
+        tool_output_limit_tokens: 10_000,
+        pairwise_compaction: Some(pairwise_params()),
+    };
+    let state = RollingPromptState {
+        history_version: history.history_version(),
+        projection_basis_fingerprint: projection_basis_fingerprint(&initial_params, 10_000, &[]),
+        pairwise_summaries: vec![pairwise_summary(0, 2, 1, "S01_SENTINEL")],
+        ..RollingPromptState::default()
+    };
+
+    let retry_outcome = build_rolling_prompt_with_live_summaries(
+        &history,
+        &state,
+        RollingPromptParams {
+            target_scale_percent: Some(90),
+            ..initial_params
+        },
+    )
+    .expect("retry projection should fit using existing summary");
+
+    let RollingPromptBuildOutcome::Ready(result) = retry_outcome else {
+        panic!("retry projection should not request an already generated summary");
+    };
+    let prompt = serde_json::to_string(&result.prompt_input).expect("serialize prompt");
+    assert!(prompt.contains("S01_SENTINEL"));
+    assert!(!prompt.contains("G0_SENTINEL"));
+    assert!(!prompt.contains("G1_SENTINEL"));
+    assert!(prompt.contains("G2_SENTINEL"));
+    assert!(prompt.contains("HOT_SENTINEL"));
+    assert_eq!(result.backoff_applied, true);
+}
+
+#[test]
+fn rolling_prompt_pairwise_summary_state_is_projected_until_committed() {
+    let history = history(vec![
+        user_msg("G0_SENTINEL"),
+        user_msg("G1_SENTINEL"),
+        user_msg("G2_SENTINEL"),
+        user_msg("G3_SENTINEL"),
+    ]);
+    let mut state = RollingPromptState::default();
+
+    let result = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(10_000),
+            reserve_percent: Some(0),
+            target_tokens: None,
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+            pairwise_compaction: Some(pairwise_params()),
+        },
+    )
+    .expect("pairwise prompt should fit");
+
+    assert_eq!(state.raw_history_start_index, 0);
+    assert!(result.raw_history_start_index > 0);
+    let raw_history = serde_json::to_string(history.raw_items()).expect("serialize history");
+    assert!(!raw_history.contains("rollctx_summary_group"));
+
+    state.commit_projection(&result.projected_state, history.raw_items().len());
+    assert_eq!(
+        state.raw_history_start_index,
+        result.raw_history_start_index
+    );
+}
+
+#[test]
+fn rolling_prompt_pairwise_budget_pressure_compacts_threshold_pair() {
+    let old_a = format!("G0_SENTINEL {}", "alpha ".repeat(600));
+    let old_b = format!("G1_SENTINEL {}", "beta ".repeat(600));
+    let history = history(vec![
+        user_msg(&old_a),
+        user_msg(&old_b),
+        user_msg("HOT_SENTINEL"),
+    ]);
+    let state = RollingPromptState::default();
+
+    let result = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(10_000),
+            reserve_percent: Some(0),
+            target_tokens: Some(500),
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+            pairwise_compaction: Some(PairwiseRollingPromptParams {
+                summary_group_token_cap: 64,
+                ..pairwise_params()
+            }),
+        },
+    )
+    .expect("budget pressure should compact the eligible threshold pair");
+
+    let prompt = serde_json::to_string(&result.prompt_input).expect("serialize prompt");
+    assert!(prompt.contains("raw[0..2)"));
+    assert!(!prompt.contains("G0_SENTINEL"));
+    assert!(!prompt.contains("G1_SENTINEL"));
+    assert!(prompt.contains("HOT_SENTINEL"));
+}
+
+#[test]
+fn rolling_prompt_pairwise_keeps_tool_followup_and_queued_steer_exact() {
+    let history = history(vec![
+        user_msg("COLD_G0_SENTINEL"),
+        user_msg("COLD_G1_SENTINEL"),
+        user_msg("COLD_G2_SENTINEL"),
+        function_call("call-1"),
+        function_output("call-1", "TOOL_OUTPUT_SENTINEL"),
+        user_msg("QUEUED_STEER_SENTINEL"),
+    ]);
+    let state = RollingPromptState::default();
+
+    let result = build_rolling_prompt(
+        &history,
+        &state,
+        RollingPromptParams {
+            input_modalities: &default_input_modalities(),
+            base_instructions: &base_instructions(),
+            invariant_prefix: Vec::new(),
+            effective_context_window: Some(10_000),
+            reserve_percent: Some(0),
+            target_tokens: None,
+            target_scale_percent: None,
+            tool_output_limit_tokens: 10_000,
+            pairwise_compaction: Some(pairwise_params()),
+        },
+    )
+    .expect("pairwise prompt should fit");
+
+    let prompt = serde_json::to_string(&result.prompt_input).expect("serialize prompt");
+    assert!(prompt.contains("raw[0..2)"));
+    assert!(!prompt.contains("COLD_G0_SENTINEL"));
+    assert!(!prompt.contains("COLD_G1_SENTINEL"));
+    assert!(prompt.contains("COLD_G2_SENTINEL"));
+    assert!(prompt.contains("call-1"));
+    assert!(prompt.contains("TOOL_OUTPUT_SENTINEL"));
+    assert!(prompt.contains("QUEUED_STEER_SENTINEL"));
 }

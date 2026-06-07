@@ -112,6 +112,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::feedback_tags;
+use crate::rollctx_pair_summary_client::collect_rollctx_pair_summary_text;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_api::map_api_error;
 use codex_feedback::FeedbackRequestTags;
@@ -192,6 +193,12 @@ struct CurrentClientSetup {
     auth: Option<CodexAuth>,
     api_provider: ApiProvider,
     api_auth: SharedAuthProvider,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResponsesRequestOverrides {
+    max_output_tokens: Option<i64>,
+    verbosity: Option<VerbosityConfig>,
 }
 
 #[derive(Clone, Copy)]
@@ -787,6 +794,7 @@ impl ModelClient {
             store: provider.is_azure_responses_endpoint(),
             stream: true,
             include,
+            max_output_tokens: None,
             service_tier,
             prompt_cache_key,
             text,
@@ -1245,6 +1253,7 @@ impl ModelClientSession {
         service_tier: Option<String>,
         turn_metadata_header: Option<&str>,
         inference_trace: &InferenceTraceContext,
+        request_overrides: ResponsesRequestOverrides,
     ) -> Result<ResponseStream> {
         let auth_manager = self.client.state.provider.auth_manager();
         let mut auth_recovery = auth_manager
@@ -1270,7 +1279,7 @@ impl ModelClientSession {
                 .build_responses_options(turn_metadata_header, compression)
                 .await;
 
-            let request = self.client.build_responses_request(
+            let mut request = self.client.build_responses_request(
                 &client_setup.api_provider,
                 prompt,
                 model_info,
@@ -1278,6 +1287,16 @@ impl ModelClientSession {
                 summary,
                 service_tier.clone(),
             )?;
+            request.max_output_tokens = request_overrides.max_output_tokens;
+            if let Some(verbosity) = request_overrides.verbosity
+                && model_info.support_verbosity
+            {
+                request.text = create_text_param_for_request(
+                    Some(verbosity),
+                    &prompt.output_schema,
+                    prompt.output_schema_strict,
+                );
+            }
             let inference_trace_attempt = inference_trace.start_attempt();
             inference_trace_attempt.add_request_headers(&mut options.extra_headers);
             inference_trace_attempt.record_started(&request);
@@ -1628,10 +1647,50 @@ impl ModelClientSession {
                     service_tier,
                     turn_metadata_header,
                     inference_trace,
+                    ResponsesRequestOverrides::default(),
                 )
                 .await
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn rollctx_pair_summary_text(
+        &self,
+        prompt: &Prompt,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        service_tier: Option<String>,
+        max_output_tokens: i64,
+    ) -> Result<String> {
+        if !prompt.tools.is_empty() || prompt.parallel_tool_calls {
+            return Err(CodexErr::Fatal(
+                "rollctx pair-summary requests must not include tools".to_string(),
+            ));
+        }
+
+        let side_channel = ModelClientSession {
+            client: self.client.clone(),
+            websocket_session: WebsocketSession::default(),
+            turn_state: Arc::new(OnceLock::new()),
+        };
+        let stream = side_channel
+            .stream_responses_api(
+                prompt,
+                model_info,
+                session_telemetry,
+                Some(ReasoningEffortConfig::Low),
+                ReasoningSummaryConfig::None,
+                service_tier,
+                None,
+                &InferenceTraceContext::disabled(),
+                ResponsesRequestOverrides {
+                    max_output_tokens: Some(max_output_tokens),
+                    verbosity: Some(VerbosityConfig::Low),
+                },
+            )
+            .await?;
+        collect_rollctx_pair_summary_text(stream).await
     }
 
     /// Permanently disables WebSockets for this Codex session and resets WebSocket state.

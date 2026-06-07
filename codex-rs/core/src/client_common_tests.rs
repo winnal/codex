@@ -22,6 +22,7 @@ fn serializes_text_verbosity_when_set() {
         store: false,
         stream: true,
         include: vec![],
+        max_output_tokens: None,
         prompt_cache_key: None,
         service_tier: None,
         text: Some(TextControls {
@@ -69,6 +70,7 @@ fn serializes_text_schema_with_strict_format() {
         store: false,
         stream: true,
         include: vec![],
+        max_output_tokens: None,
         prompt_cache_key: None,
         service_tier: None,
         text: Some(text_controls),
@@ -130,6 +132,7 @@ fn omits_text_when_not_set() {
         store: false,
         stream: true,
         include: vec![],
+        max_output_tokens: None,
         prompt_cache_key: None,
         service_tier: None,
         text: None,
@@ -153,6 +156,7 @@ fn serializes_flex_service_tier_when_set() {
         store: false,
         stream: true,
         include: vec![],
+        max_output_tokens: None,
         prompt_cache_key: None,
         service_tier: Some(ServiceTier::Flex.to_string()),
         text: None,
@@ -163,5 +167,42 @@ fn serializes_flex_service_tier_when_set() {
     assert_eq!(
         v.get("service_tier").and_then(|tier| tier.as_str()),
         Some("flex")
+    );
+}
+
+#[test]
+fn serializes_and_converts_max_output_tokens_when_set() {
+    let req = ResponsesApiRequest {
+        model: "gpt-5.4".to_string(),
+        instructions: "i".to_string(),
+        input: vec![],
+        tools: vec![],
+        tool_choice: "auto".to_string(),
+        parallel_tool_calls: true,
+        reasoning: None,
+        store: false,
+        stream: true,
+        include: vec![],
+        max_output_tokens: Some(256),
+        prompt_cache_key: None,
+        service_tier: None,
+        text: None,
+        client_metadata: None,
+    };
+
+    let value = serde_json::to_value(&req).expect("json");
+    assert_eq!(
+        value
+            .get("max_output_tokens")
+            .and_then(serde_json::Value::as_i64),
+        Some(256)
+    );
+    let ws = codex_api::ResponseCreateWsRequest::from(&req);
+    let ws_value = serde_json::to_value(&ws).expect("json");
+    assert_eq!(
+        ws_value
+            .get("max_output_tokens")
+            .and_then(serde_json::Value::as_i64),
+        Some(256)
     );
 }

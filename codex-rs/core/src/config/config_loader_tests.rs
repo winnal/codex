@@ -30,6 +30,7 @@ use codex_config::loader::load_requirements_toml;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::config_types::PromptRetentionMode;
+use codex_protocol::config_types::RollingCompactionMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_READ_ONLY;
@@ -172,6 +173,11 @@ async fn prompt_retention_defaults_to_compact_without_budget_overrides() -> anyh
     assert_eq!(config.prompt_retention, PromptRetentionMode::Compact);
     assert_eq!(config.rolling_context_reserve_percent, None);
     assert_eq!(config.rolling_context_target_tokens, None);
+    assert_eq!(config.rolling_compaction, RollingCompactionMode::Disabled);
+    assert_eq!(config.protected_hot_exact_tokens, None);
+    assert_eq!(config.summary_group_token_cap, None);
+    assert_eq!(config.max_summary_levels, None);
+    assert_eq!(config.compact_when_level_group_count_gt, None);
     assert_eq!(config.model_context_window, None);
     assert_eq!(config.model_auto_compact_token_limit, None);
     assert_eq!(config.tool_output_token_limit, None);
@@ -189,10 +195,15 @@ async fn prompt_retention_config_resolves_rolling_fields() -> anyhow::Result<()>
     tokio::fs::write(
         codex_home.join(CONFIG_TOML_FILE),
         r#"
-	prompt_retention = "rolling"
-	rolling_context_reserve_percent = 15
-	rolling_context_target_tokens = 12345
-	"#,
+		prompt_retention = "rolling"
+		rolling_context_reserve_percent = 15
+		rolling_context_target_tokens = 12345
+		rolling_compaction = "pairwise"
+		protected_hot_exact_tokens = 2048
+		summary_group_token_cap = 512
+		max_summary_levels = 4
+		compact_when_level_group_count_gt = 2
+		"#,
     )
     .await?;
 
@@ -206,6 +217,11 @@ async fn prompt_retention_config_resolves_rolling_fields() -> anyhow::Result<()>
     assert_eq!(config.prompt_retention, PromptRetentionMode::Rolling);
     assert_eq!(config.rolling_context_reserve_percent, Some(15));
     assert_eq!(config.rolling_context_target_tokens, Some(12_345));
+    assert_eq!(config.rolling_compaction, RollingCompactionMode::Pairwise);
+    assert_eq!(config.protected_hot_exact_tokens, Some(2_048));
+    assert_eq!(config.summary_group_token_cap, Some(512));
+    assert_eq!(config.max_summary_levels, Some(4));
+    assert_eq!(config.compact_when_level_group_count_gt, Some(2));
 
     Ok(())
 }

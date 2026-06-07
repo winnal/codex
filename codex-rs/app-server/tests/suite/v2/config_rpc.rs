@@ -25,6 +25,7 @@ use codex_app_server_protocol::ToolsV2;
 use codex_app_server_protocol::WriteStatus;
 use codex_core::config::set_project_trust_level;
 use codex_protocol::config_types::PromptRetentionMode;
+use codex_protocol::config_types::RollingCompactionMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchLocation;
@@ -100,10 +101,15 @@ async fn config_read_includes_prompt_retention_fields() -> Result<()> {
     write_config(
         &codex_home,
         r#"
-prompt_retention = "rolling"
-rolling_context_reserve_percent = 15
-rolling_context_target_tokens = 12345
-"#,
+	prompt_retention = "rolling"
+	rolling_context_reserve_percent = 15
+	rolling_context_target_tokens = 12345
+	rolling_compaction = "pairwise"
+	protected_hot_exact_tokens = 2048
+	summary_group_token_cap = 512
+	max_summary_levels = 4
+	compact_when_level_group_count_gt = 2
+	"#,
     )?;
     let codex_home_path = codex_home.path().canonicalize()?;
     let user_file = AbsolutePathBuf::try_from(codex_home_path.join("config.toml"))?;
@@ -129,6 +135,14 @@ rolling_context_target_tokens = 12345
     assert_eq!(config.prompt_retention, Some(PromptRetentionMode::Rolling));
     assert_eq!(config.rolling_context_reserve_percent, Some(15));
     assert_eq!(config.rolling_context_target_tokens, Some(12_345));
+    assert_eq!(
+        config.rolling_compaction,
+        Some(RollingCompactionMode::Pairwise)
+    );
+    assert_eq!(config.protected_hot_exact_tokens, Some(2_048));
+    assert_eq!(config.summary_group_token_cap, Some(512));
+    assert_eq!(config.max_summary_levels, Some(4));
+    assert_eq!(config.compact_when_level_group_count_gt, Some(2));
     assert_eq!(
         origins.get("prompt_retention").expect("origin").name,
         ConfigLayerSource::User {
@@ -981,6 +995,31 @@ async fn config_batch_write_updates_prompt_retention_fields() -> Result<()> {
                     value: json!(12345),
                     merge_strategy: MergeStrategy::Replace,
                 },
+                ConfigEdit {
+                    key_path: "rolling_compaction".to_string(),
+                    value: json!("pairwise"),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                ConfigEdit {
+                    key_path: "protected_hot_exact_tokens".to_string(),
+                    value: json!(2048),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                ConfigEdit {
+                    key_path: "summary_group_token_cap".to_string(),
+                    value: json!(512),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                ConfigEdit {
+                    key_path: "max_summary_levels".to_string(),
+                    value: json!(4),
+                    merge_strategy: MergeStrategy::Replace,
+                },
+                ConfigEdit {
+                    key_path: "compact_when_level_group_count_gt".to_string(),
+                    value: json!(2),
+                    merge_strategy: MergeStrategy::Replace,
+                },
             ],
             expected_version: None,
             reload_user_config: false,
@@ -1012,6 +1051,14 @@ async fn config_batch_write_updates_prompt_retention_fields() -> Result<()> {
     );
     assert_eq!(read.config.rolling_context_reserve_percent, Some(15));
     assert_eq!(read.config.rolling_context_target_tokens, Some(12_345));
+    assert_eq!(
+        read.config.rolling_compaction,
+        Some(RollingCompactionMode::Pairwise)
+    );
+    assert_eq!(read.config.protected_hot_exact_tokens, Some(2_048));
+    assert_eq!(read.config.summary_group_token_cap, Some(512));
+    assert_eq!(read.config.max_summary_levels, Some(4));
+    assert_eq!(read.config.compact_when_level_group_count_gt, Some(2));
 
     Ok(())
 }

@@ -34,6 +34,7 @@ fn rolling_prompt_filters_historical_extension_contextual_user_prefix() {
             target_tokens: Some(500),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("current extension context plus newest body should fit");
@@ -74,6 +75,7 @@ fn rolling_prompt_does_not_reinclude_generated_context_before_cursor() {
         history_version: history.history_version(),
         raw_history_start_index: 1,
         projection_basis_fingerprint: 0,
+        ..RollingPromptState::default()
     };
 
     let result = build_rolling_prompt(
@@ -88,6 +90,7 @@ fn rolling_prompt_does_not_reinclude_generated_context_before_cursor() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("newer suffix should fit without rehydrating pre-cursor context");
@@ -119,6 +122,7 @@ fn rolling_prompt_keeps_turn_scoped_developer_context_as_body() {
             target_tokens: Some(500),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("turn-scoped developer context should fit");
@@ -155,6 +159,7 @@ fn rolling_prompt_filters_legacy_unmarked_developer_preamble_when_current_dev_ch
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("current prefix and body should fit");
@@ -192,6 +197,7 @@ fn rolling_prompt_filters_unmarked_historical_developer_prefix_matching_current_
             target_tokens: Some(500),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("current prefix and newest body should fit");
@@ -234,6 +240,7 @@ fn rolling_prompt_filters_large_unmarked_historical_developer_prefix_before_proj
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("current split prefix and newest body should fit");
@@ -283,6 +290,7 @@ fn rolling_prompt_rejects_encrypted_reasoning_when_summary_exceeds_item_cap() {
             target_tokens: Some(50_000),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect_err("oversized pass-through reasoning should not bypass the per-item cap");
@@ -317,6 +325,7 @@ fn rolling_prompt_keeps_turn_scoped_skill_context_as_body() {
             target_tokens: Some(500),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("turn-scoped skill context should fit");
@@ -350,6 +359,7 @@ fn rolling_prompt_filters_marked_historical_raw_developer_prefix() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("current developer prefix and newest body should fit");
@@ -385,6 +395,7 @@ fn rolling_prompt_keeps_post_user_generated_context_atomic_with_user_prompt() {
             target_tokens: Some(80),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect_err("post-user generated context and user prompt should fail as one newest frontier");
@@ -418,6 +429,7 @@ fn rolling_prompt_splits_generated_context_message_under_item_cap() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("generated turn context should split into model-visible bounded items");
@@ -458,6 +470,7 @@ fn rolling_prompt_keeps_multiple_outputs_for_one_custom_tool_call() {
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("custom call with notify and final outputs should fit");
@@ -494,6 +507,7 @@ fn rolling_prompt_keeps_code_mode_custom_followup_and_queued_user_input_atomic()
             target_tokens: None,
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("code-mode custom follow-up and queued input frontier should fit");
@@ -530,6 +544,7 @@ fn rolling_prompt_does_not_detach_queued_input_from_code_mode_custom_followup_un
             target_tokens: Some(30),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect_err(
@@ -566,6 +581,7 @@ fn rolling_prompt_does_not_detach_queued_input_from_mixed_custom_followup_under_
             target_tokens: Some(30),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect_err(
@@ -611,6 +627,7 @@ fn rolling_prompt_budgets_actual_custom_tool_output_size_used_by_code_mode() {
             target_tokens: Some(2_000),
             target_scale_percent: None,
             tool_output_limit_tokens: 10_000,
+            pairwise_compaction: None,
         },
     )
     .expect("rolling prompt should eject oversized old custom output and keep frontier");
@@ -643,6 +660,7 @@ fn rolling_prompt_drops_old_pass_through_items_that_exceed_per_item_limit() {
                 target_tokens: None,
                 target_scale_percent: None,
                 tool_output_limit_tokens: 10_000,
+                pairwise_compaction: None,
             },
         )
         .expect("oversized old pass-through item should be droppable");
@@ -669,6 +687,7 @@ fn rolling_prompt_errors_when_newest_pass_through_item_exceeds_per_item_limit() 
                 target_tokens: None,
                 target_scale_percent: None,
                 tool_output_limit_tokens: 10_000,
+                pairwise_compaction: None,
             },
         )
         .expect_err("oversized newest pass-through item should fail clearly");

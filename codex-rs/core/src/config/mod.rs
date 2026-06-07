@@ -86,6 +86,7 @@ use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::PromptRetentionMode;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::RollingCompactionMode;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ServiceTier;
@@ -618,6 +619,21 @@ pub struct Config {
     /// Rolling-mode absolute token target. When unset, rolling mode uses the
     /// effective model context window minus the rolling reserve.
     pub rolling_context_target_tokens: Option<i64>,
+
+    /// Optional compaction strategy layered on top of rolling prompt retention.
+    pub rolling_compaction: RollingCompactionMode,
+
+    /// Minimum exact hot suffix retained before pairwise cold-group compaction.
+    pub protected_hot_exact_tokens: Option<i64>,
+
+    /// Maximum token budget for one pairwise summary group.
+    pub summary_group_token_cap: Option<i64>,
+
+    /// Maximum pairwise summary levels to build.
+    pub max_summary_levels: Option<u8>,
+
+    /// Compact a level when it has more than this many groups.
+    pub compact_when_level_group_count_gt: Option<usize>,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -3454,6 +3470,11 @@ impl Config {
             prompt_retention: cfg.prompt_retention.unwrap_or_default(),
             rolling_context_reserve_percent: cfg.rolling_context_reserve_percent,
             rolling_context_target_tokens: cfg.rolling_context_target_tokens,
+            rolling_compaction: cfg.rolling_compaction.unwrap_or_default(),
+            protected_hot_exact_tokens: cfg.protected_hot_exact_tokens,
+            summary_group_token_cap: cfg.summary_group_token_cap,
+            max_summary_levels: cfg.max_summary_levels,
+            compact_when_level_group_count_gt: cfg.compact_when_level_group_count_gt,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,

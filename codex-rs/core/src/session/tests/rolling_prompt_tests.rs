@@ -1,4 +1,6 @@
 use super::*;
+use codex_protocol::config_types::RollingCompactionMode;
+use codex_protocol::error::CodexErr;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
@@ -171,6 +173,41 @@ async fn prompt_debug_uses_rolling_retention_for_successful_prompt() -> anyhow::
             .any(|text| text.contains("CURRENT_DEBUG_DEV_SENTINEL")),
         "rolling prompt-debug path should include the current developer prefix: {developer_texts:?}"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompt_debug_rejects_pairwise_rolling_compaction() -> anyhow::Result<()> {
+    let session = make_session_with_config(|config| {
+        config.prompt_retention = PromptRetentionMode::Rolling;
+        config.rolling_compaction = RollingCompactionMode::Pairwise;
+        config.rolling_context_reserve_percent = Some(0);
+        config.rolling_context_target_tokens = Some(20_000);
+        config.include_permissions_instructions = false;
+        config.include_apps_instructions = false;
+        config.include_collaboration_mode_instructions = false;
+        config.include_skill_instructions = false;
+        config.include_environment_context = false;
+    })
+    .await?;
+
+    let err = crate::prompt_debug::build_prompt_input_from_session(
+        session.as_ref(),
+        vec![UserInput::Text {
+            text: "CURRENT_DEBUG_USER_SENTINEL".to_string(),
+            text_elements: Vec::new(),
+        }],
+    )
+    .await
+    .expect_err("pairwise prompt-debug must not emit synthetic summaries");
+
+    match err {
+        CodexErr::UnsupportedOperation(message) => {
+            assert!(message.contains("pairwise rolling compaction"));
+        }
+        other => panic!("expected UnsupportedOperation, got {other:?}"),
+    }
 
     Ok(())
 }

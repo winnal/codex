@@ -16,6 +16,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
+use crate::context_manager::RollingPromptState;
 use crate::feedback_tags;
 use crate::goals::GoalRuntimeEvent;
 use crate::hook_runtime::inspect_pending_input;
@@ -79,6 +80,7 @@ use codex_git_utils::get_git_repo_root_with_fs;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::PromptRetentionMode;
+use codex_protocol::config_types::RollingCompactionMode;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
@@ -252,19 +254,20 @@ pub(crate) async fn run_turn(
         }
 
         let base_instructions = sess.get_base_instructions().await;
-        let sampling_request_input = sess
-            .build_sampling_prompt_input(
-                turn_context.as_ref(),
-                &base_instructions,
-                &rolling_invariant_items,
-                /*rolling_target_scale_percent*/ None,
-            )
-            .await;
-
         let window_id = sess.services.model_client.current_window_id();
         let turn_metadata_header = turn_context
             .turn_metadata_state
             .current_header_value_for_model_request(&window_id);
+        let sampling_request_input = build_sampling_prompt_input_for_turn(
+            &sess,
+            turn_context.as_ref(),
+            &base_instructions,
+            &rolling_invariant_items,
+            /*rolling_target_scale_percent*/ None,
+            &client_session,
+            /*retry_projected_state*/ None,
+        )
+        .await;
         let (sampling_request_input, sampling_result) = match sampling_request_input {
             Ok(sampling_request_input) => {
                 let sampling_result = run_sampling_request(
@@ -1032,6 +1035,38 @@ pub(crate) fn build_prompt(
     }
 }
 
+async fn build_sampling_prompt_input_for_turn(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+    base_instructions: &BaseInstructions,
+    rolling_invariant_items: &[ResponseItem],
+    rolling_target_scale_percent: Option<u8>,
+    client_session: &ModelClientSession,
+    retry_projected_state: Option<RollingPromptState>,
+) -> CodexResult<SamplingPromptInput> {
+    if turn_context.config.prompt_retention == PromptRetentionMode::Rolling
+        && turn_context.config.rolling_compaction == RollingCompactionMode::Pairwise
+    {
+        sess.build_sampling_prompt_input_with_live_pair_summaries(
+            turn_context,
+            base_instructions,
+            rolling_invariant_items,
+            rolling_target_scale_percent,
+            client_session,
+            retry_projected_state,
+        )
+        .await
+    } else {
+        sess.build_sampling_prompt_input(
+            turn_context,
+            base_instructions,
+            rolling_invariant_items,
+            rolling_target_scale_percent,
+        )
+        .await
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 #[instrument(level = "trace",
@@ -1073,15 +1108,19 @@ async fn run_sampling_request(
     let mut initial_input = Some(input);
     let mut rolling_context_window_retries = 0u8;
     let mut rolling_target_scale_percent = None;
+    let mut retry_projected_state = None;
     loop {
         let mut sampling_prompt_input = if let Some(input) = initial_input.take() {
             input
         } else {
-            sess.build_sampling_prompt_input(
+            build_sampling_prompt_input_for_turn(
+                &sess,
                 turn_context.as_ref(),
                 &base_instructions,
                 &rolling_invariant_items,
                 rolling_target_scale_percent,
+                client_session,
+                retry_projected_state.take(),
             )
             .await?
         };
@@ -1121,6 +1160,7 @@ async fn run_sampling_request(
                             .map_or(90, |percent: u8| percent.saturating_mul(90) / 100)
                             .max(1),
                     );
+                    retry_projected_state = sampling_prompt_input.projected_rolling_prompt_state();
                     initial_input = None;
                     continue;
                 }

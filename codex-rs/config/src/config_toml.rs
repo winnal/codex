@@ -39,7 +39,9 @@ use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::PromptRetentionMode;
+use codex_protocol::config_types::ROLLCTX_SUMMARY_GROUP_TOKEN_CAP_MAX;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::RollingCompactionMode;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::Verbosity;
@@ -167,6 +169,25 @@ pub struct ConfigToml {
     /// effective model context window minus the rolling reserve.
     #[schemars(range(min = 1))]
     pub rolling_context_target_tokens: Option<i64>,
+
+    /// Optional compaction strategy layered on top of rolling prompt retention.
+    pub rolling_compaction: Option<RollingCompactionMode>,
+
+    /// Minimum exact hot suffix retained before pairwise cold-group compaction.
+    #[schemars(range(min = 1))]
+    pub protected_hot_exact_tokens: Option<i64>,
+
+    /// Maximum token budget for one pairwise summary group.
+    #[schemars(range(min = 1, max = 512))]
+    pub summary_group_token_cap: Option<i64>,
+
+    /// Maximum pairwise summary levels to build.
+    #[schemars(range(min = 1))]
+    pub max_summary_levels: Option<u8>,
+
+    /// Compact a level when it has more than this many groups.
+    #[schemars(range(min = 2))]
+    pub compact_when_level_group_count_gt: Option<usize>,
 
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
@@ -942,6 +963,33 @@ pub fn validate_prompt_retention_config(cfg: &ConfigToml) -> Result<(), String> 
     {
         return Err("rolling_context_target_tokens must be at least 1".to_string());
     }
+    if let Some(protected_hot_exact_tokens) = cfg.protected_hot_exact_tokens
+        && protected_hot_exact_tokens < 1
+    {
+        return Err("protected_hot_exact_tokens must be at least 1".to_string());
+    }
+    if let Some(summary_group_token_cap) = cfg.summary_group_token_cap
+        && summary_group_token_cap < 1
+    {
+        return Err("summary_group_token_cap must be at least 1".to_string());
+    }
+    if let Some(summary_group_token_cap) = cfg.summary_group_token_cap
+        && summary_group_token_cap > ROLLCTX_SUMMARY_GROUP_TOKEN_CAP_MAX
+    {
+        return Err(format!(
+            "summary_group_token_cap must be at most {ROLLCTX_SUMMARY_GROUP_TOKEN_CAP_MAX}"
+        ));
+    }
+    if let Some(max_summary_levels) = cfg.max_summary_levels
+        && max_summary_levels < 1
+    {
+        return Err("max_summary_levels must be at least 1".to_string());
+    }
+    if let Some(compact_when_level_group_count_gt) = cfg.compact_when_level_group_count_gt
+        && compact_when_level_group_count_gt < 2
+    {
+        return Err("compact_when_level_group_count_gt must be at least 2".to_string());
+    }
     Ok(())
 }
 
@@ -979,6 +1027,52 @@ mod tests {
 
     const WORKSPACE_ID_A: &str = "123e4567-e89b-42d3-a456-426614174000";
     const WORKSPACE_ID_B: &str = "123e4567-e89b-42d3-a456-426614174001";
+
+    #[test]
+    fn validate_prompt_retention_config_rejects_pairwise_non_positive_knobs() {
+        for (config, expected) in [
+            (
+                ConfigToml {
+                    protected_hot_exact_tokens: Some(0),
+                    ..ConfigToml::default()
+                },
+                "protected_hot_exact_tokens must be at least 1",
+            ),
+            (
+                ConfigToml {
+                    summary_group_token_cap: Some(0),
+                    ..ConfigToml::default()
+                },
+                "summary_group_token_cap must be at least 1",
+            ),
+            (
+                ConfigToml {
+                    summary_group_token_cap: Some(ROLLCTX_SUMMARY_GROUP_TOKEN_CAP_MAX + 1),
+                    ..ConfigToml::default()
+                },
+                "summary_group_token_cap must be at most 512",
+            ),
+            (
+                ConfigToml {
+                    max_summary_levels: Some(0),
+                    ..ConfigToml::default()
+                },
+                "max_summary_levels must be at least 1",
+            ),
+            (
+                ConfigToml {
+                    compact_when_level_group_count_gt: Some(1),
+                    ..ConfigToml::default()
+                },
+                "compact_when_level_group_count_gt must be at least 2",
+            ),
+        ] {
+            assert_eq!(
+                validate_prompt_retention_config(&config).expect_err("config should fail"),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn forced_chatgpt_workspace_id_accepts_single_string() {

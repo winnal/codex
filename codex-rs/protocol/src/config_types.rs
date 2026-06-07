@@ -50,6 +50,24 @@ pub enum PromptRetentionMode {
     Rolling,
 }
 
+/// Selects optional compaction behavior layered on top of rolling prompt retention.
+#[derive(
+    Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum RollingCompactionMode {
+    /// Do not summarize cold rolling groups.
+    #[default]
+    Disabled,
+    /// Summarize sealed cold rolling groups with pairwise tree compaction.
+    Pairwise,
+}
+
+/// Hard cap for one ROLLCTX pairwise summary fragment. The cap stays below the
+/// model-context manual-review threshold for newly injected fragments.
+pub const ROLLCTX_SUMMARY_GROUP_TOKEN_CAP_MAX: i64 = 512;
+
 /// A summary of the reasoning performed by the model. This can be useful for
 /// debugging and understanding the model's reasoning process.
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries

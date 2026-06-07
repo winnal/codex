@@ -3,8 +3,14 @@ use super::estimate_response_item_token_count;
 use super::rolling_context_filter::is_historical_context_item_at;
 use super::rolling_context_filter::is_turn_context_group_anchor;
 use super::rolling_context_filter::is_turn_context_group_start;
+use super::rolling_pairwise::PairwiseRollingPromptBuildOutcome;
+use super::rolling_pairwise::PairwiseRollingPromptParams;
+use super::rolling_pairwise::PairwiseSummaryMode;
+use super::rolling_pairwise::PairwiseSummaryRequest;
+use super::rolling_pairwise::build_pairwise_rolling_prompt;
 use super::rolling_projection::project_rolling_message_item;
 use super::rolling_projection::project_rolling_prompt_item;
+use super::rolling_summary_tree::PairwiseNode;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
@@ -15,13 +21,14 @@ use std::hash::Hash;
 use std::hash::Hasher;
 
 const DEFAULT_ROLLING_CONTEXT_RESERVE_PERCENT: u8 = 10;
-const MAX_ROLLING_PROMPT_ITEM_TOKENS: i64 = 10_000;
+pub(super) const MAX_ROLLING_PROMPT_ITEM_TOKENS: i64 = 10_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RollingPromptState {
     pub(crate) history_version: u64,
     pub(crate) raw_history_start_index: usize,
     pub(crate) projection_basis_fingerprint: u64,
+    pub(super) pairwise_summaries: Vec<PairwiseNode>,
 }
 
 impl RollingPromptState {
@@ -38,6 +45,21 @@ impl RollingPromptState {
                 .max(projected.raw_history_start_index)
         };
         self.projection_basis_fingerprint = projected.projection_basis_fingerprint;
+        self.pairwise_summaries = projected.pairwise_summaries.clone();
+    }
+
+    pub(super) fn add_pairwise_summary(&mut self, summary: PairwiseNode) {
+        let coverage = summary.coverage;
+        let level = summary.level;
+        self.pairwise_summaries
+            .retain(|existing| !coverage.covers(existing.coverage) || existing.level > level);
+        if !self
+            .pairwise_summaries
+            .iter()
+            .any(|existing| existing.level >= level && existing.coverage.covers(coverage))
+        {
+            self.pairwise_summaries.push(summary);
+        }
     }
 }
 
@@ -111,6 +133,16 @@ pub(crate) struct RollingPromptParams<'a> {
     pub(crate) target_tokens: Option<i64>,
     pub(crate) target_scale_percent: Option<u8>,
     pub(crate) tool_output_limit_tokens: i64,
+    pub(crate) pairwise_compaction: Option<PairwiseRollingPromptParams>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RollingPromptBuildOutcome {
+    Ready(RollingPromptResult),
+    NeedsPairSummary {
+        request: PairwiseSummaryRequest,
+        projected_state: RollingPromptState,
+    },
 }
 
 pub(crate) fn build_rolling_prompt(
@@ -118,12 +150,36 @@ pub(crate) fn build_rolling_prompt(
     state: &RollingPromptState,
     params: RollingPromptParams<'_>,
 ) -> Result<RollingPromptResult, RollingPromptError> {
+    match build_rolling_prompt_internal(history, state, params, PairwiseSummaryMode::Synthetic)? {
+        RollingPromptBuildOutcome::Ready(result) => Ok(result),
+        RollingPromptBuildOutcome::NeedsPairSummary { .. } => {
+            unreachable!("synthetic pairwise summary mode must not request live summaries")
+        }
+    }
+}
+
+pub(crate) fn build_rolling_prompt_with_live_summaries(
+    history: &ContextManager,
+    state: &RollingPromptState,
+    params: RollingPromptParams<'_>,
+) -> Result<RollingPromptBuildOutcome, RollingPromptError> {
+    build_rolling_prompt_internal(history, state, params, PairwiseSummaryMode::RequireReady)
+}
+
+fn build_rolling_prompt_internal(
+    history: &ContextManager,
+    state: &RollingPromptState,
+    params: RollingPromptParams<'_>,
+    pairwise_summary_mode: PairwiseSummaryMode,
+) -> Result<RollingPromptBuildOutcome, RollingPromptError> {
     let Some(effective_context_window) =
         params.effective_context_window.filter(|window| *window > 0)
     else {
         return Err(RollingPromptError::NoContextWindow);
     };
 
+    let fingerprint =
+        projection_basis_fingerprint(&params, effective_context_window, &params.invariant_prefix);
     let invariant_prefix = params.invariant_prefix;
     let projected_invariant_prefix = invariant_prefix
         .iter()
@@ -134,17 +190,12 @@ pub(crate) fn build_rolling_prompt(
 
     let mut projected_state = state.clone();
     reset_or_clamp_state(history, &mut projected_state);
-    let fingerprint = projection_basis_fingerprint(
-        params.input_modalities,
-        params.reserve_percent,
-        params.target_tokens,
-        params.target_scale_percent,
-        params.tool_output_limit_tokens,
-        effective_context_window,
-        &invariant_prefix,
-    );
     if projected_state.projection_basis_fingerprint != fingerprint {
         projected_state.projection_basis_fingerprint = fingerprint;
+        projected_state.pairwise_summaries.clear();
+        if params.pairwise_compaction.is_some() {
+            projected_state.raw_history_start_index = 0;
+        }
     }
 
     let target = apply_target_scale(
@@ -182,6 +233,33 @@ pub(crate) fn build_rolling_prompt(
         &invariant_prefix,
         tool_output_limit_tokens,
     );
+    if let Some(pairwise_compaction) = params.pairwise_compaction {
+        return match build_pairwise_rolling_prompt(
+            history,
+            projected_state,
+            groups,
+            pairwise_compaction,
+            pinned_tokens,
+            body_budget,
+            target,
+            backoff_applied,
+            old_raw_start,
+            &invariant_prefix,
+            projected_invariant_prefix,
+            pairwise_summary_mode,
+        )? {
+            PairwiseRollingPromptBuildOutcome::Ready(result) => {
+                Ok(RollingPromptBuildOutcome::Ready(result))
+            }
+            PairwiseRollingPromptBuildOutcome::NeedsSummary {
+                request,
+                projected_state,
+            } => Ok(RollingPromptBuildOutcome::NeedsPairSummary {
+                request,
+                projected_state,
+            }),
+        };
+    }
     let mut kept_groups = Vec::new();
     let mut kept_tokens = 0i64;
 
@@ -233,7 +311,7 @@ pub(crate) fn build_rolling_prompt(
 
     projected_state.raw_history_start_index = new_raw_start;
 
-    Ok(RollingPromptResult {
+    Ok(RollingPromptBuildOutcome::Ready(RollingPromptResult {
         prompt_input,
         estimated_prompt_tokens,
         dropped_body_items,
@@ -241,34 +319,34 @@ pub(crate) fn build_rolling_prompt(
         target_tokens: target,
         backoff_applied,
         projected_state,
-    })
+    }))
 }
 
 fn reset_or_clamp_state(history: &ContextManager, state: &mut RollingPromptState) {
     if state.history_version != history.history_version() {
         state.history_version = history.history_version();
         state.raw_history_start_index = 0;
+        state.pairwise_summaries.clear();
     }
     state.raw_history_start_index = state.raw_history_start_index.min(history.raw_items().len());
+    if state.raw_history_start_index == history.raw_items().len() {
+        state.pairwise_summaries.clear();
+    }
 }
 
 fn projection_basis_fingerprint(
-    input_modalities: &[InputModality],
-    reserve_percent: Option<u8>,
-    target_tokens: Option<i64>,
-    target_scale_percent: Option<u8>,
-    tool_output_limit_tokens: i64,
+    params: &RollingPromptParams<'_>,
     effective_context_window: i64,
     invariant_prefix: &[ResponseItem],
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     "rollctx-v2".hash(&mut hasher);
-    input_modalities.hash(&mut hasher);
-    reserve_percent.hash(&mut hasher);
-    target_tokens.hash(&mut hasher);
-    target_scale_percent.hash(&mut hasher);
-    tool_output_limit_tokens.hash(&mut hasher);
+    params.input_modalities.hash(&mut hasher);
+    params.reserve_percent.hash(&mut hasher);
+    params.target_tokens.hash(&mut hasher);
+    params.tool_output_limit_tokens.hash(&mut hasher);
     effective_context_window.hash(&mut hasher);
+    params.pairwise_compaction.hash(&mut hasher);
     invariant_prefix.len().hash(&mut hasher);
     for item in invariant_prefix {
         serde_json::to_string(item)
@@ -336,21 +414,22 @@ fn validate_prompt_items_within_limit(items: &[ResponseItem]) -> Result<(), Roll
 }
 
 #[derive(Debug)]
-struct RollingGroup {
-    raw_start_index: usize,
-    items: Vec<ResponseItem>,
-    tokens: i64,
+pub(super) struct RollingGroup {
+    pub(super) raw_start_index: usize,
+    pub(super) raw_end_exclusive: usize,
+    pub(super) items: Vec<ResponseItem>,
+    pub(super) tokens: i64,
 }
 
 impl RollingGroup {
-    fn item_tokens_exceed_limit(&self) -> bool {
+    pub(super) fn item_tokens_exceed_limit(&self) -> bool {
         self.items
             .iter()
             .map(item_token_estimate)
             .any(|tokens| tokens > MAX_ROLLING_PROMPT_ITEM_TOKENS)
     }
 
-    fn item_limit_error(&self) -> RollingPromptError {
+    pub(super) fn item_limit_error(&self) -> RollingPromptError {
         let item_tokens = self
             .items
             .iter()
@@ -365,7 +444,7 @@ impl RollingGroup {
     }
 }
 
-fn item_token_estimate(item: &ResponseItem) -> i64 {
+pub(super) fn item_token_estimate(item: &ResponseItem) -> i64 {
     estimate_response_item_token_count(item)
 }
 
@@ -399,6 +478,7 @@ fn projected_rolling_groups(
             let tokens = estimate_items_tokens(&items);
             Some(RollingGroup {
                 raw_start_index: group.raw_start_index,
+                raw_end_exclusive: group.raw_end_exclusive,
                 items,
                 tokens,
             })
@@ -409,6 +489,7 @@ fn projected_rolling_groups(
 #[derive(Debug)]
 struct RawRollingGroup {
     raw_start_index: usize,
+    raw_end_exclusive: usize,
     items: Vec<ResponseItem>,
 }
 
@@ -453,6 +534,7 @@ fn rolling_groups(
                 };
                 groups.push(RawRollingGroup {
                     raw_start_index: index,
+                    raw_end_exclusive: group_end + 1,
                     items: raw_items[index..=group_end]
                         .iter()
                         .enumerate()
@@ -490,6 +572,7 @@ fn rolling_groups(
             if group_start >= raw_start_index {
                 groups.push(RawRollingGroup {
                     raw_start_index: group_start,
+                    raw_end_exclusive: group_end + 1,
                     items: raw_items[group_start..=group_end].to_vec(),
                 });
             }
@@ -500,6 +583,7 @@ fn rolling_groups(
         if index >= raw_start_index {
             groups.push(RawRollingGroup {
                 raw_start_index: index,
+                raw_end_exclusive: index + 1,
                 items: vec![item.clone()],
             });
         }

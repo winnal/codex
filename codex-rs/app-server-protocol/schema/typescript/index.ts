@@ -66,6 +66,7 @@ export type { ResourceContent } from "./ResourceContent";
 export type { ResourceTemplate } from "./ResourceTemplate";
 export type { ResponseItem } from "./ResponseItem";
 export type { ReviewDecision } from "./ReviewDecision";
+export type { RollingCompactionMode } from "./RollingCompactionMode";
 export type { ServerNotification } from "./ServerNotification";
 export type { ServerRequest } from "./ServerRequest";
 export type { SessionSource } from "./SessionSource";

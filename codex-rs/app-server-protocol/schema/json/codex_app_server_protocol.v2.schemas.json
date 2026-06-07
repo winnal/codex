@@ -3769,6 +3769,14 @@
             "null"
           ]
         },
+        "compact_when_level_group_count_gt": {
+          "format": "uint",
+          "minimum": 2.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "desktop": {
           "additionalProperties": true,
           "type": [
@@ -3805,6 +3813,14 @@
         "instructions": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "max_summary_levels": {
+          "format": "uint8",
+          "minimum": 1.0,
+          "type": [
+            "integer",
             "null"
           ]
         },
@@ -3884,10 +3900,28 @@
             }
           ]
         },
+        "protected_hot_exact_tokens": {
+          "format": "int64",
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "review_model": {
           "type": [
             "string",
             "null"
+          ]
+        },
+        "rolling_compaction": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RollingCompactionMode"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "rolling_context_reserve_percent": {
@@ -3933,6 +3967,15 @@
             "null"
           ]
         },
+        "summary_group_token_cap": {
+          "format": "int64",
+          "maximum": 512.0,
+          "minimum": 1.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "tools": {
           "anyOf": [
             {
@@ -3955,8 +3998,12 @@
         }
       },
       "required": [
+        "compact_when_level_group_count_gt",
+        "max_summary_levels",
+        "protected_hot_exact_tokens",
         "rolling_context_reserve_percent",
-        "rolling_context_target_tokens"
+        "rolling_context_target_tokens",
+        "summary_group_token_cap"
       ],
       "type": "object"
     },
@@ -11359,6 +11406,25 @@
           ],
           "title": "CustomReviewTarget",
           "type": "object"
+        }
+      ]
+    },
+    "RollingCompactionMode": {
+      "description": "Selects optional compaction behavior layered on top of rolling prompt retention.",
+      "oneOf": [
+        {
+          "description": "Do not summarize cold rolling groups.",
+          "enum": [
+            "disabled"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Summarize sealed cold rolling groups with pairwise tree compaction.",
+          "enum": [
+            "pairwise"
+          ],
+          "type": "string"
         }
       ]
     },

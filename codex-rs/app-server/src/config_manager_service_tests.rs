@@ -253,6 +253,31 @@ async fn batch_write_rejects_invalid_prompt_retention_fields() -> Result<()> {
             "rolling_context_target_tokens must be at least 1",
         ),
         (
+            "protected_hot_exact_tokens",
+            serde_json::json!(0),
+            "protected_hot_exact_tokens must be at least 1",
+        ),
+        (
+            "summary_group_token_cap",
+            serde_json::json!(0),
+            "summary_group_token_cap must be at least 1",
+        ),
+        (
+            "max_summary_levels",
+            serde_json::json!(0),
+            "max_summary_levels must be at least 1",
+        ),
+        (
+            "compact_when_level_group_count_gt",
+            serde_json::json!(1),
+            "compact_when_level_group_count_gt must be at least 2",
+        ),
+        (
+            "rolling_compaction",
+            serde_json::json!("sideways"),
+            "unknown variant `sideways`",
+        ),
+        (
             "prompt_retention",
             serde_json::json!("sideways"),
             "unknown variant `sideways`",
