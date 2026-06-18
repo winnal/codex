@@ -7806,6 +7806,14 @@
             ],
             "description": "[UNSTABLE] Optional default for where approval requests are routed for review."
           },
+          "compact_preserve_recent_tokens": {
+            "format": "int64",
+            "minimum": 1.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "compact_prompt": {
             "type": [
               "string",

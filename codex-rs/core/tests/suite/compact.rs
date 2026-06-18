@@ -540,7 +540,11 @@ async fn summarize_context_three_requests_and_instructions() {
     });
     let test = builder.build(&server).await.unwrap();
     let codex = test.codex.clone();
-    let rollout_path = test.session_configured.rollout_path.expect("rollout path");
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
 
     // 1) Normal user input – should hit server once.
     codex

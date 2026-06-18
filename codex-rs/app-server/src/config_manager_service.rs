@@ -128,6 +128,8 @@ impl ConfigManager {
         let effective_config_toml: ConfigToml = effective
             .try_into()
             .map_err(|err| ConfigManagerError::toml("invalid configuration", err))?;
+        validate_config_toml(&effective_config_toml)
+            .map_err(|err| ConfigManagerError::anyhow("invalid configuration", err))?;
 
         let json_value = serde_json::to_value(&effective_config_toml)
             .map_err(|err| ConfigManagerError::json("failed to serialize configuration", err))?;
@@ -589,8 +591,19 @@ fn toml_value_to_value(value: &TomlValue) -> anyhow::Result<toml_edit::Value> {
     }
 }
 
-fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
-    let _: ConfigToml = value.clone().try_into()?;
+fn validate_config(value: &TomlValue) -> anyhow::Result<()> {
+    let config: ConfigToml = value.clone().try_into()?;
+    validate_config_toml(&config)?;
+    Ok(())
+}
+
+fn validate_config_toml(config: &ConfigToml) -> anyhow::Result<()> {
+    if config
+        .compact_preserve_recent_tokens
+        .is_some_and(|tokens| tokens <= 0)
+    {
+        anyhow::bail!("`compact_preserve_recent_tokens` must be a positive integer when set");
+    }
     Ok(())
 }
 

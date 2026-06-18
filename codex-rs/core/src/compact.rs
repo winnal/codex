@@ -4,6 +4,18 @@ use std::time::Instant;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
+use crate::compact_exact_tail::CompactionHistoryPolicy;
+use crate::compact_exact_tail::EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS;
+use crate::compact_exact_tail::ExactTailImplementation;
+use crate::compact_exact_tail::ExactTailPrepareInput;
+use crate::compact_exact_tail::build_exact_tail_replacement;
+use crate::compact_exact_tail::check_cold_input_fits;
+use crate::compact_exact_tail::ensure_non_empty_local_summary;
+use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
+use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
+use crate::compact_exact_tail::local_summary_scaffold_overhead_tokens;
+use crate::compact_exact_tail::prepare_exact_tail_plan;
+use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -49,17 +61,12 @@ use codex_model_provider_info::ModelProviderInfo;
 
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
-const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+pub(crate) const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
-/// Controls whether compaction replacement history must include initial context.
+/// Controls whether compaction replacement history must carry initial context.
 ///
-/// Pre-turn/manual compaction variants use `DoNotInject`: they replace history with a summary and
-/// clear `reference_context_item`, so the next regular turn will fully reinject initial context
-/// after compaction.
-///
-/// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
-/// compaction summary as the last item in history after mid-turn compaction; we therefore inject
-/// initial context into the replacement history just above the last real user message.
+/// Pre-turn/manual compaction clears the reference context item and lets the next turn reinject.
+/// Mid-turn compaction must inject context above the last real user so the summary stays last.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage,
@@ -169,6 +176,7 @@ async fn run_compact_task_inner(
         Arc::clone(&turn_context),
         input,
         initial_context_injection,
+        trigger,
         compaction_metadata,
     )
     .await;
@@ -204,6 +212,7 @@ async fn run_compact_task_inner_impl(
     turn_context: Arc<TurnContext>,
     input: Vec<UserInput>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
     let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
@@ -211,18 +220,67 @@ async fn run_compact_task_inner_impl(
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
-    let mut history = sess.clone_history().await;
+    let source_history = sess.clone_history().await;
+    let source_history_items = source_history.raw_items().to_vec();
+    let base_instructions = sess.get_base_instructions().await;
+    let policy = CompactionHistoryPolicy::from_config(&turn_context.config);
+    let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
+        sess: sess.as_ref(),
+        turn_context: turn_context.as_ref(),
+        history_items: &source_history_items,
+        base_instructions: &base_instructions,
+        policy,
+        trigger,
+        initial_context_injection,
+        estimated_summary_scaffold_overhead_tokens: local_summary_scaffold_overhead_tokens(),
+        retained_cold_user_message_budget_tokens:
+            EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS,
+        implementation: ExactTailImplementation::Local,
+    })
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            let error = error.into_codex_err();
+            send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
+            return Err(error);
+        }
+    };
+
+    let mut history = source_history;
+    if let Some(prepared) = &exact_tail_plan {
+        history.replace(prepared.plan.cold_history.clone());
+    }
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.model_info.truncation_policy.into(),
     );
+    if let Some(prepared) = &exact_tail_plan {
+        if let Err(error) = check_cold_input_fits(
+            &prepared.plan,
+            history.raw_items(),
+            turn_context.model_context_window(),
+        )
+        .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)
+        {
+            send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
+            return Err(error);
+        }
+        if let Some(context_window) = turn_context.model_context_window()
+            && let Some(request_tokens) =
+                history.estimate_token_count_with_base_instructions(&base_instructions)
+            && request_tokens > context_window
+        {
+            let error = exact_tail_cold_input_too_large_error(request_tokens, context_window);
+            send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
+            return Err(error);
+        }
+    }
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut client_session = sess.services.model_client.new_session();
-    // Reuse one client session so turn-scoped state (sticky routing, websocket incremental
-    // request tracking)
-    // survives retries within this compact turn.
+    // Reuse one client session so turn-scoped state survives retries within this compact turn.
     let window_id = sess.current_window_id().await;
     let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
         sess.installation_id.clone(),
@@ -230,7 +288,7 @@ async fn run_compact_task_inner_impl(
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
 
-    loop {
+    let compaction_output = loop {
         // Clone is required because of the loop
         let turn_input = history
             .clone()
@@ -238,8 +296,13 @@ async fn run_compact_task_inner_impl(
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
-            base_instructions: sess.get_base_instructions().await,
+            base_instructions: base_instructions.clone(),
             ..Default::default()
+        };
+        let drain_mode = if exact_tail_plan.is_some() {
+            LocalCompactionDrainMode::BufferOnly
+        } else {
+            LocalCompactionDrainMode::RecordToSession
         };
         let attempt_result = drain_to_completed(
             &sess,
@@ -247,17 +310,26 @@ async fn run_compact_task_inner_impl(
             &mut client_session,
             &responses_metadata,
             &prompt,
+            drain_mode,
         )
         .await;
 
         match attempt_result {
-            Ok(()) => {
-                break;
+            Ok(output) => {
+                break output;
             }
             Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
                 return Err(err);
             }
             Err(e @ CodexErr::ContextWindowExceeded) => {
+                if exact_tail_plan.is_some() {
+                    let error = exact_tail_backend_context_exceeded_error();
+                    error!(
+                        "Exact-tail local compaction request exceeded backend context window without a safe cold-pruning repair. Original error: {e}"
+                    );
+                    send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
+                    return Err(error);
+                }
                 if turn_input_len > 1 {
                     // Trim from the beginning to preserve cache (prefix-based) and keep recent messages intact.
                     error!(
@@ -293,13 +365,31 @@ async fn run_compact_task_inner_impl(
                 }
             }
         }
-    }
+    };
 
-    let history_snapshot = sess.clone_history().await;
-    let history_items = history_snapshot.raw_items();
-    let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
+    let (summary_suffix, user_messages) = match &exact_tail_plan {
+        Some(prepared) => {
+            let summary_suffix =
+                get_last_assistant_message_from_turn(&compaction_output.completed_items)
+                    .unwrap_or_default();
+            if let Err(error) = ensure_non_empty_local_summary(&prepared.plan, &summary_suffix)
+                .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)
+            {
+                send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
+                return Err(error);
+            }
+            (summary_suffix, prepared.plan.cold_user_messages.clone())
+        }
+        None => {
+            let history_snapshot = sess.clone_history().await;
+            let history_items = history_snapshot.raw_items();
+            (
+                get_last_assistant_message_from_turn(history_items).unwrap_or_default(),
+                collect_user_messages(history_items),
+            )
+        }
+    };
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
-    let user_messages = collect_user_messages(history_items);
 
     let mut new_history = build_compacted_history(Vec::new(), &user_messages, &summary_text);
     if let Some(summary_item) = new_history.last_mut() {
@@ -307,12 +397,31 @@ async fn run_compact_task_inner_impl(
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
     }
+    if let Some(prepared) = &exact_tail_plan {
+        match build_exact_tail_replacement(
+            prepared,
+            new_history,
+            initial_context_injection,
+            estimate_response_items_token_count(&compaction_output.completed_items),
+        ) {
+            Ok(replacement_history) => {
+                new_history = replacement_history;
+            }
+            Err(error) => {
+                let error = error.into_codex_err();
+                send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
+                return Err(error);
+            }
+        }
+    }
     let (window_number, window_ids) = sess.advance_auto_compact_window().await;
 
-    if matches!(
-        initial_context_injection,
-        InitialContextInjection::BeforeLastUserMessage
-    ) {
+    if exact_tail_plan.is_none()
+        && matches!(
+            initial_context_injection,
+            InitialContextInjection::BeforeLastUserMessage
+        )
+    {
         let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
@@ -345,6 +454,12 @@ async fn run_compact_task_inner_impl(
     });
     sess.send_event(&turn_context, warning).await;
     Ok(summary_suffix)
+}
+
+async fn send_local_compaction_error(sess: &Session, turn_context: &TurnContext, error: &CodexErr) {
+    sess.track_turn_codex_error(turn_context, error);
+    let event = EventMsg::Error(error.to_error_event(/*message_prefix*/ None));
+    sess.send_event(turn_context, event).await;
 }
 
 pub(crate) struct CompactionAnalyticsAttempt {
@@ -629,13 +744,24 @@ fn build_compacted_history_with_limit(
     history
 }
 
+struct LocalCompactionOutput {
+    completed_items: Vec<ResponseItem>,
+}
+
+#[derive(Clone, Copy)]
+enum LocalCompactionDrainMode {
+    RecordToSession,
+    BufferOnly,
+}
+
 async fn drain_to_completed(
     sess: &Session,
     turn_context: &TurnContext,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
-) -> CodexResult<()> {
+    mode: LocalCompactionDrainMode,
+) -> CodexResult<LocalCompactionOutput> {
     let mut stream = client_session
         .stream(
             prompt,
@@ -650,6 +776,7 @@ async fn drain_to_completed(
             &InferenceTraceContext::disabled(),
         )
         .await?;
+    let mut completed_items = Vec::new();
     loop {
         let maybe_event = stream.next().await;
         let Some(event) = maybe_event else {
@@ -659,10 +786,15 @@ async fn drain_to_completed(
             ));
         };
         match event {
-            Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
-                    .await;
-            }
+            Ok(ResponseEvent::OutputItemDone(item)) => match mode {
+                LocalCompactionDrainMode::RecordToSession => {
+                    sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+                        .await;
+                }
+                LocalCompactionDrainMode::BufferOnly => {
+                    completed_items.push(item);
+                }
+            },
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;
             }
@@ -672,7 +804,7 @@ async fn drain_to_completed(
             Ok(ResponseEvent::Completed { token_usage, .. }) => {
                 sess.update_token_usage_info(turn_context, token_usage.as_ref())
                     .await?;
-                return Ok(());
+                return Ok(LocalCompactionOutput { completed_items });
             }
             Ok(_) => continue,
             Err(e) => return Err(e),

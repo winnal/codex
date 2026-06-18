@@ -8,7 +8,17 @@ use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact_exact_tail::CompactionHistoryPolicy;
+use crate::compact_exact_tail::ExactTailImplementation;
+use crate::compact_exact_tail::ExactTailPrepareInput;
+use crate::compact_exact_tail::build_exact_tail_replacement;
+use crate::compact_exact_tail::check_cold_input_fits;
+use crate::compact_exact_tail::ensure_replacement_has_cold_summary;
+use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
+use crate::compact_exact_tail::prepare_exact_tail_plan;
+use crate::compact_exact_tail::remote_legacy_summary_scaffold_overhead_tokens;
 use crate::context_manager::ContextManager;
+use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -137,6 +147,7 @@ async fn run_remote_compact_task_inner(
         turn_context,
         turn_state,
         initial_context_injection,
+        trigger,
         compaction_metadata,
         &mut analytics_details,
     )
@@ -171,6 +182,7 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     turn_state: Option<Arc<OnceLock<String>>>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
@@ -186,31 +198,70 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    let mut history = sess.clone_history().await;
+    let source_history = sess.clone_history().await;
+    let source_history_items = source_history.raw_items().to_vec();
     let base_instructions = sess.get_base_instructions().await;
-    let (rewritten_outputs, estimated_deleted_tokens) =
-        trim_function_call_history_to_fit_context_window(
-            &mut history,
-            turn_context.as_ref(),
-            &base_instructions,
-        );
-    if rewritten_outputs > 0 {
-        info!(
-            turn_id = %turn_context.sub_id,
-            rewritten_outputs,
-            "rewrote history outputs before remote compaction"
-        );
-    }
-    if estimated_deleted_tokens > 0 {
-        let max_local_deleted_tokens = sess
-            .estimated_tokens_after_last_model_generated_item()
-            .await;
-        analytics_details.active_context_tokens_before = analytics_details
-            .active_context_tokens_before
-            .map(|active_context_tokens_before| {
-                active_context_tokens_before
-                    .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
-            });
+    let policy = CompactionHistoryPolicy::from_config(&turn_context.config);
+    let exact_tail_plan = prepare_exact_tail_plan(ExactTailPrepareInput {
+        sess: sess.as_ref(),
+        turn_context: turn_context.as_ref(),
+        history_items: &source_history_items,
+        base_instructions: &base_instructions,
+        policy,
+        trigger,
+        initial_context_injection,
+        estimated_summary_scaffold_overhead_tokens: remote_legacy_summary_scaffold_overhead_tokens(
+        ),
+        retained_cold_user_message_budget_tokens: 0,
+        implementation: ExactTailImplementation::RemoteLegacy,
+    })
+    .await
+    .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)?;
+
+    let mut history = source_history;
+    if let Some(prepared) = &exact_tail_plan {
+        history.replace(prepared.plan.cold_history.clone());
+        check_cold_input_fits(
+            &prepared.plan,
+            history.raw_items(),
+            turn_context.model_context_window(),
+        )
+        .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)?;
+        if let Some(context_window) = turn_context.model_context_window()
+            && let Some(request_tokens) =
+                history.estimate_token_count_with_base_instructions(&base_instructions)
+            && request_tokens > context_window
+        {
+            return Err(exact_tail_cold_input_too_large_error(
+                request_tokens,
+                context_window,
+            ));
+        }
+    } else {
+        let (rewritten_outputs, estimated_deleted_tokens) =
+            trim_function_call_history_to_fit_context_window(
+                &mut history,
+                turn_context.as_ref(),
+                &base_instructions,
+            );
+        if rewritten_outputs > 0 {
+            info!(
+                turn_id = %turn_context.sub_id,
+                rewritten_outputs,
+                "rewrote history outputs before remote compaction"
+            );
+        }
+        if estimated_deleted_tokens > 0 {
+            let max_local_deleted_tokens = sess
+                .estimated_tokens_after_last_model_generated_item()
+                .await;
+            analytics_details.active_context_tokens_before = analytics_details
+                .active_context_tokens_before
+                .map(|active_context_tokens_before| {
+                    active_context_tokens_before
+                        .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
+                });
+        }
     }
     // This is the history selected for remote compaction, after any output rewriting required to
     // fit the compact endpoint. The checkpoint below records it separately from the next sampling
@@ -258,14 +309,28 @@ async fn run_remote_compact_task_inner_impl(
             &responses_metadata,
         )
         .await?;
+    new_history = if let Some(prepared) = &exact_tail_plan {
+        new_history.retain(should_keep_compacted_history_item);
+        ensure_replacement_has_cold_summary(&prepared.plan, &new_history)
+            .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)?;
+        let actual_summary_tokens = estimate_response_items_token_count(&new_history);
+        build_exact_tail_replacement(
+            prepared,
+            new_history,
+            initial_context_injection,
+            actual_summary_tokens,
+        )
+        .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)?
+    } else {
+        process_compacted_history(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            new_history,
+            initial_context_injection,
+        )
+        .await
+    };
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    new_history = process_compacted_history(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        new_history,
-        initial_context_injection,
-    )
-    .await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,

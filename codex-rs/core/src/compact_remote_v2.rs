@@ -8,6 +8,8 @@ use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
+use crate::compact_exact_tail::CompactionHistoryPolicy;
+use crate::compact_exact_tail::unsupported_remote_v2_ordering_error;
 use crate::compact_remote::process_compacted_history;
 use crate::compact_remote::should_keep_compacted_history_item;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
@@ -187,6 +189,13 @@ async fn run_remote_compact_task_inner_impl(
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
+    if matches!(
+        CompactionHistoryPolicy::from_config(&turn_context.config),
+        CompactionHistoryPolicy::PreserveRecentExact { .. }
+    ) {
+        return Err(unsupported_remote_v2_ordering_error().into_codex_err());
+    }
+
     let context_compaction_item = ContextCompactionItem::new();
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
         turn_context.sub_id.as_str(),

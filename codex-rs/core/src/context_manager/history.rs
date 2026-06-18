@@ -167,11 +167,7 @@ impl ContextManager {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
-        let items_tokens = self
-            .items
-            .iter()
-            .map(estimate_item_token_count)
-            .fold(0i64, i64::saturating_add);
+        let items_tokens = estimate_response_items_token_count(&self.items);
 
         Some(base_tokens.saturating_add(items_tokens))
     }
@@ -509,6 +505,13 @@ fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
 fn estimate_item_token_count(item: &ResponseItem) -> i64 {
     let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
     approx_tokens_from_byte_count_i64(model_visible_bytes)
+}
+
+pub(crate) fn estimate_response_items_token_count(items: &[ResponseItem]) -> i64 {
+    items
+        .iter()
+        .map(estimate_item_token_count)
+        .fold(0i64, i64::saturating_add)
 }
 
 /// Approximate model-visible byte cost for one image input.

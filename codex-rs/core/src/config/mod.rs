@@ -634,6 +634,10 @@ pub struct Config {
     /// active context or only tokens after the carried compaction-window prefix.
     pub model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope,
 
+    /// Approximate recent conversation-token target to preserve exactly during
+    /// compaction. `None` keeps standard compaction behavior.
+    pub compact_preserve_recent_tokens: Option<i64>,
+
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
 
@@ -3563,6 +3567,15 @@ impl Config {
                 Some(trimmed.to_string())
             }
         });
+        if cfg
+            .compact_preserve_recent_tokens
+            .is_some_and(|tokens| tokens <= 0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "`compact_preserve_recent_tokens` must be a positive integer when set",
+            ));
+        }
 
         // Load base instructions override from a file if specified. If the
         // path is relative, resolve it against the effective cwd so the
@@ -3754,6 +3767,7 @@ impl Config {
             model_auto_compact_token_limit_scope: cfg
                 .model_auto_compact_token_limit_scope
                 .unwrap_or_default(),
+            compact_preserve_recent_tokens: cfg.compact_preserve_recent_tokens,
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,

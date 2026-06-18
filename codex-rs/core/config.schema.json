@@ -4642,6 +4642,12 @@
       "default": null,
       "description": "Preferred backend for storing CLI auth credentials. file (default): Use a file in the Codex home directory. keyring: Use an OS-specific keyring service. auto: Use the keyring if available, otherwise use a file."
     },
+    "compact_preserve_recent_tokens": {
+      "description": "Approximate number of recent conversation tokens to preserve exactly when compaction summarizes older history.\n\nThis is a whole-group target, not an exact guarantee. Exact-tail compaction fails closed instead of falling back to standard compaction when it cannot safely preserve the requested recent suffix.",
+      "format": "int64",
+      "minimum": 1.0,
+      "type": "integer"
+    },
     "compact_prompt": {
       "description": "Compact prompt used for history compaction.",
       "type": "string"

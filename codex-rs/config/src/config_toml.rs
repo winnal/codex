@@ -170,6 +170,15 @@ pub struct ConfigToml {
     /// only to tokens after the carried prefix in the current compaction window.
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
 
+    /// Approximate number of recent conversation tokens to preserve exactly
+    /// when compaction summarizes older history.
+    ///
+    /// This is a whole-group target, not an exact guarantee. Exact-tail
+    /// compaction fails closed instead of falling back to standard compaction
+    /// when it cannot safely preserve the requested recent suffix.
+    #[schemars(range(min = 1))]
+    pub compact_preserve_recent_tokens: Option<i64>,
+
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,
 

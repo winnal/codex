@@ -6879,6 +6879,53 @@ async fn cli_override_sets_compact_prompt() -> std::io::Result<()> {
 }
 
 #[tokio::test]
+async fn load_config_sets_compact_preserve_recent_tokens() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        compact_preserve_recent_tokens: Some(120_000),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(config.compact_preserve_recent_tokens, Some(120_000));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_rejects_non_positive_compact_preserve_recent_tokens() -> std::io::Result<()> {
+    for compact_preserve_recent_tokens in [0, -1] {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            compact_preserve_recent_tokens: Some(compact_preserve_recent_tokens),
+            ..Default::default()
+        };
+
+        let error = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await
+        .expect_err("non-positive compact_preserve_recent_tokens should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error.to_string().contains("compact_preserve_recent_tokens"),
+            "error should name compact_preserve_recent_tokens, got {error}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn loads_compact_prompt_from_file() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let workspace = codex_home.path().join("workspace");

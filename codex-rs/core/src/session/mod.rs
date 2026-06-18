@@ -950,6 +950,12 @@ fn push_prompt_fragment(
     }
 }
 
+#[derive(Clone, Copy)]
+enum InitialContextSideEffects {
+    Emit,
+    Suppress,
+}
+
 impl Session {
     pub(crate) async fn app_server_client_metadata(&self) -> AppServerClientMetadata {
         let state = self.state.lock().await;
@@ -3038,6 +3044,19 @@ impl Session {
             .await
     }
 
+    pub(crate) async fn build_initial_context_without_side_effects(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Vec<ResponseItem> {
+        let world_state = self.build_world_state(turn_context).await;
+        self.build_initial_context_with_world_state_inner(
+            turn_context,
+            &world_state,
+            InitialContextSideEffects::Suppress,
+        )
+        .await
+    }
+
     async fn build_world_state(&self, turn_context: &TurnContext) -> WorldState {
         let environment_subagents = if turn_context.config.include_environment_context {
             self.services
@@ -3054,6 +3073,20 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         world_state: &WorldState,
+    ) -> Vec<ResponseItem> {
+        self.build_initial_context_with_world_state_inner(
+            turn_context,
+            world_state,
+            InitialContextSideEffects::Emit,
+        )
+        .await
+    }
+
+    async fn build_initial_context_with_world_state_inner(
+        &self,
+        turn_context: &TurnContext,
+        world_state: &WorldState,
+        side_effects: InitialContextSideEffects,
     ) -> Vec<ResponseItem> {
         let mut developer_sections = Vec::<String>::with_capacity(8);
         let mut contextual_user_sections = Vec::<String>::with_capacity(2);
@@ -3164,14 +3197,19 @@ impl Session {
             let available_skills = build_available_skills(
                 turn_context.turn_skills.snapshot.outcome(),
                 default_skill_metadata_budget(turn_context.model_info.context_window),
-                SkillRenderSideEffects::ThreadStart {
-                    session_telemetry: &self.services.session_telemetry,
+                match side_effects {
+                    InitialContextSideEffects::Emit => SkillRenderSideEffects::ThreadStart {
+                        session_telemetry: &self.services.session_telemetry,
+                    },
+                    InitialContextSideEffects::Suppress => SkillRenderSideEffects::None,
                 },
             );
             if let Some(available_skills) = available_skills {
                 let warning_message = available_skills.warning_message.clone();
                 let skills_instructions = AvailableSkillsInstructions::from(available_skills);
-                if let Some(warning_message) = warning_message {
+                if let Some(warning_message) = warning_message
+                    && matches!(side_effects, InitialContextSideEffects::Emit)
+                {
                     self.send_event_raw(Event {
                         id: String::new(),
                         msg: EventMsg::Warning(WarningEvent {

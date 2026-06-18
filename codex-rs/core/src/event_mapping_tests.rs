@@ -17,6 +17,8 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::CONTEXT_WINDOW_CLOSE_TAG;
 use codex_protocol::protocol::CONTEXT_WINDOW_OPEN_TAG;
+use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
@@ -31,7 +33,45 @@ fn recognizes_skills_instructions_as_contextual_developer_content() {
 }
 
 #[test]
-fn recognizes_legacy_token_budget_as_contextual_developer_content() {
+fn recognizes_apps_instructions_as_contextual_developer_content() {
+    let content = vec![ContentItem::InputText {
+        text: format!("{APPS_INSTRUCTIONS_OPEN_TAG}\n## Apps (Connectors)"),
+    }];
+
+    assert!(is_contextual_dev_message_content(&content));
+    assert!(!has_non_contextual_dev_message_content(&content));
+}
+
+#[test]
+fn recognizes_plugins_instructions_as_contextual_developer_content() {
+    let content = vec![ContentItem::InputText {
+        text: format!("{PLUGINS_INSTRUCTIONS_OPEN_TAG}\n## Plugins"),
+    }];
+
+    assert!(is_contextual_dev_message_content(&content));
+    assert!(!has_non_contextual_dev_message_content(&content));
+}
+
+#[test]
+fn recognizes_mixed_app_plugin_and_persistent_developer_content() {
+    let content = vec![
+        ContentItem::InputText {
+            text: format!("{APPS_INSTRUCTIONS_OPEN_TAG}\n## Apps (Connectors)"),
+        },
+        ContentItem::InputText {
+            text: format!("{PLUGINS_INSTRUCTIONS_OPEN_TAG}\n## Plugins"),
+        },
+        ContentItem::InputText {
+            text: "Persistent developer rule".to_string(),
+        },
+    ];
+
+    assert!(is_contextual_dev_message_content(&content));
+    assert!(has_non_contextual_dev_message_content(&content));
+}
+
+#[test]
+fn recognizes_token_budget_as_contextual_developer_content() {
     let content = vec![ContentItem::InputText {
         text: "<token_budget>\nYou have 710 tokens left in this context window.\n</token_budget>"
             .to_string(),
