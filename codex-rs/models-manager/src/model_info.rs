@@ -11,6 +11,7 @@ use codex_protocol::openai_models::default_input_modalities;
 
 use crate::config::ModelsManagerConfig;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
+use codex_utils_output_truncation::approx_tokens_from_byte_count;
 use tracing::warn;
 
 pub const BASE_INSTRUCTIONS: &str = include_str!("../prompt.md");
@@ -51,6 +52,9 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
             }
         };
     }
+    if let Some(max_token_limit) = config.max_tool_output_token_limit {
+        model.truncation_policy = cap_truncation_policy(model.truncation_policy, max_token_limit);
+    }
 
     if let Some(base_instructions) = &config.base_instructions {
         model.base_instructions = base_instructions.clone();
@@ -60,6 +64,39 @@ pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig)
     }
 
     model
+}
+
+fn cap_truncation_policy(
+    policy: TruncationPolicyConfig,
+    max_token_limit: usize,
+) -> TruncationPolicyConfig {
+    let current_token_limit = match policy.mode {
+        TruncationMode::Bytes => usize::try_from(approx_tokens_from_byte_count(
+            usize::try_from(policy.limit).unwrap_or(usize::MAX),
+        ))
+        .unwrap_or(usize::MAX),
+        TruncationMode::Tokens => usize::try_from(policy.limit).unwrap_or(usize::MAX),
+    };
+    if current_token_limit <= max_token_limit {
+        return policy;
+    }
+
+    warn!(
+        configured_tool_output_token_limit = current_token_limit,
+        max_tool_output_token_limit = max_token_limit,
+        "capping model tool output truncation policy"
+    );
+    match policy.mode {
+        TruncationMode::Bytes => {
+            let byte_limit =
+                i64::try_from(approx_bytes_for_tokens(max_token_limit)).unwrap_or(i64::MAX);
+            TruncationPolicyConfig::bytes(byte_limit)
+        }
+        TruncationMode::Tokens => {
+            let limit = i64::try_from(max_token_limit).unwrap_or(i64::MAX);
+            TruncationPolicyConfig::tokens(limit)
+        }
+    }
 }
 
 /// Build a minimal fallback model descriptor for missing/unknown slugs.

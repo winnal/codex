@@ -552,6 +552,13 @@ fn oversize_hot_tool_output_item_fails_closed() {
     .expect_err("hot tool output should exceed the per-item cap");
 
     assert_eq!(actual.reason, ExactTailFailReason::ModelVisibleItemTooLarge);
+    assert!(
+        actual
+            .into_codex_err()
+            .to_string()
+            .contains("function_call_output call_id=call-1"),
+        "error should identify the oversized item"
+    );
 }
 
 #[test]

@@ -6899,6 +6899,57 @@ async fn load_config_sets_compact_preserve_recent_tokens() -> std::io::Result<()
 }
 
 #[tokio::test]
+async fn exact_tail_caps_model_manager_tool_output_limit() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        compact_preserve_recent_tokens: Some(120_000),
+        tool_output_token_limit: Some(20_000),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config
+            .to_models_manager_config()
+            .max_tool_output_token_limit,
+        Some(8_000)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn standard_compaction_does_not_cap_model_manager_tool_output_limit() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        tool_output_token_limit: Some(20_000),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config
+            .to_models_manager_config()
+            .max_tool_output_token_limit,
+        None
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn load_config_rejects_non_positive_compact_preserve_recent_tokens() -> std::io::Result<()> {
     for compact_preserve_recent_tokens in [0, -1] {
         let codex_home = TempDir::new()?;

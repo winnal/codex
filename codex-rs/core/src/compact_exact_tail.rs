@@ -399,9 +399,13 @@ pub(super) fn ensure_model_visible_items_within_limit(
     for item in items {
         let item_tokens = estimate_response_items_token_count(std::slice::from_ref(item));
         if item_tokens > EXACT_TAIL_MAX_MODEL_VISIBLE_ITEM_TOKENS {
+            let item_kind = model_visible_item_kind(item);
+            let item_label = model_visible_item_label(item);
             warn!(
                 exact_tail_enabled = true,
                 exact_tail_fail_reason = ExactTailFailReason::ModelVisibleItemTooLarge.as_str(),
+                item_kind,
+                item_label = item_label.as_str(),
                 item_tokens,
                 max_item_tokens = EXACT_TAIL_MAX_MODEL_VISIBLE_ITEM_TOKENS,
                 "exact-tail model-visible item exceeds per-item cap"
@@ -409,7 +413,7 @@ pub(super) fn ensure_model_visible_items_within_limit(
             return Err(ExactTailError::new(
                 ExactTailFailReason::ModelVisibleItemTooLarge,
                 format!(
-                    "{}: exact-tail model-visible item estimates to {} tokens, exceeding per-item cap {}",
+                    "{}: exact-tail {item_label} estimates to {} tokens, exceeding per-item cap {}",
                     ExactTailFailReason::ModelVisibleItemTooLarge.as_str(),
                     item_tokens,
                     EXACT_TAIL_MAX_MODEL_VISIBLE_ITEM_TOKENS
@@ -418,6 +422,52 @@ pub(super) fn ensure_model_visible_items_within_limit(
         }
     }
     Ok(())
+}
+
+fn model_visible_item_kind(item: &ResponseItem) -> &'static str {
+    match item {
+        ResponseItem::Message { .. } => "message",
+        ResponseItem::AgentMessage { .. } => "agent_message",
+        ResponseItem::Reasoning { .. } => "reasoning",
+        ResponseItem::LocalShellCall { .. } => "local_shell_call",
+        ResponseItem::FunctionCall { .. } => "function_call",
+        ResponseItem::ToolSearchCall { .. } => "tool_search_call",
+        ResponseItem::FunctionCallOutput { .. } => "function_call_output",
+        ResponseItem::ToolSearchOutput { .. } => "tool_search_output",
+        ResponseItem::CustomToolCall { .. } => "custom_tool_call",
+        ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output",
+        ResponseItem::WebSearchCall { .. } => "web_search_call",
+        ResponseItem::ImageGenerationCall { .. } => "image_generation_call",
+        ResponseItem::Compaction { .. } => "compaction",
+        ResponseItem::CompactionTrigger { .. } => "compaction_trigger",
+        ResponseItem::ContextCompaction { .. } => "context_compaction",
+        ResponseItem::Other => "other",
+    }
+}
+
+fn model_visible_item_label(item: &ResponseItem) -> String {
+    let kind = model_visible_item_kind(item);
+    match item {
+        ResponseItem::Message { role, .. } => format!("{kind} role={role}"),
+        ResponseItem::FunctionCall { call_id, name, .. }
+        | ResponseItem::CustomToolCall { call_id, name, .. } => {
+            format!("{kind} name={name} call_id={call_id}")
+        }
+        ResponseItem::FunctionCallOutput { call_id, .. }
+        | ResponseItem::CustomToolCallOutput { call_id, .. } => {
+            format!("{kind} call_id={call_id}")
+        }
+        ResponseItem::ToolSearchCall { call_id, .. }
+        | ResponseItem::ToolSearchOutput { call_id, .. }
+        | ResponseItem::LocalShellCall { call_id, .. } => match item.id() {
+            Some(id) => format!("{kind} id={id} call_id={call_id:?}"),
+            None => format!("{kind} call_id={call_id:?}"),
+        },
+        _ => match item.id() {
+            Some(id) => format!("{kind} id={id}"),
+            None => kind.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
