@@ -1,6 +1,7 @@
 use super::ensure_model_visible_items_within_limit;
 use super::groups::build_groups;
 use crate::compact::collect_user_messages;
+use crate::compact::is_summary_message;
 use crate::context::parse_visible_hook_prompt_message;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::event_mapping::has_non_contextual_dev_message_content;
@@ -8,6 +9,7 @@ use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
 use codex_analytics::CompactionTrigger;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 
 use super::EXACT_TAIL_CONSERVATIVE_SUMMARY_BUDGET_TOKENS;
@@ -21,6 +23,8 @@ use super::ExactTailFailReason;
 use super::ExactTailItemClass;
 use super::ExactTailPlan;
 use super::ExactTailPlanInput;
+
+const POST_SUMMARY_COLD_RESERVE_DIVISOR: i64 = 10;
 
 pub(crate) fn classify_exact_tail_history_item(item: &ResponseItem) -> ExactTailItemClass {
     match item {
@@ -65,11 +69,6 @@ pub(crate) fn classify_exact_tail_history_item(item: &ResponseItem) -> ExactTail
     }
 }
 
-pub(crate) fn exact_tail_group_count(history_items: &[ResponseItem]) -> usize {
-    let (groups, _, _) = build_groups(history_items);
-    groups.len()
-}
-
 pub(crate) fn plan_exact_tail(
     input: ExactTailPlanInput<'_>,
 ) -> Result<ExactTailPlan, ExactTailError> {
@@ -101,8 +100,6 @@ pub(crate) fn plan_exact_tail(
     let (groups, filtered_stale_groups, filtered_context_item_count) = build_groups(history_items);
     let group_count = groups.len();
 
-    let mut selected_group_count = 0usize;
-    let mut actual_hot_tokens = 0i64;
     if let Some(newest_group) = groups.last()
         && newest_group.tokens > budget_reservation.available_for_hot
     {
@@ -117,26 +114,20 @@ pub(crate) fn plan_exact_tail(
         ));
     }
 
-    for group in groups.iter().rev() {
-        let next_tokens = actual_hot_tokens.saturating_add(group.tokens);
-        let required_to_reach_target =
-            selected_group_count == 0 || actual_hot_tokens < target_tokens;
-        if !required_to_reach_target {
-            break;
-        }
-        if next_tokens > budget_reservation.available_for_hot {
-            return Err(ExactTailError::new(
-                ExactTailFailReason::MinimumHotSuffixTooLarge,
-                format!(
-                    "{}: requested exact-tail suffix requires {} tokens but only {} are available",
-                    ExactTailFailReason::MinimumHotSuffixTooLarge.as_str(),
-                    next_tokens,
-                    budget_reservation.available_for_hot
-                ),
-            ));
-        }
-        selected_group_count += 1;
-        actual_hot_tokens = next_tokens;
+    let HotGroupSelection {
+        selected_group_count,
+        actual_hot_tokens,
+    } = select_hot_groups(&groups, target_tokens);
+    if actual_hot_tokens > budget_reservation.available_for_hot {
+        return Err(ExactTailError::new(
+            ExactTailFailReason::MinimumHotSuffixTooLarge,
+            format!(
+                "{}: requested exact-tail suffix requires {} tokens but only {} are available",
+                ExactTailFailReason::MinimumHotSuffixTooLarge.as_str(),
+                actual_hot_tokens,
+                budget_reservation.available_for_hot
+            ),
+        ));
     }
 
     let cold_group_count = group_count.saturating_sub(selected_group_count);
@@ -199,6 +190,96 @@ pub(crate) fn plan_exact_tail(
         diagnostics,
         coverage,
     })
+}
+
+struct HotGroupSelection {
+    selected_group_count: usize,
+    actual_hot_tokens: i64,
+}
+
+fn select_hot_groups(
+    groups: &[super::groups::ExactTailGroup],
+    target_tokens: i64,
+) -> HotGroupSelection {
+    let mut selected_group_count = 0usize;
+    let mut actual_hot_tokens = 0i64;
+    let max_selected_group_count = max_hot_group_count_after_summary_reserve(groups);
+
+    for group in groups.iter().rev() {
+        if selected_group_count >= max_selected_group_count {
+            break;
+        }
+        if selected_group_count > 0 && group_contains_compaction_summary(group) {
+            break;
+        }
+        let required_to_reach_target =
+            selected_group_count == 0 || actual_hot_tokens < target_tokens;
+        if !required_to_reach_target {
+            break;
+        }
+        selected_group_count += 1;
+        actual_hot_tokens = actual_hot_tokens.saturating_add(group.tokens);
+    }
+
+    HotGroupSelection {
+        selected_group_count,
+        actual_hot_tokens,
+    }
+}
+
+fn max_hot_group_count_after_summary_reserve(groups: &[super::groups::ExactTailGroup]) -> usize {
+    let Some(summary_index) = groups.iter().rposition(group_contains_compaction_summary) else {
+        return groups.len();
+    };
+    let post_summary_groups = &groups[summary_index + 1..];
+    if post_summary_groups.len() <= 1 {
+        return groups.len();
+    }
+
+    let post_summary_tokens = post_summary_groups
+        .iter()
+        .fold(0i64, |total, group| total.saturating_add(group.tokens));
+    let reserve_target = post_summary_tokens
+        .saturating_div(POST_SUMMARY_COLD_RESERVE_DIVISOR)
+        .max(1);
+    let mut reserved_group_count = 0usize;
+    let mut reserved_tokens = 0i64;
+    for group in post_summary_groups
+        .iter()
+        .take(post_summary_groups.len() - 1)
+    {
+        reserved_group_count += 1;
+        reserved_tokens = reserved_tokens.saturating_add(group.tokens);
+        if reserved_tokens >= reserve_target {
+            break;
+        }
+    }
+    groups
+        .len()
+        .saturating_sub(summary_index + 1 + reserved_group_count)
+}
+
+fn group_contains_compaction_summary(group: &super::groups::ExactTailGroup) -> bool {
+    group.items.iter().any(response_item_is_compaction_summary)
+}
+
+fn response_item_is_compaction_summary(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
+        ResponseItem::Message { role, content, .. } if role == "user" => {
+            content.iter().any(content_item_is_summary_text)
+        }
+        _ => false,
+    }
+}
+
+fn content_item_is_summary_text(item: &ContentItem) -> bool {
+    match item {
+        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+            is_summary_message(text.trim_start())
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn exact_tail_budget_reservation(

@@ -14,19 +14,10 @@ use crate::compact::InitialContextInjection;
 use crate::compact::run_inline_auto_compact_task;
 use crate::compact::should_use_remote_compact_task;
 use crate::compact::should_use_remote_compact_task_v2;
-use crate::compact_exact_tail::CompactionHistoryPolicy;
-use crate::compact_exact_tail::EXACT_TAIL_AUTO_COMPACT_TRIGGER_MARGIN_TOKENS;
-use crate::compact_exact_tail::EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS;
-use crate::compact_exact_tail::exact_tail_budget_reservation;
-use crate::compact_exact_tail::exact_tail_group_count;
-use crate::compact_exact_tail::exact_tail_replacement_budget;
-use crate::compact_exact_tail::local_summary_scaffold_overhead_tokens;
-use crate::compact_exact_tail::remote_legacy_summary_scaffold_overhead_tokens;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
-use crate::context_manager::estimate_response_items_token_count;
 use crate::feedback_tags;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
@@ -80,7 +71,6 @@ use crate::util::error_or_panic;
 use codex_analytics::AppInvocation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
-use codex_analytics::CompactionTrigger;
 use codex_analytics::InvocationType;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
@@ -117,7 +107,6 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_tools::ToolName;
 use codex_tools::filter_request_plugin_install_discoverable_tools_for_client;
-use codex_utils_output_truncation::approx_token_count;
 use codex_utils_stream_parser::AssistantTextChunk;
 use codex_utils_stream_parser::AssistantTextStreamParser;
 use codex_utils_stream_parser::ProposedPlanSegment;
@@ -325,9 +314,7 @@ pub(crate) async fn run_turn(
                     auto_compact_limit_scope = ?turn_context.config.model_auto_compact_token_limit_scope,
                     auto_compact_window_prefill_tokens = ?token_status.auto_compact_window_prefill_tokens,
                     full_context_window_limit = ?token_status.full_context_window_limit,
-                    exact_tail_full_context_limit = ?token_status.exact_tail_full_context_limit,
                     full_context_window_limit_reached = token_status.full_context_window_limit_reached,
-                    exact_tail_full_context_limit_reached = token_status.exact_tail_full_context_limit_reached,
                     token_limit_reached,
                     model_needs_follow_up,
                     has_pending_input,
@@ -823,10 +810,8 @@ struct AutoCompactTokenStatus {
     auto_compact_scope_tokens: i64,
     auto_compact_scope_limit: i64,
     full_context_window_limit: Option<i64>,
-    exact_tail_full_context_limit: Option<i64>,
     auto_compact_window_prefill_tokens: Option<i64>,
     full_context_window_limit_reached: bool,
-    exact_tail_full_context_limit_reached: bool,
     token_limit_reached: bool,
 }
 
@@ -861,105 +846,22 @@ async fn auto_compact_token_status(
                 )
             }
         };
-    let exact_tail_full_context_limit =
-        exact_tail_auto_compact_full_context_limit(sess, turn_context).await;
     let full_context_window_limit_reached =
         full_context_window_limit.is_some_and(|full_context_window_limit| {
             active_context_tokens >= full_context_window_limit
         });
-    let exact_tail_full_context_limit_reached =
-        exact_tail_full_context_limit.is_some_and(|exact_tail_full_context_limit| {
-            active_context_tokens >= exact_tail_full_context_limit
-        });
-    let token_limit_reached = auto_compact_scope_tokens >= auto_compact_scope_limit
-        || full_context_window_limit_reached
-        || exact_tail_full_context_limit_reached;
+    let token_limit_reached =
+        auto_compact_scope_tokens >= auto_compact_scope_limit || full_context_window_limit_reached;
 
     AutoCompactTokenStatus {
         active_context_tokens,
         auto_compact_scope_tokens,
         auto_compact_scope_limit,
         full_context_window_limit,
-        exact_tail_full_context_limit,
         auto_compact_window_prefill_tokens,
         full_context_window_limit_reached,
-        exact_tail_full_context_limit_reached,
         token_limit_reached,
     }
-}
-
-async fn exact_tail_auto_compact_full_context_limit(
-    sess: &Session,
-    turn_context: &TurnContext,
-) -> Option<i64> {
-    if !matches!(
-        CompactionHistoryPolicy::from_config(&turn_context.config),
-        CompactionHistoryPolicy::PreserveRecentExact { .. }
-    ) {
-        return None;
-    }
-    let history = sess.clone_history().await;
-    if exact_tail_group_count(history.raw_items()) < 2 {
-        return None;
-    }
-
-    let effective_replacement_budget = exact_tail_replacement_budget(
-        turn_context.model_context_window(),
-        turn_context.config.model_auto_compact_token_limit,
-        turn_context.config.model_auto_compact_token_limit_scope,
-        CompactionTrigger::Auto,
-    )?;
-    let base_instructions = sess.get_base_instructions().await;
-    let base_instruction_tokens =
-        i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
-    let current_context = sess
-        .build_initial_context_without_side_effects(turn_context)
-        .await;
-    let required_current_context_budget = base_instruction_tokens
-        .saturating_add(estimate_response_items_token_count(&current_context));
-    let (
-        implementation,
-        estimated_summary_scaffold_overhead_tokens,
-        retained_cold_user_message_budget_tokens,
-    ) = if should_use_remote_compact_task(turn_context.provider.info()) {
-        (
-            "remote",
-            remote_legacy_summary_scaffold_overhead_tokens(),
-            0,
-        )
-    } else {
-        (
-            "local",
-            local_summary_scaffold_overhead_tokens(),
-            EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS,
-        )
-    };
-    let budget_reservation = exact_tail_budget_reservation(
-        effective_replacement_budget,
-        required_current_context_budget,
-        estimated_summary_scaffold_overhead_tokens,
-        retained_cold_user_message_budget_tokens,
-    );
-    let full_context_limit = budget_reservation
-        .available_for_hot
-        .saturating_sub(EXACT_TAIL_AUTO_COMPACT_TRIGGER_MARGIN_TOKENS)
-        .max(0);
-
-    trace!(
-        exact_tail_enabled = true,
-        implementation,
-        effective_replacement_budget,
-        conservative_cold_summary_budget = budget_reservation.conservative_cold_summary_budget,
-        required_current_context_budget,
-        retained_cold_user_message_budget_tokens,
-        safety_margin = budget_reservation.safety_margin,
-        available_for_hot = budget_reservation.available_for_hot,
-        exact_tail_auto_compact_trigger_margin = EXACT_TAIL_AUTO_COMPACT_TRIGGER_MARGIN_TOKENS,
-        exact_tail_full_context_limit = full_context_limit,
-        "exact-tail auto-compaction trigger limit derived"
-    );
-
-    Some(full_context_limit)
 }
 
 #[instrument(level = "trace", skip_all)]

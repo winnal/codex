@@ -1,8 +1,6 @@
 use crate::compact_exact_tail::ExactTailItemClass;
 use crate::compact_exact_tail::classify_exact_tail_history_item;
 use crate::context_manager::estimate_response_items_token_count;
-use crate::context_manager::is_user_turn_boundary;
-use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 
 #[derive(Clone, Debug)]
@@ -60,14 +58,7 @@ fn group_intervals(eligible: &[(usize, ResponseItem)]) -> Vec<(usize, usize)> {
     }
 
     let mut intervals = dependency_intervals(eligible);
-    let mut start = 0usize;
-    for (index, (_, item)) in eligible.iter().enumerate().skip(1) {
-        if is_semantic_turn_boundary(item) {
-            intervals.push((start, index - 1));
-            start = index;
-        }
-    }
-    intervals.push((start, eligible.len() - 1));
+    intervals.extend((0..eligible.len()).map(|index| (index, index)));
     merge_intervals(intervals)
 }
 
@@ -107,18 +98,6 @@ fn merge_intervals(mut intervals: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
         merged.push((start, end));
     }
     merged
-}
-
-fn is_semantic_turn_boundary(item: &ResponseItem) -> bool {
-    is_user_turn_boundary(item)
-        || matches!(
-            crate::event_mapping::parse_turn_item(item),
-            Some(TurnItem::HookPrompt(_))
-        )
-        || matches!(
-            item,
-            ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
-        )
 }
 
 fn dependency_key(item: &ResponseItem) -> Option<String> {

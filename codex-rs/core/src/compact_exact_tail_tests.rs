@@ -249,6 +249,28 @@ fn planner_preserves_inter_agent_assistant_instruction_in_its_own_hot_group() {
 }
 
 #[test]
+fn planner_splits_long_turn_into_atomic_hot_groups() {
+    let old = user("old history");
+    let prompt = user("long running task");
+    let step_one = assistant("step one");
+    let step_two = assistant("step two");
+
+    let actual = plan(
+        vec![
+            old.clone(),
+            prompt.clone(),
+            step_one.clone(),
+            step_two.clone(),
+        ],
+        1,
+    );
+
+    assert_eq!(actual.cold_history, vec![old, prompt, step_one]);
+    assert_eq!(actual.hot_suffix, vec![step_two]);
+    assert_eq!(actual.diagnostics.hot_group_count, 1);
+}
+
+#[test]
 fn planner_preserves_function_call_and_output_as_one_hot_group() {
     let old = user(&"old history ".repeat(100));
     let recent = user(&"recent tool turn ".repeat(100));
@@ -260,9 +282,114 @@ fn planner_preserves_function_call_and_output_as_one_hot_group() {
         1,
     );
 
-    assert_eq!(actual.cold_history, vec![old]);
-    assert_eq!(actual.hot_suffix, vec![recent, call, output]);
+    assert_eq!(actual.cold_history, vec![old, recent]);
+    assert_eq!(actual.hot_suffix, vec![call, output]);
     assert_eq!(actual.diagnostics.hot_group_count, 1);
+}
+
+#[test]
+fn planner_preserves_interleaved_function_call_dependencies_as_one_hot_group() {
+    let old = user("old history");
+    let call_one = function_call("call-1");
+    let call_two = function_call("call-2");
+    let output_one = function_output("call-1", "tool result one");
+    let output_two = function_output("call-2", "tool result two");
+
+    let actual = plan(
+        vec![
+            old.clone(),
+            call_one.clone(),
+            call_two.clone(),
+            output_one.clone(),
+            output_two.clone(),
+        ],
+        1,
+    );
+
+    assert_eq!(actual.cold_history, vec![old]);
+    assert_eq!(
+        actual.hot_suffix,
+        vec![call_one, call_two, output_one, output_two]
+    );
+    assert_eq!(actual.diagnostics.hot_group_count, 1);
+}
+
+#[test]
+fn planner_target_overshoots_only_by_one_atomic_group() {
+    let old = user("old history");
+    let target = 150;
+    let hot_groups = (0..5)
+        .map(|index| {
+            assistant(&format!(
+                "granular response segment {index} {}",
+                "x ".repeat(80)
+            ))
+        })
+        .collect::<Vec<_>>();
+    let history = std::iter::once(old.clone())
+        .chain(hot_groups.iter().cloned())
+        .collect::<Vec<_>>();
+
+    let actual = plan(history, target);
+    let newest_group_tokens =
+        estimate_response_items_token_count(std::slice::from_ref(hot_groups.last().unwrap()));
+
+    assert_eq!(actual.cold_history.first(), Some(&old));
+    assert!(actual.diagnostics.actual_hot_tokens >= target);
+    assert!(
+        actual.diagnostics.actual_hot_tokens < target + newest_group_tokens,
+        "granular grouping should bound target overshoot to one atomic group"
+    );
+}
+
+#[test]
+fn planner_treats_prior_compaction_summary_as_cold_prefix() {
+    let old = user("old history");
+    let summary = compaction_summary("prior exact-tail summary");
+    let hot = user("recent exact tail");
+
+    let actual = plan(vec![old.clone(), summary.clone(), hot.clone()], 10_000);
+
+    assert_eq!(actual.cold_history, vec![old, summary]);
+    assert_eq!(actual.hot_suffix, vec![hot]);
+    assert!(actual.diagnostics.actual_hot_tokens < actual.diagnostics.requested_hot_tokens);
+}
+
+#[test]
+fn planner_treats_prior_local_summary_message_as_cold_prefix() {
+    let old = user("old history");
+    let summary = user(&format!("{SUMMARY_PREFIX}\nprior local exact-tail summary"));
+    let hot = user("recent exact tail");
+
+    let actual = plan(vec![old.clone(), summary.clone(), hot.clone()], 10_000);
+
+    assert_eq!(actual.cold_history, vec![old, summary]);
+    assert_eq!(actual.hot_suffix, vec![hot]);
+    assert!(actual.diagnostics.actual_hot_tokens < actual.diagnostics.requested_hot_tokens);
+}
+
+#[test]
+fn planner_reserves_post_summary_cold_context_when_target_is_too_large() {
+    let old = user("old history");
+    let summary = user(&format!("{SUMMARY_PREFIX}\nprior exact-tail summary"));
+    let post_summary_cold = assistant(&"new cold material after summary ".repeat(40));
+    let hot_one = assistant(&"recent exact tail one ".repeat(40));
+    let hot_two = assistant(&"recent exact tail two ".repeat(40));
+
+    let actual = plan(
+        vec![
+            old.clone(),
+            summary.clone(),
+            post_summary_cold.clone(),
+            hot_one.clone(),
+            hot_two.clone(),
+        ],
+        10_000,
+    );
+
+    assert_eq!(actual.cold_history, vec![old, summary, post_summary_cold]);
+    assert_eq!(actual.hot_suffix, vec![hot_one, hot_two]);
+    assert!(actual.diagnostics.actual_hot_tokens < actual.diagnostics.requested_hot_tokens);
 }
 
 #[test]
@@ -621,10 +748,7 @@ fn configured_larger_item_cap_allows_read_thread_sized_tool_output() {
     })
     .expect("configured 20k item cap should allow the read_thread-sized tool output");
 
-    assert_eq!(
-        actual.hot_suffix,
-        vec![user("recent"), function_call("call-1"), output]
-    );
+    assert_eq!(actual.hot_suffix, vec![function_call("call-1"), output]);
 }
 
 #[test]

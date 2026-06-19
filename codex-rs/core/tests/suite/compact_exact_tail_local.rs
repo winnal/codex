@@ -2,8 +2,8 @@ use super::compact_exact_tail_support::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exact_tail_local_manual_compact_excludes_hot_suffix_from_compaction_request() -> Result<()>
-{
+async fn exact_tail_local_manual_compact_excludes_newest_atomic_hot_suffix_from_compaction_request()
+-> Result<()> {
     let server = start_mock_server().await;
     let cold_user = format!("COLD_USER {}", "cold context ".repeat(100));
     let cold_assistant = format!("COLD_ASSISTANT {}", "cold answer ".repeat(100));
@@ -83,19 +83,19 @@ async fn exact_tail_local_manual_compact_excludes_hot_suffix_from_compaction_req
         "compact request should include the summarization prompt"
     );
     assert!(
-        !input_contains_text(&compact_input, "HOT_USER"),
-        "exact hot user text must be excluded from the compaction request; compact input: {compact_input:#?}"
+        input_contains_text(&compact_input, "HOT_USER"),
+        "older same-turn user text should remain cold when the target only selects the newest atomic group; compact input: {compact_input:#?}"
     );
     assert!(
         !input_contains_text(&compact_input, "HOT_ASSISTANT"),
-        "exact hot assistant text must be excluded from the compaction request; compact input: {compact_input:#?}"
+        "newest atomic hot assistant text must be excluded from the compaction request; compact input: {compact_input:#?}"
     );
 
     let replacement_history = replacement_history_from_rollout(&rollout_path)?;
     let expected_summary = summary_with_prefix("EXACT_TAIL_SUMMARY");
     assert_ordered_input_texts(
         &replacement_history,
-        &[expected_summary.as_str(), "HOT_USER", "HOT_ASSISTANT"],
+        &["HOT_USER", expected_summary.as_str(), "HOT_ASSISTANT"],
     );
     assert!(
         !input_contains_text(&replacement_history, SUMMARIZATION_PROMPT),
@@ -115,8 +115,8 @@ async fn exact_tail_local_manual_compact_excludes_hot_suffix_from_compaction_req
     assert_ordered_input_texts(
         &follow_up_input,
         &[
-            expected_summary.as_str(),
             "HOT_USER",
+            expected_summary.as_str(),
             "HOT_ASSISTANT",
             "FOLLOW_UP_USER",
         ],
@@ -195,16 +195,10 @@ async fn exact_tail_local_manual_reserves_reinjected_initial_context_before_comp
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
         &server,
-        vec![
-            sse(vec![
-                ev_assistant_message("local-context-cold-assistant", "LOCAL_CONTEXT_COLD"),
-                ev_completed("local-context-cold-response"),
-            ]),
-            sse(vec![
-                ev_assistant_message("local-context-hot-assistant", "LOCAL_CONTEXT_HOT"),
-                ev_completed("local-context-hot-response"),
-            ]),
-        ],
+        vec![sse(vec![
+            ev_assistant_message("local-context-cold-assistant", "LOCAL_CONTEXT_COLD"),
+            ev_completed("local-context-cold-response"),
+        ])],
     )
     .await;
     let provider = local_compaction_provider(&server);
@@ -227,8 +221,7 @@ async fn exact_tail_local_manual_reserves_reinjected_initial_context_before_comp
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn("LOCAL_CONTEXT_COLD_USER").await?;
-    test.submit_turn("LOCAL_CONTEXT_HOT_USER").await?;
+    test.submit_turn("LOCAL_CONTEXT_USER").await?;
     test.codex.submit(Op::Compact).await?;
     let error_message = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::Error(err) => Some(err.message.clone()),
@@ -240,9 +233,11 @@ async fn exact_tail_local_manual_reserves_reinjected_initial_context_before_comp
         error_message.contains("ExactTailMinimumHotSuffixTooLarge"),
         "expected exact-tail current-context budget failure, got {error_message}"
     );
-    assert_eq!(
-        response_mock.requests().len(),
-        2,
+    let requests = response_mock.requests();
+    assert!(
+        requests
+            .iter()
+            .all(|request| !input_contains_text(&request.input(), SUMMARIZATION_PROMPT)),
         "exact-tail should reserve reinjected initial context and fail before issuing a local compaction request"
     );
     shutdown_codex(&test).await?;
@@ -254,16 +249,10 @@ async fn exact_tail_local_manual_rejects_oversize_reinjected_initial_context_ite
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
         &server,
-        vec![
-            sse(vec![
-                ev_assistant_message("local-context-item-cold-assistant", "LOCAL_ITEM_COLD"),
-                ev_completed("local-context-item-cold-response"),
-            ]),
-            sse(vec![
-                ev_assistant_message("local-context-item-hot-assistant", "LOCAL_ITEM_HOT"),
-                ev_completed("local-context-item-hot-response"),
-            ]),
-        ],
+        vec![sse(vec![
+            ev_assistant_message("local-context-item-cold-assistant", "LOCAL_ITEM_COLD"),
+            ev_completed("local-context-item-cold-response"),
+        ])],
     )
     .await;
     let provider = local_compaction_provider(&server);
@@ -280,8 +269,7 @@ async fn exact_tail_local_manual_rejects_oversize_reinjected_initial_context_ite
     });
     let test = builder.build(&server).await?;
 
-    test.submit_turn("LOCAL_CONTEXT_ITEM_COLD_USER").await?;
-    test.submit_turn("LOCAL_CONTEXT_ITEM_HOT_USER").await?;
+    test.submit_turn("LOCAL_CONTEXT_ITEM_USER").await?;
     test.codex.submit(Op::Compact).await?;
     let error_message = wait_for_event_match(&test.codex, |event| match event {
         EventMsg::Error(err) => Some(err.message.clone()),
@@ -293,9 +281,11 @@ async fn exact_tail_local_manual_rejects_oversize_reinjected_initial_context_ite
         error_message.contains("ExactTailModelVisibleItemTooLarge"),
         "expected exact-tail current-context item cap failure, got {error_message}"
     );
-    assert_eq!(
-        response_mock.requests().len(),
-        2,
+    let requests = response_mock.requests();
+    assert!(
+        requests
+            .iter()
+            .all(|request| !input_contains_text(&request.input(), SUMMARIZATION_PROMPT)),
         "oversize reinjected context should fail before issuing a local compaction request"
     );
 
@@ -444,8 +434,8 @@ async fn exact_tail_auto_compact_body_after_prefix_uses_full_context_window_budg
         "exact-tail body-after-prefix compaction should reach the compactor instead of failing against the body budget"
     );
     assert!(
-        !body_contains_text(&compact_body, "EXACT_TAIL_BODY_PREFIX_TWO"),
-        "the protected hot suffix should not be sent to the compactor"
+        !body_contains_text(&compact_body, SECOND_LARGE_REPLY),
+        "the protected newest atomic hot suffix should not be sent to the compactor"
     );
 
     shutdown_codex(&test).await?;

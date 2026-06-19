@@ -2,7 +2,7 @@ use super::compact_exact_tail_support::*;
 use pretty_assertions::assert_eq;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exact_tail_remote_legacy_manual_compact_excludes_hot_suffix_from_compaction_request()
+async fn exact_tail_remote_legacy_manual_compact_excludes_newest_atomic_hot_suffix_from_compaction_request()
 -> Result<()> {
     let server = start_mock_server().await;
     let cold_user = format!("REMOTE_COLD_USER {}", "remote cold context ".repeat(100));
@@ -70,12 +70,12 @@ async fn exact_tail_remote_legacy_manual_compact_excludes_hot_suffix_from_compac
         "cold assistant output should be sent to remote compact; compact body: {compact_body}"
     );
     assert!(
-        !body_contains_text(&compact_body, "REMOTE_HOT_USER"),
-        "exact hot user text must be excluded from remote compact; compact body: {compact_body}"
+        body_contains_text(&compact_body, "REMOTE_HOT_USER"),
+        "older same-turn user text should remain cold when the target only selects the newest atomic group; compact body: {compact_body}"
     );
     assert!(
         !body_contains_text(&compact_body, "REMOTE_HOT_ASSISTANT"),
-        "exact hot assistant text must be excluded from remote compact; compact body: {compact_body}"
+        "newest atomic hot assistant text must be excluded from remote compact; compact body: {compact_body}"
     );
 
     let requests = response_mock.requests();
@@ -89,10 +89,13 @@ async fn exact_tail_remote_legacy_manual_compact_excludes_hot_suffix_from_compac
         &follow_up_input,
         &[
             "REMOTE_EXACT_TAIL_SUMMARY",
-            "REMOTE_HOT_USER",
             "REMOTE_HOT_ASSISTANT",
             "REMOTE_FOLLOW_UP_USER",
         ],
+    );
+    assert!(
+        !input_contains_text(&follow_up_input, "REMOTE_HOT_USER"),
+        "follow-up should not replay older same-turn user text outside the remote summary"
     );
     assert!(
         !input_contains_text(&follow_up_input, "REMOTE_COLD_ASSISTANT"),
@@ -104,7 +107,7 @@ async fn exact_tail_remote_legacy_manual_compact_excludes_hot_suffix_from_compac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exact_tail_remote_legacy_auto_compact_excludes_hot_suffix_from_compaction_request()
+async fn exact_tail_remote_legacy_auto_compact_excludes_newest_atomic_hot_suffix_from_compaction_request()
 -> Result<()> {
     let server = start_mock_server().await;
     let cold_user = format!("REMOTE_AUTO_COLD_USER {}", "remote auto cold ".repeat(100));
@@ -173,12 +176,12 @@ async fn exact_tail_remote_legacy_auto_compact_excludes_hot_suffix_from_compacti
         "cold assistant output should be sent to remote auto compact; compact body: {compact_body}"
     );
     assert!(
-        !body_contains_text(&compact_body, "REMOTE_AUTO_HOT_USER"),
-        "exact hot user text must be excluded from remote auto compact; compact body: {compact_body}"
+        body_contains_text(&compact_body, "REMOTE_AUTO_HOT_USER"),
+        "older same-turn user text should remain cold when the target only selects the newest atomic group; compact body: {compact_body}"
     );
     assert!(
         !body_contains_text(&compact_body, "REMOTE_AUTO_HOT_ASSISTANT"),
-        "exact hot assistant text must be excluded from remote auto compact; compact body: {compact_body}"
+        "newest atomic hot assistant text must be excluded from remote auto compact; compact body: {compact_body}"
     );
 
     let requests = response_mock.requests();
@@ -192,10 +195,13 @@ async fn exact_tail_remote_legacy_auto_compact_excludes_hot_suffix_from_compacti
         &follow_up_input,
         &[
             "REMOTE_AUTO_EXACT_TAIL_SUMMARY",
-            "REMOTE_AUTO_HOT_USER",
             "REMOTE_AUTO_HOT_ASSISTANT",
             "REMOTE_AUTO_FOLLOW_UP_USER",
         ],
+    );
+    assert!(
+        !input_contains_text(&follow_up_input, "REMOTE_AUTO_HOT_USER"),
+        "follow-up should not replay older same-turn user text outside the remote auto summary"
     );
     assert!(
         !input_contains_text(&follow_up_input, "REMOTE_AUTO_COLD_ASSISTANT"),
@@ -293,7 +299,10 @@ async fn exact_tail_remote_v2_enabled_manual_routes_to_legacy_remote() -> Result
                 ev_completed("remote-v2-route-cold-response"),
             ]),
             sse(vec![
-                ev_assistant_message("remote-v2-route-hot-assistant", "REMOTE_V2_ROUTE_HOT"),
+                ev_assistant_message(
+                    "remote-v2-route-hot-assistant",
+                    "REMOTE_V2_ROUTE_ASSISTANT_EXACT",
+                ),
                 ev_completed("remote-v2-route-hot-response"),
             ]),
             sse(vec![
@@ -351,10 +360,16 @@ async fn exact_tail_remote_v2_enabled_manual_routes_to_legacy_remote() -> Result
         &response_mock.requests()[2].input(),
         &[
             "REMOTE_V2_ROUTE_EXACT_TAIL_SUMMARY",
-            "REMOTE_V2_ROUTE_HOT_USER",
-            "REMOTE_V2_ROUTE_HOT",
+            "REMOTE_V2_ROUTE_ASSISTANT_EXACT",
             "REMOTE_V2_ROUTE_FOLLOW_UP_USER",
         ],
+    );
+    assert!(
+        !input_contains_text(
+            &response_mock.requests()[2].input(),
+            "REMOTE_V2_ROUTE_HOT_USER"
+        ),
+        "follow-up should not replay older same-turn user text outside the remote-v2-routed summary"
     );
 
     shutdown_codex(&test).await?;
@@ -380,7 +395,7 @@ async fn exact_tail_remote_v2_enabled_auto_routes_to_legacy_remote() -> Result<(
             sse(vec![
                 ev_assistant_message(
                     "remote-v2-route-auto-hot-assistant",
-                    "REMOTE_V2_ROUTE_AUTO_HOT",
+                    "REMOTE_V2_ROUTE_AUTO_ASSISTANT_EXACT",
                 ),
                 ev_completed_with_tokens(
                     "remote-v2-route-auto-hot-response",
@@ -441,10 +456,16 @@ async fn exact_tail_remote_v2_enabled_auto_routes_to_legacy_remote() -> Result<(
         &response_mock.requests()[2].input(),
         &[
             "REMOTE_V2_ROUTE_AUTO_EXACT_TAIL_SUMMARY",
-            "REMOTE_V2_ROUTE_AUTO_HOT_USER",
-            "REMOTE_V2_ROUTE_AUTO_HOT",
+            "REMOTE_V2_ROUTE_AUTO_ASSISTANT_EXACT",
             "REMOTE_V2_ROUTE_AUTO_FOLLOW_UP_USER",
         ],
+    );
+    assert!(
+        !input_contains_text(
+            &response_mock.requests()[2].input(),
+            "REMOTE_V2_ROUTE_AUTO_HOT_USER"
+        ),
+        "follow-up should not replay older same-turn user text outside the remote-v2-routed auto summary"
     );
 
     shutdown_codex(&test).await?;
