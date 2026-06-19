@@ -430,7 +430,8 @@ fn replacement_fit_ignores_oversize_stale_context_wrapper_item() {
 }
 
 #[test]
-fn mixed_app_plugin_and_persistent_developer_message_fails_closed() {
+fn planner_filters_mixed_app_plugin_and_persistent_developer_message() {
+    let old = user("old history");
     let mixed_developer = developer(vec![
         ContentItem::InputText {
             text: format!("{APPS_INSTRUCTIONS_OPEN_TAG}\n## Apps (Connectors)"),
@@ -442,54 +443,41 @@ fn mixed_app_plugin_and_persistent_developer_message_fails_closed() {
             text: "Persistent developer instruction must not be silently dropped.".to_string(),
         },
     ]);
-    let history = [user("old"), mixed_developer, user("recent")];
-    let actual = plan_exact_tail(ExactTailPlanInput {
-        history_items: &history,
-        target_tokens: 1,
-        effective_replacement_budget: Some(50_000),
-        required_current_context_budget: 0,
-        final_replacement_extra_budget_tokens: 0,
-        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
-        estimated_summary_scaffold_overhead_tokens: 0,
-        retained_cold_user_message_budget_tokens: 0,
-        implementation: ExactTailImplementation::Local,
-    })
-    .expect_err("mixed app/plugin developer context should fail closed");
+    let recent = user("recent history");
 
+    let actual = plan(vec![old.clone(), mixed_developer, recent.clone()], 1);
+
+    assert_eq!(actual.cold_history, vec![old]);
+    assert_eq!(actual.hot_suffix, vec![recent]);
+    assert_eq!(actual.diagnostics.filtered_context_item_count, 1);
     assert_eq!(
-        actual.reason,
-        ExactTailFailReason::MixedDeveloperContextUnsupported
+        actual.coverage.filtered_stale_groups,
+        vec![1],
+        "old mixed initial-context bundles should be superseded by freshly built current context"
     );
 }
 
 #[test]
-fn mixed_contextual_and_persistent_developer_message_fails_closed() {
+fn planner_filters_oversize_mixed_developer_context_bundle() {
+    let old = user("old history");
     let mixed_developer = developer(vec![
         ContentItem::InputText {
-            text: "<token_budget>\n1000 tokens remain\n</token_budget>".to_string(),
+            text: format!("<token_budget>\n{}\n</token_budget>", "ctx ".repeat(15_000)),
         },
         ContentItem::InputText {
             text: "Persistent developer instruction must not be silently dropped.".to_string(),
         },
     ]);
-    let history = [user("old"), mixed_developer, user("recent")];
-    let actual = plan_exact_tail(ExactTailPlanInput {
-        history_items: &history,
-        target_tokens: 1,
-        effective_replacement_budget: Some(50_000),
-        required_current_context_budget: 0,
-        final_replacement_extra_budget_tokens: 0,
-        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
-        estimated_summary_scaffold_overhead_tokens: 0,
-        retained_cold_user_message_budget_tokens: 0,
-        implementation: ExactTailImplementation::Local,
-    })
-    .expect_err("mixed developer context should fail closed");
+    let recent = user("recent history");
+    let mixed_developer_tokens =
+        estimate_response_items_token_count(std::slice::from_ref(&mixed_developer));
+    assert!(mixed_developer_tokens > EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS);
 
-    assert_eq!(
-        actual.reason,
-        ExactTailFailReason::MixedDeveloperContextUnsupported
-    );
+    let actual = plan(vec![old.clone(), mixed_developer, recent.clone()], 1);
+
+    assert_eq!(actual.cold_history, vec![old]);
+    assert_eq!(actual.hot_suffix, vec![recent]);
+    assert_eq!(actual.diagnostics.filtered_context_item_count, 1);
 }
 
 #[test]

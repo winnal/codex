@@ -72,7 +72,6 @@ pub(crate) enum ExactTailFailReason {
     UnsupportedRemoteV2Ordering,
     NoUsableColdSummary,
     ModelVisibleItemTooLarge,
-    MixedDeveloperContextUnsupported,
 }
 
 impl ExactTailFailReason {
@@ -86,7 +85,6 @@ impl ExactTailFailReason {
             Self::UnsupportedRemoteV2Ordering => "ExactTailUnsupportedForRemoteV2Ordering",
             Self::NoUsableColdSummary => "ExactTailNoUsableColdSummary",
             Self::ModelVisibleItemTooLarge => "ExactTailModelVisibleItemTooLarge",
-            Self::MixedDeveloperContextUnsupported => "ExactTailMixedDeveloperContextUnsupported",
         }
     }
 }

@@ -1,5 +1,3 @@
-use crate::compact_exact_tail::ExactTailError;
-use crate::compact_exact_tail::ExactTailFailReason;
 use crate::compact_exact_tail::ExactTailItemClass;
 use crate::compact_exact_tail::classify_exact_tail_history_item;
 use crate::context_manager::estimate_response_items_token_count;
@@ -16,7 +14,7 @@ pub(super) struct ExactTailGroup {
 
 pub(super) fn build_groups(
     history_items: &[ResponseItem],
-) -> Result<(Vec<ExactTailGroup>, Vec<usize>, usize), ExactTailError> {
+) -> (Vec<ExactTailGroup>, Vec<usize>, usize) {
     let mut eligible = Vec::new();
     let mut filtered_stale_groups = Vec::new();
     let mut filtered_context_item_count = 0usize;
@@ -28,10 +26,10 @@ pub(super) fn build_groups(
                 filtered_context_item_count += 1;
             }
             ExactTailItemClass::MixedDeveloperContext => {
-                return Err(ExactTailError::new(
-                    ExactTailFailReason::MixedDeveloperContextUnsupported,
-                    "Exact-tail compaction found a developer message mixing contextual fragments with persistent developer instructions. This build fails closed rather than preserving stale contextual wrappers or dropping persistent instructions.",
-                ));
+                // Mixed developer bundles come from initial-context assembly. The caller rebuilds
+                // and budgets current context separately, so the historical bundle is stale.
+                filtered_stale_groups.push(index);
+                filtered_context_item_count += 1;
             }
             ExactTailItemClass::ConversationOrProtocol
             | ExactTailItemClass::DependencyProtocol
@@ -53,7 +51,7 @@ pub(super) fn build_groups(
         });
     }
 
-    Ok((groups, filtered_stale_groups, filtered_context_item_count))
+    (groups, filtered_stale_groups, filtered_context_item_count)
 }
 
 fn group_intervals(eligible: &[(usize, ResponseItem)]) -> Vec<(usize, usize)> {

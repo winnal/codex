@@ -96,7 +96,7 @@ pub(crate) fn plan_exact_tail(
         .saturating_sub(safety_margin);
 
     let raw_item_count = history_items.len();
-    let (groups, filtered_stale_groups, filtered_context_item_count) = build_groups(history_items)?;
+    let (groups, filtered_stale_groups, filtered_context_item_count) = build_groups(history_items);
     let group_count = groups.len();
 
     let mut selected_group_count = 0usize;
