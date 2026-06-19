@@ -127,6 +127,117 @@ async fn exact_tail_mid_turn_compaction_preserves_hot_tool_turn_outside_compacto
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_total_scope_no_auto_limit_uses_replacement_guard() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let first_turn = sse(vec![
+        ev_assistant_message(
+            "exact-tail-total-guard-cold-assistant",
+            "EXACT_TAIL_TOTAL_GUARD_COLD_ASSISTANT",
+        ),
+        ev_completed_with_usage(
+            "exact-tail-total-guard-cold-response",
+            /*input_tokens*/ 50_000,
+            /*output_tokens*/ 50,
+        ),
+    ]);
+    let second_turn = sse(vec![
+        ev_assistant_message(
+            "exact-tail-total-guard-hot-assistant",
+            "EXACT_TAIL_TOTAL_GUARD_HOT_ASSISTANT",
+        ),
+        ev_completed_with_usage(
+            "exact-tail-total-guard-hot-response",
+            /*input_tokens*/ 170_000,
+            /*output_tokens*/ 50,
+        ),
+    ]);
+    let auto_compact_turn = sse(vec![
+        ev_assistant_message(
+            "exact-tail-total-guard-summary",
+            "EXACT_TAIL_TOTAL_GUARD_SUMMARY",
+        ),
+        ev_completed_with_tokens(
+            "exact-tail-total-guard-compact-response",
+            /*total_tokens*/ 20,
+        ),
+    ]);
+    let third_turn = sse(vec![
+        ev_assistant_message(
+            "exact-tail-total-guard-final",
+            "EXACT_TAIL_TOTAL_GUARD_FINAL",
+        ),
+        ev_completed_with_usage(
+            "exact-tail-total-guard-final-response",
+            /*input_tokens*/ 80_000,
+            /*output_tokens*/ 50,
+        ),
+    ]);
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![first_turn, second_turn, auto_compact_turn, third_turn],
+    )
+    .await;
+    let provider = local_compaction_provider(&server);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(1);
+        })
+        .build(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("EXACT_TAIL_TOTAL_GUARD_COLD_USER")
+        .await
+        .expect("submit cold turn");
+    test.submit_turn("EXACT_TAIL_TOTAL_GUARD_HOT_USER")
+        .await
+        .expect("submit hot turn");
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "exact-tail should wait until the next pre-turn check before compacting"
+    );
+
+    test.submit_turn("EXACT_TAIL_TOTAL_GUARD_FOLLOW_UP_USER")
+        .await
+        .expect("submit follow-up turn");
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "third turn should run pre-turn exact-tail compaction even without a configured auto limit"
+    );
+    let compact_input = requests[2].input();
+    assert!(
+        input_contains_text(&compact_input, "EXACT_TAIL_TOTAL_GUARD_COLD_USER"),
+        "cold prefix should be sent to the exact-tail compactor"
+    );
+    assert!(
+        !input_contains_text(&compact_input, "EXACT_TAIL_TOTAL_GUARD_HOT_USER"),
+        "protected hot suffix should be excluded from the compactor"
+    );
+
+    let continuation_input = requests[3].input();
+    assert_ordered_input_texts(
+        &continuation_input,
+        &[
+            "EXACT_TAIL_TOTAL_GUARD_SUMMARY",
+            "EXACT_TAIL_TOTAL_GUARD_HOT_USER",
+            "EXACT_TAIL_TOTAL_GUARD_FOLLOW_UP_USER",
+        ],
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_tail_replacement_history_survives_resume() -> Result<()> {
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(

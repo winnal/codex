@@ -13,6 +13,7 @@ use codex_protocol::models::ResponseItem;
 use super::EXACT_TAIL_CONSERVATIVE_SUMMARY_BUDGET_TOKENS;
 use super::EXACT_TAIL_MIN_SAFETY_MARGIN_TOKENS;
 use super::EXACT_TAIL_REPLACEMENT_OVERHEAD_MARGIN_TOKENS;
+use super::ExactTailBudgetReservation;
 use super::ExactTailCoverage;
 use super::ExactTailDiagnostics;
 use super::ExactTailError;
@@ -64,6 +65,11 @@ pub(crate) fn classify_exact_tail_history_item(item: &ResponseItem) -> ExactTail
     }
 }
 
+pub(crate) fn exact_tail_group_count(history_items: &[ResponseItem]) -> usize {
+    let (groups, _, _) = build_groups(history_items);
+    groups.len()
+}
+
 pub(crate) fn plan_exact_tail(
     input: ExactTailPlanInput<'_>,
 ) -> Result<ExactTailPlan, ExactTailError> {
@@ -84,16 +90,12 @@ pub(crate) fn plan_exact_tail(
             "Exact-tail compaction requires a model context window or auto-compaction budget.",
         ));
     };
-    let conservative_cold_summary_budget = EXACT_TAIL_CONSERVATIVE_SUMMARY_BUDGET_TOKENS
-        .saturating_add(estimated_summary_scaffold_overhead_tokens)
-        .saturating_add(retained_cold_user_message_budget_tokens)
-        .saturating_add(EXACT_TAIL_REPLACEMENT_OVERHEAD_MARGIN_TOKENS);
-    let safety_margin =
-        EXACT_TAIL_MIN_SAFETY_MARGIN_TOKENS.max(effective_replacement_budget.saturating_div(100));
-    let available_for_hot = effective_replacement_budget
-        .saturating_sub(required_current_context_budget)
-        .saturating_sub(conservative_cold_summary_budget)
-        .saturating_sub(safety_margin);
+    let budget_reservation = exact_tail_budget_reservation(
+        effective_replacement_budget,
+        required_current_context_budget,
+        estimated_summary_scaffold_overhead_tokens,
+        retained_cold_user_message_budget_tokens,
+    );
 
     let raw_item_count = history_items.len();
     let (groups, filtered_stale_groups, filtered_context_item_count) = build_groups(history_items);
@@ -102,7 +104,7 @@ pub(crate) fn plan_exact_tail(
     let mut selected_group_count = 0usize;
     let mut actual_hot_tokens = 0i64;
     if let Some(newest_group) = groups.last()
-        && newest_group.tokens > available_for_hot
+        && newest_group.tokens > budget_reservation.available_for_hot
     {
         return Err(ExactTailError::new(
             ExactTailFailReason::MinimumHotSuffixTooLarge,
@@ -110,7 +112,7 @@ pub(crate) fn plan_exact_tail(
                 "{}: newest exact-tail group requires {} tokens but only {} are available",
                 ExactTailFailReason::MinimumHotSuffixTooLarge.as_str(),
                 newest_group.tokens,
-                available_for_hot
+                budget_reservation.available_for_hot
             ),
         ));
     }
@@ -122,14 +124,14 @@ pub(crate) fn plan_exact_tail(
         if !required_to_reach_target {
             break;
         }
-        if next_tokens > available_for_hot {
+        if next_tokens > budget_reservation.available_for_hot {
             return Err(ExactTailError::new(
                 ExactTailFailReason::MinimumHotSuffixTooLarge,
                 format!(
                     "{}: requested exact-tail suffix requires {} tokens but only {} are available",
                     ExactTailFailReason::MinimumHotSuffixTooLarge.as_str(),
                     next_tokens,
-                    available_for_hot
+                    budget_reservation.available_for_hot
                 ),
             ));
         }
@@ -182,12 +184,12 @@ pub(crate) fn plan_exact_tail(
         estimated_summary_scaffold_overhead_tokens,
         retained_cold_user_message_budget_tokens,
         replacement_overhead_margin_tokens: EXACT_TAIL_REPLACEMENT_OVERHEAD_MARGIN_TOKENS,
-        conservative_cold_summary_budget,
+        conservative_cold_summary_budget: budget_reservation.conservative_cold_summary_budget,
         required_current_context_budget,
         final_replacement_extra_budget_tokens,
         max_model_visible_item_tokens,
-        safety_margin,
-        available_for_hot,
+        safety_margin: budget_reservation.safety_margin,
+        available_for_hot: budget_reservation.available_for_hot,
     };
     trace_plan(&diagnostics);
     Ok(ExactTailPlan {
@@ -197,6 +199,30 @@ pub(crate) fn plan_exact_tail(
         diagnostics,
         coverage,
     })
+}
+
+pub(crate) fn exact_tail_budget_reservation(
+    effective_replacement_budget: i64,
+    required_current_context_budget: i64,
+    estimated_summary_scaffold_overhead_tokens: i64,
+    retained_cold_user_message_budget_tokens: i64,
+) -> ExactTailBudgetReservation {
+    let conservative_cold_summary_budget = EXACT_TAIL_CONSERVATIVE_SUMMARY_BUDGET_TOKENS
+        .saturating_add(estimated_summary_scaffold_overhead_tokens)
+        .saturating_add(retained_cold_user_message_budget_tokens)
+        .saturating_add(EXACT_TAIL_REPLACEMENT_OVERHEAD_MARGIN_TOKENS);
+    let safety_margin =
+        EXACT_TAIL_MIN_SAFETY_MARGIN_TOKENS.max(effective_replacement_budget.saturating_div(100));
+    let available_for_hot = effective_replacement_budget
+        .saturating_sub(required_current_context_budget)
+        .saturating_sub(conservative_cold_summary_budget)
+        .saturating_sub(safety_margin);
+
+    ExactTailBudgetReservation {
+        conservative_cold_summary_budget,
+        safety_margin,
+        available_for_hot,
+    }
 }
 
 pub(crate) fn exact_tail_replacement_budget(

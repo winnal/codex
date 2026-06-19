@@ -12,6 +12,7 @@ use codex_protocol::models::ResponseItem;
 pub(crate) const EXACT_TAIL_CONSERVATIVE_SUMMARY_BUDGET_TOKENS: i64 = 16_384;
 pub(crate) const EXACT_TAIL_REPLACEMENT_OVERHEAD_MARGIN_TOKENS: i64 = 1_024;
 pub(crate) const EXACT_TAIL_MIN_SAFETY_MARGIN_TOKENS: i64 = 4_096;
+pub(crate) const EXACT_TAIL_AUTO_COMPACT_TRIGGER_MARGIN_TOKENS: i64 = 4_096;
 pub(crate) const EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS: i64 = 10_000;
 pub(crate) const EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS: i64 =
     COMPACT_USER_MESSAGE_MAX_TOKENS as i64;
@@ -150,6 +151,13 @@ pub(crate) struct ExactTailDiagnostics {
     pub(crate) required_current_context_budget: i64,
     pub(crate) final_replacement_extra_budget_tokens: i64,
     pub(crate) max_model_visible_item_tokens: i64,
+    pub(crate) safety_margin: i64,
+    pub(crate) available_for_hot: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactTailBudgetReservation {
+    pub(crate) conservative_cold_summary_budget: i64,
     pub(crate) safety_margin: i64,
     pub(crate) available_for_hot: i64,
 }

@@ -16,6 +16,8 @@ mod planner;
 mod types;
 
 pub(crate) use planner::classify_exact_tail_history_item;
+pub(crate) use planner::exact_tail_budget_reservation;
+pub(crate) use planner::exact_tail_group_count;
 pub(crate) use planner::exact_tail_replacement_budget;
 pub(crate) use planner::plan_exact_tail;
 pub(crate) use types::*;
