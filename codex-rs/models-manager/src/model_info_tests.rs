@@ -74,11 +74,10 @@ fn model_context_window_uses_model_value_without_override() {
 }
 
 #[test]
-fn tool_output_cap_limits_larger_token_override() {
+fn tool_output_token_limit_sets_byte_mode_policy() {
     let model = model_info_from_slug("unknown-model");
     let config = ModelsManagerConfig {
         tool_output_token_limit: Some(20_000),
-        max_tool_output_token_limit: Some(8_000),
         ..Default::default()
     };
 
@@ -86,34 +85,16 @@ fn tool_output_cap_limits_larger_token_override() {
 
     assert_eq!(
         updated.truncation_policy,
-        TruncationPolicyConfig::bytes(/*limit*/ 32_000)
+        TruncationPolicyConfig::bytes(/*limit*/ 80_000)
     );
 }
 
 #[test]
-fn tool_output_cap_preserves_smaller_token_override() {
-    let model = model_info_from_slug("unknown-model");
-    let config = ModelsManagerConfig {
-        tool_output_token_limit: Some(4_000),
-        max_tool_output_token_limit: Some(8_000),
-        ..Default::default()
-    };
-
-    let updated = with_config_overrides(model, &config);
-
-    assert_eq!(
-        updated.truncation_policy,
-        TruncationPolicyConfig::bytes(/*limit*/ 16_000)
-    );
-}
-
-#[test]
-fn tool_output_cap_preserves_token_mode_when_model_uses_token_mode() {
+fn tool_output_token_limit_preserves_token_mode_policy() {
     let mut model = model_info_from_slug("unknown-model");
     model.truncation_policy = TruncationPolicyConfig::tokens(/*limit*/ 10_000);
     let config = ModelsManagerConfig {
         tool_output_token_limit: Some(20_000),
-        max_tool_output_token_limit: Some(8_000),
         ..Default::default()
     };
 
@@ -121,6 +102,6 @@ fn tool_output_cap_preserves_token_mode_when_model_uses_token_mode() {
 
     assert_eq!(
         updated.truncation_policy,
-        TruncationPolicyConfig::tokens(/*limit*/ 8_000)
+        TruncationPolicyConfig::tokens(/*limit*/ 20_000)
     );
 }

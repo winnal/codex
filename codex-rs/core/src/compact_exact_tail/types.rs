@@ -12,23 +12,37 @@ use codex_protocol::models::ResponseItem;
 pub(crate) const EXACT_TAIL_CONSERVATIVE_SUMMARY_BUDGET_TOKENS: i64 = 16_384;
 pub(crate) const EXACT_TAIL_REPLACEMENT_OVERHEAD_MARGIN_TOKENS: i64 = 1_024;
 pub(crate) const EXACT_TAIL_MIN_SAFETY_MARGIN_TOKENS: i64 = 4_096;
-pub(crate) const EXACT_TAIL_MAX_MODEL_VISIBLE_ITEM_TOKENS: i64 = 10_000;
+pub(crate) const EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS: i64 = 10_000;
 pub(crate) const EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS: i64 =
     COMPACT_USER_MESSAGE_MAX_TOKENS as i64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompactionHistoryPolicy {
     Standard,
-    PreserveRecentExact { target_tokens: i64 },
+    PreserveRecentExact {
+        target_tokens: i64,
+        max_model_visible_item_tokens: i64,
+    },
 }
 
 impl CompactionHistoryPolicy {
     pub(crate) fn from_config(config: &Config) -> Self {
         match config.compact_preserve_recent_tokens {
-            Some(target_tokens) if target_tokens > 0 => Self::PreserveRecentExact { target_tokens },
+            Some(target_tokens) if target_tokens > 0 => Self::PreserveRecentExact {
+                target_tokens,
+                max_model_visible_item_tokens: max_model_visible_item_tokens(config),
+            },
             Some(_) | None => Self::Standard,
         }
     }
+}
+
+fn max_model_visible_item_tokens(config: &Config) -> i64 {
+    config
+        .tool_output_token_limit
+        .and_then(|tokens| i64::try_from(tokens).ok())
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -137,6 +151,7 @@ pub(crate) struct ExactTailDiagnostics {
     pub(crate) conservative_cold_summary_budget: i64,
     pub(crate) required_current_context_budget: i64,
     pub(crate) final_replacement_extra_budget_tokens: i64,
+    pub(crate) max_model_visible_item_tokens: i64,
     pub(crate) safety_margin: i64,
     pub(crate) available_for_hot: i64,
 }
@@ -162,6 +177,7 @@ pub(crate) struct ExactTailPlanInput<'a> {
     pub(crate) effective_replacement_budget: Option<i64>,
     pub(crate) required_current_context_budget: i64,
     pub(crate) final_replacement_extra_budget_tokens: i64,
+    pub(crate) max_model_visible_item_tokens: i64,
     pub(crate) estimated_summary_scaffold_overhead_tokens: i64,
     pub(crate) retained_cold_user_message_budget_tokens: i64,
     pub(crate) implementation: ExactTailImplementation,

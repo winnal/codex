@@ -151,7 +151,7 @@ fn serialize_function_output_caps_read_resource_payload() {
         }]),
     };
     let serialized = serde_json::to_string(&payload).expect("serialize payload");
-    let expected = truncate_text(&serialized, truncation_policy * 1.2);
+    let expected = truncate_text(&serialized, truncation_policy);
 
     let output = serialize_function_output(payload, truncation_policy)
         .expect("serialize bounded function output")

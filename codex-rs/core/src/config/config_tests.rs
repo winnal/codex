@@ -1,3 +1,4 @@
+use crate::compact_exact_tail::CompactionHistoryPolicy;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
@@ -6899,7 +6900,7 @@ async fn load_config_sets_compact_preserve_recent_tokens() -> std::io::Result<()
 }
 
 #[tokio::test]
-async fn exact_tail_caps_model_manager_tool_output_limit() -> std::io::Result<()> {
+async fn exact_tail_preserves_configured_model_manager_tool_output_limit() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cfg = ConfigToml {
         compact_preserve_recent_tokens: Some(120_000),
@@ -6915,35 +6916,15 @@ async fn exact_tail_caps_model_manager_tool_output_limit() -> std::io::Result<()
     .await?;
 
     assert_eq!(
-        config
-            .to_models_manager_config()
-            .max_tool_output_token_limit,
-        Some(8_000)
+        config.to_models_manager_config().tool_output_token_limit,
+        Some(20_000)
     );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn standard_compaction_does_not_cap_model_manager_tool_output_limit() -> std::io::Result<()> {
-    let codex_home = TempDir::new()?;
-    let cfg = ConfigToml {
-        tool_output_token_limit: Some(20_000),
-        ..Default::default()
-    };
-
-    let config = Config::load_from_base_config_with_overrides(
-        cfg,
-        ConfigOverrides::default(),
-        codex_home.abs(),
-    )
-    .await?;
-
     assert_eq!(
-        config
-            .to_models_manager_config()
-            .max_tool_output_token_limit,
-        None
+        CompactionHistoryPolicy::from_config(&config),
+        CompactionHistoryPolicy::PreserveRecentExact {
+            target_tokens: 120_000,
+            max_model_visible_item_tokens: 20_000,
+        }
     );
 
     Ok(())

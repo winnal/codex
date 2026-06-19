@@ -308,7 +308,7 @@ where
     })?;
     // Match regular MCP tool outputs by bounding the copy persisted to the
     // rollout and injected into model context.
-    let content = truncate_text(&content, truncation_policy * 1.2);
+    let content = truncate_text(&content, truncation_policy);
 
     Ok(FunctionToolOutput::from_text(content, Some(true)))
 }

@@ -25,6 +25,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::TurnContextItem;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::truncate_text;
 use image::ImageBuffer;
 use image::ImageFormat;
@@ -1165,6 +1166,40 @@ fn record_items_respects_custom_token_limit() {
 
     history.record_items([&item], policy);
 
+    let stored = match &history.items[0] {
+        ResponseItem::FunctionCallOutput { output, .. } => output,
+        other => panic!("unexpected history item: {other:?}"),
+    };
+    assert!(
+        stored
+            .text_content()
+            .is_some_and(|content| content.contains("tokens truncated"))
+    );
+}
+
+#[test]
+fn record_items_keeps_read_thread_sized_tool_output_within_serialized_item_budget() {
+    let mut history = ContextManager::new();
+    let token_limit = 20_000;
+    let policy = TruncationPolicy::Bytes(approx_bytes_for_tokens(token_limit));
+    let long_output = "read_thread summary payload ".repeat(20_000);
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "read_thread-call".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(long_output),
+            success: Some(true),
+        },
+        metadata: None,
+    };
+
+    history.record_items([&item], policy);
+
+    let stored_tokens = estimate_response_items_token_count(&history.items);
+    assert!(
+        stored_tokens <= i64::try_from(token_limit).unwrap_or(i64::MAX),
+        "stored tool output item estimated to {stored_tokens} tokens, above {token_limit}"
+    );
     let stored = match &history.items[0] {
         ResponseItem::FunctionCallOutput { output, .. } => output,
         other => panic!("unexpected history item: {other:?}"),

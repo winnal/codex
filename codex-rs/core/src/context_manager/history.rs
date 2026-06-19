@@ -356,32 +356,35 @@ impl ContextManager {
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
-        let policy_with_serialization_budget = policy * 1.2;
         match item {
             ResponseItem::FunctionCallOutput {
                 id,
                 call_id,
                 output,
                 internal_chat_message_metadata_passthrough: metadata,
-            } => ResponseItem::FunctionCallOutput {
-                id: id.clone(),
-                call_id: call_id.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
-                internal_chat_message_metadata_passthrough: metadata.clone(),
-            },
+            } => truncate_function_output_item_to_policy(output, policy, |output| {
+                ResponseItem::FunctionCallOutput {
+                    id: id.clone(),
+                    call_id: call_id.clone(),
+                    output,
+                    internal_chat_message_metadata_passthrough: metadata.clone(),
+                }
+            }),
             ResponseItem::CustomToolCallOutput {
                 id,
                 call_id,
                 name,
                 output,
                 internal_chat_message_metadata_passthrough: metadata,
-            } => ResponseItem::CustomToolCallOutput {
-                id: id.clone(),
-                call_id: call_id.clone(),
-                name: name.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
-                internal_chat_message_metadata_passthrough: metadata.clone(),
-            },
+            } => truncate_function_output_item_to_policy(output, policy, |output| {
+                ResponseItem::CustomToolCallOutput {
+                    id: id.clone(),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    output,
+                    internal_chat_message_metadata_passthrough: metadata.clone(),
+                }
+            }),
             ResponseItem::Message { .. }
             | ResponseItem::AgentMessage { .. }
             | ResponseItem::Reasoning { .. }
@@ -445,6 +448,38 @@ impl ContextManager {
         }
         cut_idx
     }
+}
+
+fn truncate_function_output_item_to_policy(
+    original_output: &FunctionCallOutputPayload,
+    policy: TruncationPolicy,
+    mut build_item: impl FnMut(FunctionCallOutputPayload) -> ResponseItem,
+) -> ResponseItem {
+    let token_limit = i64::try_from(policy.token_budget()).unwrap_or(i64::MAX);
+    let mut output_budget = policy.token_budget();
+    let mut item = build_item(truncate_function_output_payload(original_output, policy));
+
+    for _ in 0..4 {
+        let item_tokens = estimate_response_items_token_count(std::slice::from_ref(&item));
+        if item_tokens <= token_limit {
+            return item;
+        }
+
+        let excess = usize::try_from(item_tokens.saturating_sub(token_limit))
+            .unwrap_or(usize::MAX)
+            .saturating_add(64);
+        let next_budget = output_budget.saturating_sub(excess);
+        if next_budget >= output_budget {
+            break;
+        }
+        output_budget = next_budget;
+        item = build_item(truncate_function_output_payload(
+            original_output,
+            TruncationPolicy::Tokens(output_budget),
+        ));
+    }
+
+    item
 }
 
 pub(crate) fn truncate_function_output_payload(

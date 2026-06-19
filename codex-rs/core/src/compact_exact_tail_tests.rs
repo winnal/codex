@@ -116,6 +116,7 @@ fn plan_input<'a>(
         effective_replacement_budget,
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: local_summary_scaffold_overhead_tokens(),
         retained_cold_user_message_budget_tokens:
             EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS,
@@ -181,6 +182,7 @@ fn planner_fails_when_required_whole_group_to_reach_target_cannot_fit() {
         ),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -273,6 +275,7 @@ fn planner_uses_summary_scaffold_overhead_in_available_hot_budget() {
         effective_replacement_budget: Some(50_000),
         required_current_context_budget: 123,
         final_replacement_extra_budget_tokens: 456,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: overhead,
         retained_cold_user_message_budget_tokens: 321,
         implementation: ExactTailImplementation::RemoteLegacy,
@@ -318,6 +321,7 @@ fn minimum_hot_suffix_oversize_fails_before_compaction() {
         effective_replacement_budget: Some(1),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -336,6 +340,7 @@ fn all_hot_history_without_cold_prefix_fails_before_compaction() {
         effective_replacement_budget: Some(50_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -354,6 +359,7 @@ fn unavailable_replacement_budget_fails_before_compaction() {
         effective_replacement_budget: None,
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -407,6 +413,23 @@ fn planner_filters_stale_app_and_plugin_developer_wrappers() {
 }
 
 #[test]
+fn replacement_fit_ignores_oversize_stale_context_wrapper_item() {
+    let actual = plan(vec![user("old history"), user("recent history")], 1);
+    let stale_context = developer(vec![ContentItem::InputText {
+        text: format!("<token_budget>\n{}\n</token_budget>", "ctx ".repeat(15_000)),
+    }]);
+    let stale_context_tokens =
+        estimate_response_items_token_count(std::slice::from_ref(&stale_context));
+    assert!(stale_context_tokens > EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS);
+
+    let final_tokens =
+        check_replacement_fits(&actual, &[stale_context], /*actual_summary_tokens*/ 0)
+            .expect("stale context wrapper should not fail the exact-tail item cap");
+
+    assert!(final_tokens < actual.diagnostics.effective_replacement_budget);
+}
+
+#[test]
 fn mixed_app_plugin_and_persistent_developer_message_fails_closed() {
     let mixed_developer = developer(vec![
         ContentItem::InputText {
@@ -426,6 +449,7 @@ fn mixed_app_plugin_and_persistent_developer_message_fails_closed() {
         effective_replacement_budget: Some(50_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -455,6 +479,7 @@ fn mixed_contextual_and_persistent_developer_message_fails_closed() {
         effective_replacement_budget: Some(50_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -476,6 +501,7 @@ fn oversize_hot_user_item_fails_closed() {
         effective_replacement_budget: Some(200_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -500,6 +526,7 @@ fn oversize_hot_developer_item_fails_closed() {
         effective_replacement_budget: Some(200_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -522,6 +549,7 @@ fn oversize_hot_assistant_item_fails_closed() {
         effective_replacement_budget: Some(200_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -545,6 +573,7 @@ fn oversize_hot_tool_output_item_fails_closed() {
         effective_replacement_budget: Some(200_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -558,6 +587,55 @@ fn oversize_hot_tool_output_item_fails_closed() {
             .to_string()
             .contains("function_call_output call_id=call-1"),
         "error should identify the oversized item"
+    );
+}
+
+#[test]
+fn configured_larger_item_cap_allows_read_thread_sized_tool_output() {
+    let output = function_output("call-1", &"read_thread summary payload ".repeat(2_400));
+    let output_tokens = estimate_response_items_token_count(std::slice::from_ref(&output));
+    assert!(output_tokens > EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS);
+    assert!(output_tokens < 20_000);
+    let history = [
+        user("old"),
+        user("recent"),
+        function_call("call-1"),
+        output.clone(),
+    ];
+
+    let default_error = plan_exact_tail(ExactTailPlanInput {
+        history_items: &history,
+        target_tokens: 1,
+        effective_replacement_budget: Some(200_000),
+        required_current_context_budget: 0,
+        final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
+        estimated_summary_scaffold_overhead_tokens: 0,
+        retained_cold_user_message_budget_tokens: 0,
+        implementation: ExactTailImplementation::Local,
+    })
+    .expect_err("default item cap should reject the read_thread-sized tool output");
+    assert_eq!(
+        default_error.reason,
+        ExactTailFailReason::ModelVisibleItemTooLarge
+    );
+
+    let actual = plan_exact_tail(ExactTailPlanInput {
+        history_items: &history,
+        target_tokens: 1,
+        effective_replacement_budget: Some(200_000),
+        required_current_context_budget: 0,
+        final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: 20_000,
+        estimated_summary_scaffold_overhead_tokens: 0,
+        retained_cold_user_message_budget_tokens: 0,
+        implementation: ExactTailImplementation::Local,
+    })
+    .expect("configured 20k item cap should allow the read_thread-sized tool output");
+
+    assert_eq!(
+        actual.hot_suffix,
+        vec![user("recent"), function_call("call-1"), output]
     );
 }
 
@@ -602,6 +680,7 @@ fn replacement_fit_includes_final_prompt_reserve() {
         effective_replacement_budget: Some(effective_budget),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: final_extra_tokens,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
@@ -630,6 +709,7 @@ fn replacement_fit_rejects_oversize_model_visible_item_even_when_total_fits() {
         effective_replacement_budget: Some(replacement_tokens + 100_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,

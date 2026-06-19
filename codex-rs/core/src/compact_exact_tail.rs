@@ -36,7 +36,11 @@ pub(crate) async fn prepare_exact_tail_plan(
         implementation,
     } = input;
 
-    let CompactionHistoryPolicy::PreserveRecentExact { target_tokens } = policy else {
+    let CompactionHistoryPolicy::PreserveRecentExact {
+        target_tokens,
+        max_model_visible_item_tokens,
+    } = policy
+    else {
         return Ok(None);
     };
 
@@ -49,7 +53,7 @@ pub(crate) async fn prepare_exact_tail_plan(
                 .await
         }
     };
-    ensure_model_visible_items_within_limit(&current_context)?;
+    ensure_model_visible_items_within_limit(&current_context, max_model_visible_item_tokens)?;
     let initial_context = match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage => current_context.clone(),
         InitialContextInjection::DoNotInject => Vec::new(),
@@ -74,6 +78,7 @@ pub(crate) async fn prepare_exact_tail_plan(
         ),
         required_current_context_budget,
         final_replacement_extra_budget_tokens,
+        max_model_visible_item_tokens,
         estimated_summary_scaffold_overhead_tokens,
         retained_cold_user_message_budget_tokens,
         implementation,
@@ -302,7 +307,10 @@ pub(crate) fn check_replacement_fits(
     replacement_history: &[ResponseItem],
     actual_summary_tokens: i64,
 ) -> Result<i64, ExactTailError> {
-    ensure_model_visible_items_within_limit(replacement_history)?;
+    ensure_model_visible_items_within_limit(
+        replacement_history,
+        plan.diagnostics.max_model_visible_item_tokens,
+    )?;
     let replacement_tokens_estimate = estimate_response_items_token_count(replacement_history);
     let final_tokens_estimate = replacement_tokens_estimate
         .saturating_add(plan.diagnostics.final_replacement_extra_budget_tokens);
@@ -324,6 +332,7 @@ pub(crate) fn check_replacement_fits(
         required_current_context_budget = plan.diagnostics.required_current_context_budget,
         final_replacement_extra_budget_tokens =
             plan.diagnostics.final_replacement_extra_budget_tokens,
+        max_model_visible_item_tokens = plan.diagnostics.max_model_visible_item_tokens,
         safety_margin = plan.diagnostics.safety_margin,
         available_for_hot = plan.diagnostics.available_for_hot,
         actual_summary_tokens,
@@ -357,7 +366,10 @@ pub(crate) fn check_cold_input_fits(
     compact_request_items: &[ResponseItem],
     context_window: Option<i64>,
 ) -> Result<(), ExactTailError> {
-    ensure_model_visible_items_within_limit(compact_request_items)?;
+    ensure_model_visible_items_within_limit(
+        compact_request_items,
+        plan.diagnostics.max_model_visible_item_tokens,
+    )?;
     let Some(context_window) = context_window else {
         return Ok(());
     };
@@ -395,10 +407,17 @@ pub(crate) fn unsupported_remote_v2_ordering_error() -> ExactTailError {
 
 pub(super) fn ensure_model_visible_items_within_limit(
     items: &[ResponseItem],
+    max_model_visible_item_tokens: i64,
 ) -> Result<(), ExactTailError> {
     for item in items {
+        if matches!(
+            classify_exact_tail_history_item(item),
+            ExactTailItemClass::StaleContextWrapper
+        ) {
+            continue;
+        }
         let item_tokens = estimate_response_items_token_count(std::slice::from_ref(item));
-        if item_tokens > EXACT_TAIL_MAX_MODEL_VISIBLE_ITEM_TOKENS {
+        if item_tokens > max_model_visible_item_tokens {
             let item_kind = model_visible_item_kind(item);
             let item_label = model_visible_item_label(item);
             warn!(
@@ -407,7 +426,7 @@ pub(super) fn ensure_model_visible_items_within_limit(
                 item_kind,
                 item_label = item_label.as_str(),
                 item_tokens,
-                max_item_tokens = EXACT_TAIL_MAX_MODEL_VISIBLE_ITEM_TOKENS,
+                max_item_tokens = max_model_visible_item_tokens,
                 "exact-tail model-visible item exceeds per-item cap"
             );
             return Err(ExactTailError::new(
@@ -416,7 +435,7 @@ pub(super) fn ensure_model_visible_items_within_limit(
                     "{}: exact-tail {item_label} estimates to {} tokens, exceeding per-item cap {}",
                     ExactTailFailReason::ModelVisibleItemTooLarge.as_str(),
                     item_tokens,
-                    EXACT_TAIL_MAX_MODEL_VISIBLE_ITEM_TOKENS
+                    max_model_visible_item_tokens
                 ),
             ));
         }

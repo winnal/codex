@@ -133,10 +133,7 @@ impl McpToolOutput {
         // This is the context-injection form, so keep it aligned with the
         // function-call output truncation that conversation history already
         // applies. Code-mode consumers still get the raw `CallToolResult`.
-        //
-        // The text is serialized again inside the Responses payload, so allow
-        // a small buffer for JSON escaping and wrapper overhead.
-        truncate_function_output_payload(&payload, self.truncation_policy * 1.2)
+        truncate_function_output_payload(&payload, self.truncation_policy)
     }
 }
 

@@ -178,7 +178,6 @@ pub(crate) use resolved_permission_profile::PermissionProfileState;
 
 const DEFAULT_IGNORE_LARGE_UNTRACKED_DIRS: i64 = 200;
 const DEFAULT_IGNORE_LARGE_UNTRACKED_FILES: i64 = 10 * 1024 * 1024;
-const EXACT_TAIL_SAFE_TOOL_OUTPUT_TOKEN_LIMIT: usize = 8_000;
 
 /// Compatibility-only config retained so legacy `ghost_snapshot` settings
 /// continue to load even though snapshots are no longer produced.
@@ -1463,9 +1462,6 @@ impl Config {
             model_context_window: self.model_context_window,
             model_auto_compact_token_limit: self.model_auto_compact_token_limit,
             tool_output_token_limit: self.tool_output_token_limit,
-            max_tool_output_token_limit: self
-                .compact_preserve_recent_tokens
-                .map(|_| EXACT_TAIL_SAFE_TOOL_OUTPUT_TOKEN_LIMIT),
             base_instructions: self.base_instructions.clone(),
             personality_enabled: self.features.enabled(Feature::Personality),
             model_supports_reasoning_summaries: self.model_supports_reasoning_summaries,

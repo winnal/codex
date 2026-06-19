@@ -73,6 +73,7 @@ pub(crate) fn plan_exact_tail(
         effective_replacement_budget,
         required_current_context_budget,
         final_replacement_extra_budget_tokens,
+        max_model_visible_item_tokens,
         estimated_summary_scaffold_overhead_tokens,
         retained_cold_user_message_budget_tokens,
         implementation,
@@ -157,7 +158,7 @@ pub(crate) fn plan_exact_tail(
         hot_exact_groups.push(group.id);
         hot_suffix.extend(group.items.clone());
     }
-    ensure_model_visible_items_within_limit(&hot_suffix)?;
+    ensure_model_visible_items_within_limit(&hot_suffix, max_model_visible_item_tokens)?;
 
     let cold_tokens = estimate_response_items_token_count(&cold_history);
     let cold_user_messages = collect_user_messages(&cold_history);
@@ -184,6 +185,7 @@ pub(crate) fn plan_exact_tail(
         conservative_cold_summary_budget,
         required_current_context_budget,
         final_replacement_extra_budget_tokens,
+        max_model_visible_item_tokens,
         safety_margin,
         available_for_hot,
     };
@@ -237,6 +239,7 @@ fn trace_plan(diagnostics: &ExactTailDiagnostics) {
         replacement_overhead_margin_tokens = diagnostics.replacement_overhead_margin_tokens,
         required_current_context_budget = diagnostics.required_current_context_budget,
         final_replacement_extra_budget_tokens = diagnostics.final_replacement_extra_budget_tokens,
+        max_model_visible_item_tokens = diagnostics.max_model_visible_item_tokens,
         safety_margin = diagnostics.safety_margin,
         available_for_hot = diagnostics.available_for_hot,
         hot_group_count = diagnostics.hot_group_count,
