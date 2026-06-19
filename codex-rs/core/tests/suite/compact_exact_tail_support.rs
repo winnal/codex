@@ -12,7 +12,6 @@ pub(super) use codex_protocol::protocol::EventMsg;
 pub(super) use codex_protocol::protocol::Op;
 pub(super) use codex_protocol::protocol::RolloutItem;
 pub(super) use codex_protocol::protocol::RolloutLine;
-pub(super) use core_test_support::responses;
 pub(super) use core_test_support::responses::ev_assistant_message;
 pub(super) use core_test_support::responses::ev_completed;
 pub(super) use core_test_support::responses::ev_completed_with_tokens;

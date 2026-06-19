@@ -77,6 +77,29 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
     provider.supports_remote_compaction()
 }
 
+pub(crate) fn should_use_remote_compact_task_v2(turn_context: &TurnContext) -> bool {
+    if !turn_context
+        .config
+        .features
+        .enabled(codex_features::Feature::RemoteCompactionV2)
+    {
+        return false;
+    }
+    if matches!(
+        CompactionHistoryPolicy::from_config(&turn_context.config),
+        CompactionHistoryPolicy::PreserveRecentExact { .. }
+    ) {
+        tracing::info!(
+            exact_tail_enabled = true,
+            implementation = "remote",
+            bypassed_implementation = "remote_v2",
+            "exact-tail compaction bypassed remote v2 ordering"
+        );
+        return false;
+    }
+    true
+}
+
 pub(crate) async fn run_inline_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
