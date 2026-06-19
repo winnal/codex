@@ -3830,14 +3830,69 @@ async fn auto_compaction_feature_disabled_skips_mid_turn_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auto_compact_clamps_config_limit_to_context_window() {
+async fn auto_compact_honors_config_limit_above_default_threshold() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 94),
+    ]);
+    let sse2 = sse(vec![
+        ev_assistant_message("m2", FINAL_REPLY),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 92),
+    ]);
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2]).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(200);
+        })
+        .build(&server)
+        .await
+        .expect("build codex");
+
+    test.submit_turn("ABOVE_DEFAULT_BELOW_CONFIG")
+        .await
+        .expect("submit first turn");
+    test.submit_turn("SHOULD_NOT_PRECOMPACT")
+        .await
+        .expect("submit second turn");
+
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "explicit limit above the 90% default should not compact until the effective context window is reached"
+    );
+    assert!(
+        request_log.requests()[1].input().iter().any(|item| {
+            item.get("type").and_then(|value| value.as_str()) == Some("message")
+                && item
+                    .get("content")
+                    .and_then(|content| content.as_array())
+                    .and_then(|entries| entries.first())
+                    .and_then(|entry| entry.get("text"))
+                    .and_then(|value| value.as_str())
+                    == Some("SHOULD_NOT_PRECOMPACT")
+        }),
+        "second request should be the normal user turn rather than a compact request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compact_clamps_config_limit_to_effective_context_window() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
 
     let context_window = 100;
     let config_limit = 200;
-    let over_limit_tokens = context_window * 90 / 100 + 1;
+    let over_limit_tokens = context_window * 95 / 100 + 1;
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),

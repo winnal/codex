@@ -388,8 +388,8 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_window: Option<i64>,
     /// Token threshold for automatic compaction. When omitted, core derives it
-    /// from `context_window` (90%). When provided, core clamps it to 90% of the
-    /// context window when available.
+    /// from `context_window` (90%). When provided, core clamps it to the
+    /// effective context window when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact_token_limit: Option<i64>,
     /// Opaque identifier for compaction-compatible model configurations.
@@ -434,16 +434,18 @@ impl ModelInfo {
     }
 
     pub fn auto_compact_token_limit(&self) -> Option<i64> {
-        let context_limit = self
-            .resolved_context_window()
-            .map(|context_window| (context_window * 9) / 10);
-        let config_limit = self.auto_compact_token_limit;
-        if let Some(context_limit) = context_limit {
-            return Some(
-                config_limit.map_or(context_limit, |limit| std::cmp::min(limit, context_limit)),
-            );
+        let resolved_context_window = self.resolved_context_window();
+        let default_limit = resolved_context_window.map(|context_window| (context_window * 9) / 10);
+        let effective_context_window = resolved_context_window.map(|context_window| {
+            context_window.saturating_mul(self.effective_context_window_percent) / 100
+        });
+        match (self.auto_compact_token_limit, effective_context_window) {
+            (Some(limit), Some(effective_context_window)) => {
+                Some(limit.min(effective_context_window))
+            }
+            (Some(limit), None) => Some(limit),
+            (None, _) => default_limit,
         }
-        config_limit
     }
 
     pub fn supports_personality(&self) -> bool {
@@ -1031,6 +1033,28 @@ mod tests {
 
         assert_eq!(model.resolved_context_window(), Some(400_000));
         assert_eq!(model.auto_compact_token_limit(), Some(360_000));
+    }
+
+    #[test]
+    fn auto_compact_token_limit_allows_explicit_limit_above_default() {
+        let model = ModelInfo {
+            context_window: Some(100),
+            auto_compact_token_limit: Some(94),
+            ..test_model(/*spec*/ None)
+        };
+
+        assert_eq!(model.auto_compact_token_limit(), Some(94));
+    }
+
+    #[test]
+    fn auto_compact_token_limit_clamps_explicit_limit_to_effective_context_window() {
+        let model = ModelInfo {
+            context_window: Some(100),
+            auto_compact_token_limit: Some(200),
+            ..test_model(/*spec*/ None)
+        };
+
+        assert_eq!(model.auto_compact_token_limit(), Some(95));
     }
 
     #[test]
