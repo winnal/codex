@@ -69,9 +69,10 @@ pub(crate) enum ExactTailFailReason {
     MinimumHotSuffixTooLarge,
     ReplacementTooLarge,
     ColdInputTooLarge,
-    UnsupportedRemoteV2Ordering,
     NoUsableColdSummary,
     ModelVisibleItemTooLarge,
+    BackendContextExceeded,
+    HotSuffixMismatch,
 }
 
 impl ExactTailFailReason {
@@ -82,16 +83,17 @@ impl ExactTailFailReason {
             Self::MinimumHotSuffixTooLarge => "ExactTailMinimumHotSuffixTooLarge",
             Self::ReplacementTooLarge => "ExactTailReplacementTooLarge",
             Self::ColdInputTooLarge => "ExactTailColdInputTooLarge",
-            Self::UnsupportedRemoteV2Ordering => "ExactTailUnsupportedForRemoteV2Ordering",
             Self::NoUsableColdSummary => "ExactTailNoUsableColdSummary",
             Self::ModelVisibleItemTooLarge => "ExactTailModelVisibleItemTooLarge",
+            Self::BackendContextExceeded => "ExactTailBackendContextExceeded",
+            Self::HotSuffixMismatch => "ExactTailHotSuffixMismatch",
         }
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct ExactTailError {
-    pub(super) reason: ExactTailFailReason,
+    pub(crate) reason: ExactTailFailReason,
     message: String,
 }
 
@@ -152,6 +154,10 @@ pub(crate) struct ExactTailDiagnostics {
     pub(crate) max_model_visible_item_tokens: i64,
     pub(crate) safety_margin: i64,
     pub(crate) available_for_hot: i64,
+    pub(crate) largest_hot_item_tokens: i64,
+    pub(crate) post_summary_cold_reserve_target_tokens: i64,
+    pub(crate) post_summary_cold_reserve_tokens: i64,
+    pub(crate) post_summary_cold_reserve_group_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +180,29 @@ pub(crate) struct ExactTailPlan {
 pub(crate) struct PreparedExactTailPlan {
     pub(crate) plan: ExactTailPlan,
     pub(crate) initial_context: Vec<ResponseItem>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExactTailReplacement {
+    pub(crate) replacement_history: Vec<ResponseItem>,
+    pub(crate) diagnostics: ExactTailReplacementDiagnostics,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExactTailReplacementDiagnostics {
+    pub(crate) actual_summary_tokens: i64,
+    pub(crate) replacement_tokens_estimate: i64,
+    pub(crate) final_replacement_tokens_estimate: i64,
+    pub(crate) hot_suffix_exact_match: bool,
+    pub(crate) planned_hot_suffix_item_count: usize,
+    pub(crate) installed_hot_suffix_item_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExactTailHotSuffixProof {
+    pub(crate) exact_match: bool,
+    pub(crate) planned_item_count: usize,
+    pub(crate) installed_item_count: usize,
 }
 
 pub(crate) struct ExactTailPlanInput<'a> {

@@ -4,10 +4,18 @@ use crate::compact::build_compacted_history;
 use crate::compact::is_summary_message;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::context_manager::is_user_turn_boundary;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
+use codex_analytics::CompactionTrigger;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::plaintext_agent_message_content;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExactTailCompactionDiagnosticEvent;
+use codex_protocol::protocol::ExactTailCompactionFitResult;
+use codex_protocol::protocol::ExactTailCompactionRoute;
+use codex_protocol::protocol::ExactTailCompactionTrigger;
 use codex_utils_output_truncation::approx_token_count;
 use tracing::warn;
 
@@ -212,7 +220,10 @@ pub(crate) fn exact_tail_cold_input_too_large_error(
 
 pub(crate) fn exact_tail_backend_context_exceeded_error() -> CodexErr {
     CodexErr::Stream(
-        "BackendContextExceededDespiteLocalFit: exact-tail compaction request exceeded the backend context window and cannot be pruned without losing cold coverage.".to_string(),
+        format!(
+            "{}: exact-tail compaction request exceeded the backend context window and cannot be pruned without losing cold coverage.",
+            ExactTailFailReason::BackendContextExceeded.as_str()
+        ),
         None,
     )
 }
@@ -232,8 +243,9 @@ pub(crate) fn append_hot_suffix_to_replacement(
             insert_exact_tail_initial_context(compacted_history, initial_context)
         }
         InitialContextInjection::BeforeLastUserMessage => {
+            compacted_history.extend(initial_context);
             compacted_history.extend(hot_suffix);
-            insert_exact_tail_initial_context(compacted_history, initial_context)
+            compacted_history
         }
     }
 }
@@ -291,15 +303,206 @@ pub(crate) fn build_exact_tail_replacement(
     compacted_history: Vec<ResponseItem>,
     initial_context_injection: InitialContextInjection,
     actual_summary_tokens: i64,
-) -> Result<Vec<ResponseItem>, ExactTailError> {
+) -> Result<ExactTailReplacement, ExactTailError> {
     let replacement_history = append_hot_suffix_to_replacement(
         compacted_history,
         prepared.initial_context.clone(),
         prepared.plan.hot_suffix.clone(),
         initial_context_injection,
     );
-    check_replacement_fits(&prepared.plan, &replacement_history, actual_summary_tokens)?;
-    Ok(replacement_history)
+    let final_replacement_tokens_estimate =
+        check_replacement_fits(&prepared.plan, &replacement_history, actual_summary_tokens)?;
+    let hot_suffix_proof = verify_exact_hot_suffix_preserved(prepared, &replacement_history)?;
+    Ok(ExactTailReplacement {
+        diagnostics: ExactTailReplacementDiagnostics {
+            actual_summary_tokens,
+            replacement_tokens_estimate: estimate_response_items_token_count(&replacement_history),
+            final_replacement_tokens_estimate,
+            hot_suffix_exact_match: hot_suffix_proof.exact_match,
+            planned_hot_suffix_item_count: hot_suffix_proof.planned_item_count,
+            installed_hot_suffix_item_count: hot_suffix_proof.installed_item_count,
+        },
+        replacement_history,
+    })
+}
+
+pub(crate) fn verify_exact_hot_suffix_preserved(
+    prepared: &PreparedExactTailPlan,
+    replacement_history: &[ResponseItem],
+) -> Result<ExactTailHotSuffixProof, ExactTailError> {
+    let planned_hot_suffix = prepared.plan.hot_suffix.as_slice();
+    if planned_hot_suffix.is_empty() {
+        return Ok(ExactTailHotSuffixProof {
+            exact_match: true,
+            planned_item_count: 0,
+            installed_item_count: 0,
+        });
+    }
+    if replacement_history.ends_with(planned_hot_suffix) {
+        return Ok(ExactTailHotSuffixProof {
+            exact_match: true,
+            planned_item_count: planned_hot_suffix.len(),
+            installed_item_count: planned_hot_suffix.len(),
+        });
+    }
+
+    Err(ExactTailError::new(
+        ExactTailFailReason::HotSuffixMismatch,
+        "Installed exact-tail replacement does not preserve the planned hot suffix exactly.",
+    ))
+}
+
+pub(crate) async fn emit_exact_tail_compaction_diagnostic(
+    sess: &Session,
+    turn_context: &TurnContext,
+    compaction_id: &str,
+    trigger: CompactionTrigger,
+    plan: &ExactTailPlan,
+    replacement: Option<&ExactTailReplacementDiagnostics>,
+    failure_reason: Option<ExactTailFailReason>,
+) {
+    let diagnostics = &plan.diagnostics;
+    let mut event = exact_tail_diagnostic_event(
+        sess,
+        turn_context,
+        compaction_id,
+        diagnostic_route(diagnostics.implementation),
+        trigger,
+        if failure_reason.is_some() {
+            ExactTailCompactionFitResult::Failure
+        } else {
+            ExactTailCompactionFitResult::Success
+        },
+        failure_reason,
+    );
+    event.requested_hot_tokens = Some(diagnostics.requested_hot_tokens);
+    event.actual_hot_tokens = Some(diagnostics.actual_hot_tokens);
+    event.hot_group_count = Some(diagnostics.hot_group_count);
+    event.cold_group_count = Some(diagnostics.cold_group_count);
+    event.raw_item_count = Some(diagnostics.raw_item_count);
+    event.group_count = Some(diagnostics.group_count);
+    event.cold_tokens = Some(diagnostics.cold_tokens);
+    event.summary_tokens = replacement.map(|replacement| replacement.actual_summary_tokens);
+    event.replacement_tokens_estimate =
+        replacement.map(|replacement| replacement.replacement_tokens_estimate);
+    event.final_replacement_tokens_estimate =
+        replacement.map(|replacement| replacement.final_replacement_tokens_estimate);
+    event.effective_replacement_budget = Some(diagnostics.effective_replacement_budget);
+    event.safety_margin = Some(diagnostics.safety_margin);
+    event.max_model_visible_item_tokens = Some(diagnostics.max_model_visible_item_tokens);
+    event.largest_hot_item_tokens = Some(diagnostics.largest_hot_item_tokens);
+    event.hot_suffix_exact_match =
+        replacement.map(|replacement| replacement.hot_suffix_exact_match);
+    event.planned_hot_suffix_item_count =
+        replacement.map(|replacement| replacement.planned_hot_suffix_item_count);
+    event.installed_hot_suffix_item_count =
+        replacement.map(|replacement| replacement.installed_hot_suffix_item_count);
+    event.filtered_stale_group_count = Some(plan.coverage.filtered_stale_groups.len());
+    event.filtered_context_item_count = Some(diagnostics.filtered_context_item_count);
+    event.required_current_context_budget = Some(diagnostics.required_current_context_budget);
+    event.final_replacement_extra_budget_tokens =
+        Some(diagnostics.final_replacement_extra_budget_tokens);
+    event.conservative_cold_summary_budget = Some(diagnostics.conservative_cold_summary_budget);
+    event.conservative_summary_budget_tokens = Some(diagnostics.conservative_summary_budget_tokens);
+    event.estimated_summary_scaffold_overhead_tokens =
+        Some(diagnostics.estimated_summary_scaffold_overhead_tokens);
+    event.retained_cold_user_message_budget_tokens =
+        Some(diagnostics.retained_cold_user_message_budget_tokens);
+    event.replacement_overhead_margin_tokens = Some(diagnostics.replacement_overhead_margin_tokens);
+    event.available_for_hot = Some(diagnostics.available_for_hot);
+    event.post_summary_cold_reserve_target_tokens =
+        Some(diagnostics.post_summary_cold_reserve_target_tokens);
+    event.post_summary_cold_reserve_tokens = Some(diagnostics.post_summary_cold_reserve_tokens);
+    event.post_summary_cold_reserve_group_count =
+        Some(diagnostics.post_summary_cold_reserve_group_count);
+    sess.send_event(turn_context, EventMsg::ExactTailCompactionDiagnostic(event))
+        .await;
+}
+
+pub(crate) async fn emit_exact_tail_prepare_failure_diagnostic(
+    sess: &Session,
+    turn_context: &TurnContext,
+    compaction_id: &str,
+    trigger: CompactionTrigger,
+    implementation: ExactTailImplementation,
+    failure_reason: ExactTailFailReason,
+) {
+    let event = exact_tail_diagnostic_event(
+        sess,
+        turn_context,
+        compaction_id,
+        diagnostic_route(implementation),
+        trigger,
+        ExactTailCompactionFitResult::Failure,
+        Some(failure_reason),
+    );
+    sess.send_event(turn_context, EventMsg::ExactTailCompactionDiagnostic(event))
+        .await;
+}
+
+fn exact_tail_diagnostic_event(
+    sess: &Session,
+    turn_context: &TurnContext,
+    compaction_id: &str,
+    route: ExactTailCompactionRoute,
+    trigger: CompactionTrigger,
+    fit_result: ExactTailCompactionFitResult,
+    failure_reason: Option<ExactTailFailReason>,
+) -> ExactTailCompactionDiagnosticEvent {
+    ExactTailCompactionDiagnosticEvent {
+        thread_id: sess.thread_id().to_string(),
+        turn_id: turn_context.sub_id.clone(),
+        compaction_id: compaction_id.to_string(),
+        route,
+        trigger: diagnostic_trigger(trigger),
+        fit_result,
+        failure_reason: failure_reason.map(|reason| reason.as_str().to_string()),
+        requested_hot_tokens: None,
+        actual_hot_tokens: None,
+        hot_group_count: None,
+        cold_group_count: None,
+        raw_item_count: None,
+        group_count: None,
+        cold_tokens: None,
+        summary_tokens: None,
+        replacement_tokens_estimate: None,
+        final_replacement_tokens_estimate: None,
+        effective_replacement_budget: None,
+        safety_margin: None,
+        max_model_visible_item_tokens: None,
+        largest_hot_item_tokens: None,
+        hot_suffix_exact_match: None,
+        planned_hot_suffix_item_count: None,
+        installed_hot_suffix_item_count: None,
+        filtered_stale_group_count: None,
+        filtered_context_item_count: None,
+        required_current_context_budget: None,
+        final_replacement_extra_budget_tokens: None,
+        conservative_cold_summary_budget: None,
+        conservative_summary_budget_tokens: None,
+        estimated_summary_scaffold_overhead_tokens: None,
+        retained_cold_user_message_budget_tokens: None,
+        replacement_overhead_margin_tokens: None,
+        available_for_hot: None,
+        post_summary_cold_reserve_target_tokens: None,
+        post_summary_cold_reserve_tokens: None,
+        post_summary_cold_reserve_group_count: None,
+    }
+}
+
+fn diagnostic_route(implementation: ExactTailImplementation) -> ExactTailCompactionRoute {
+    match implementation {
+        ExactTailImplementation::Local => ExactTailCompactionRoute::Local,
+        ExactTailImplementation::RemoteLegacy => ExactTailCompactionRoute::RemoteLegacy,
+        ExactTailImplementation::RemoteV2 => ExactTailCompactionRoute::RemoteV2,
+    }
+}
+
+fn diagnostic_trigger(trigger: CompactionTrigger) -> ExactTailCompactionTrigger {
+    match trigger {
+        CompactionTrigger::Manual => ExactTailCompactionTrigger::Manual,
+        CompactionTrigger::Auto => ExactTailCompactionTrigger::Auto,
+    }
 }
 
 pub(crate) fn check_replacement_fits(
@@ -390,19 +593,6 @@ pub(crate) fn check_cold_input_fits(
         ExactTailFailReason::ColdInputTooLarge,
         "Exact-tail compaction could not safely summarize the cold prefix without losing coverage. Try a smaller compact_preserve_recent_tokens, compact earlier, or disable exact-tail.",
     ))
-}
-
-pub(crate) fn unsupported_remote_v2_ordering_error() -> ExactTailError {
-    warn!(
-        exact_tail_enabled = true,
-        implementation = ExactTailImplementation::RemoteV2.as_str(),
-        exact_tail_fail_reason = ExactTailFailReason::UnsupportedRemoteV2Ordering.as_str(),
-        "remote compaction v2 exact-tail ordering is unsupported"
-    );
-    ExactTailError::new(
-        ExactTailFailReason::UnsupportedRemoteV2Ordering,
-        "ExactTailUnsupportedForRemoteV2Ordering: remote compaction v2 exact-tail ordering is not supported by this build.",
-    )
 }
 
 pub(super) fn ensure_model_visible_items_within_limit(

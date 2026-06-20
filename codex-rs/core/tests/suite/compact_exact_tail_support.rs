@@ -17,6 +17,7 @@ pub(super) use core_test_support::responses::ev_completed;
 pub(super) use core_test_support::responses::ev_completed_with_tokens;
 pub(super) use core_test_support::responses::ev_function_call;
 pub(super) use core_test_support::responses::mount_compact_json_once;
+pub(super) use core_test_support::responses::mount_compact_response_once;
 pub(super) use core_test_support::responses::mount_sse_sequence;
 pub(super) use core_test_support::responses::sse;
 pub(super) use core_test_support::responses::sse_failed;
@@ -26,10 +27,13 @@ pub(super) use core_test_support::test_codex::TestCodex;
 pub(super) use core_test_support::test_codex::test_codex;
 pub(super) use core_test_support::wait_for_event;
 pub(super) use core_test_support::wait_for_event_match;
+pub(super) use core_test_support::wait_for_event_with_timeout;
 pub(super) use serde_json::Value;
 pub(super) use serde_json::json;
 pub(super) use std::fs;
 pub(super) use std::path::Path;
+pub(super) use tokio::time::Duration;
+pub(super) use wiremock::ResponseTemplate;
 
 pub(super) const FIRST_REPLY: &str = "FIRST_REPLY";
 pub(super) const AUTO_SUMMARY_TEXT: &str = "AUTO_SUMMARY";
@@ -58,6 +62,16 @@ pub(super) fn ev_completed_with_usage(id: &str, input_tokens: i64, output_tokens
                 "output_tokens_details": null,
                 "total_tokens": input_tokens + output_tokens
             }
+        }
+    })
+}
+
+pub(super) fn ev_compaction_item(encrypted_content: &str) -> Value {
+    json!({
+        "type": "response.output_item.done",
+        "item": {
+            "type": "compaction",
+            "encrypted_content": encrypted_content,
         }
     })
 }
@@ -148,6 +162,22 @@ pub(super) fn replacement_history_from_rollout(path: &Path) -> Result<Vec<Value>
         }
     }
     replacement_history.ok_or_else(|| anyhow!("expected rollout replacement history"))
+}
+
+pub(super) fn exact_tail_diagnostics_from_rollout(path: &Path) -> Result<Vec<Value>> {
+    let rollout_text = fs::read_to_string(path)?;
+    let mut diagnostics = Vec::new();
+    for line in rollout_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let entry: RolloutLine = serde_json::from_str(line)?;
+        if let RolloutItem::EventMsg(EventMsg::ExactTailCompactionDiagnostic(event)) = entry.item {
+            diagnostics.push(serde_json::to_value(event)?);
+        }
+    }
+    Ok(diagnostics)
 }
 
 pub(super) fn local_compaction_provider(server: &wiremock::MockServer) -> ModelProviderInfo {

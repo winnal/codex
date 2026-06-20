@@ -129,6 +129,18 @@ fn plan(history: Vec<ResponseItem>, target_tokens: i64) -> ExactTailPlan {
         .expect("exact-tail plan should fit")
 }
 
+fn prepared_for_hot_suffix(
+    hot_suffix: Vec<ResponseItem>,
+    initial_context: Vec<ResponseItem>,
+) -> PreparedExactTailPlan {
+    let mut plan = plan(vec![user("old"), user("placeholder hot")], 1);
+    plan.hot_suffix = hot_suffix;
+    PreparedExactTailPlan {
+        plan,
+        initial_context,
+    }
+}
+
 #[test]
 fn planner_keeps_newest_group_hot_and_moves_older_groups_to_cold() {
     let old = user(&"old history ".repeat(100));
@@ -356,6 +368,31 @@ fn planner_treats_prior_compaction_summary_as_cold_prefix() {
 }
 
 #[test]
+fn planner_does_not_preserve_newest_compaction_summary_as_hot_suffix() {
+    let old = user("old history");
+    let summary = compaction_summary("prior exact-tail summary");
+
+    let actual = plan(vec![old.clone(), summary.clone()], 10_000);
+
+    assert_eq!(actual.cold_history, vec![old, summary]);
+    assert!(actual.hot_suffix.is_empty());
+    assert_eq!(actual.diagnostics.hot_group_count, 0);
+}
+
+#[test]
+fn planner_does_not_apply_hot_budget_guard_to_newest_compaction_summary() {
+    let old = user("old history");
+    let summary = compaction_summary(&"prior exact-tail summary ".repeat(20_000));
+
+    let actual = plan(vec![old.clone(), summary.clone()], 10_000);
+    let summary_tokens = estimate_response_items_token_count(std::slice::from_ref(&summary));
+
+    assert!(summary_tokens > actual.diagnostics.available_for_hot);
+    assert_eq!(actual.cold_history, vec![old, summary]);
+    assert!(actual.hot_suffix.is_empty());
+}
+
+#[test]
 fn planner_treats_prior_local_summary_message_as_cold_prefix() {
     let old = user("old history");
     let summary = user(&format!("{SUMMARY_PREFIX}\nprior local exact-tail summary"));
@@ -366,6 +403,18 @@ fn planner_treats_prior_local_summary_message_as_cold_prefix() {
     assert_eq!(actual.cold_history, vec![old, summary]);
     assert_eq!(actual.hot_suffix, vec![hot]);
     assert!(actual.diagnostics.actual_hot_tokens < actual.diagnostics.requested_hot_tokens);
+}
+
+#[test]
+fn planner_does_not_preserve_newest_local_summary_message_as_hot_suffix() {
+    let old = user("old history");
+    let summary = user(&format!("{SUMMARY_PREFIX}\nprior local exact-tail summary"));
+
+    let actual = plan(vec![old.clone(), summary.clone()], 10_000);
+
+    assert_eq!(actual.cold_history, vec![old, summary]);
+    assert!(actual.hot_suffix.is_empty());
+    assert_eq!(actual.diagnostics.hot_group_count, 0);
 }
 
 #[test]
@@ -765,6 +814,51 @@ fn cold_input_too_large_fails_closed_without_pruning() {
 }
 
 #[test]
+fn cold_tool_output_fails_before_standard_remote_v2_trim_could_rescue_it() {
+    let call_id = "cold-tool";
+    let oversized_output = function_output(call_id, &"cold tool output ".repeat(20_000));
+    let history = [
+        user("cold user"),
+        function_call(call_id),
+        oversized_output,
+        user("recent hot"),
+    ];
+    let actual = plan_exact_tail(ExactTailPlanInput {
+        history_items: &history,
+        target_tokens: 1,
+        effective_replacement_budget: Some(200_000),
+        required_current_context_budget: 0,
+        final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: 120_000,
+        estimated_summary_scaffold_overhead_tokens: 0,
+        retained_cold_user_message_budget_tokens: 0,
+        implementation: ExactTailImplementation::RemoteV2,
+    })
+    .expect("large cold tool output should be cold, not the minimum hot group");
+    assert_eq!(actual.hot_suffix, vec![user("recent hot")]);
+    assert!(
+        actual.diagnostics.cold_tokens > 30_000,
+        "test setup must exceed the cold input window before standard trimming"
+    );
+
+    let error = check_cold_input_fits(&actual, &actual.cold_history, Some(30_000))
+        .expect_err("untrimmed exact-tail cold tool output must fail before v2 compaction");
+
+    assert_eq!(error.reason, ExactTailFailReason::ColdInputTooLarge);
+
+    let trimmed_cold_history = vec![
+        user("cold user"),
+        function_call(call_id),
+        function_output(
+            call_id,
+            "Output exceeded the available model context and was truncated",
+        ),
+    ];
+    check_cold_input_fits(&actual, &trimmed_cold_history, Some(30_000))
+        .expect("standard remote-v2 trim sentinel would fit, proving the ordering matters");
+}
+
+#[test]
 fn cold_input_oversize_item_fails_closed_without_requesting_compaction() {
     let actual = plan(vec![user("old"), user("recent")], 1);
     let error = check_cold_input_fits(
@@ -892,7 +986,117 @@ fn retained_remote_user_text_is_not_a_usable_cold_summary() {
 }
 
 #[test]
-fn mid_turn_replacement_inserts_initial_context_before_last_protected_user_group() {
+fn hot_suffix_proof_accepts_strict_tail_match() {
+    let hot_user = user("protected hot user");
+    let hot_assistant = assistant("protected hot assistant");
+    let prepared = prepared_for_hot_suffix(vec![hot_user.clone(), hot_assistant.clone()], vec![]);
+    let replacement = vec![compaction_summary("summary"), hot_user, hot_assistant];
+
+    let proof = verify_exact_hot_suffix_preserved(&prepared, &replacement)
+        .expect("strict hot suffix tail should verify");
+
+    assert_eq!(
+        proof,
+        ExactTailHotSuffixProof {
+            exact_match: true,
+            planned_item_count: 2,
+            installed_item_count: 2,
+        }
+    );
+}
+
+#[test]
+fn hot_suffix_proof_rejects_mid_tail_initial_context_insertion() {
+    let hot_user_one = user("first protected hot user");
+    let hot_assistant_one = assistant("first protected hot assistant");
+    let hot_user_two = user("second protected hot user");
+    let hot_assistant_two = assistant("second protected hot assistant");
+    let initial_context = developer(vec![ContentItem::InputText {
+        text: "<token_budget>\n900 tokens remain\n</token_budget>".to_string(),
+    }]);
+    let prepared = prepared_for_hot_suffix(
+        vec![
+            hot_user_one.clone(),
+            hot_assistant_one.clone(),
+            hot_user_two.clone(),
+            hot_assistant_two.clone(),
+        ],
+        vec![initial_context.clone()],
+    );
+    let replacement = vec![
+        compaction_summary("summary"),
+        hot_user_one,
+        hot_assistant_one,
+        initial_context,
+        hot_user_two,
+        hot_assistant_two,
+    ];
+
+    let error = verify_exact_hot_suffix_preserved(&prepared, &replacement)
+        .expect_err("current context inside the planned hot suffix must not verify as exact");
+
+    assert_eq!(error.reason, ExactTailFailReason::HotSuffixMismatch);
+}
+
+#[test]
+fn hot_suffix_proof_rejects_mutated_hot_item() {
+    let prepared = prepared_for_hot_suffix(vec![user("hot"), assistant("final")], vec![]);
+    let replacement = vec![
+        compaction_summary("summary"),
+        user("hot mutated"),
+        assistant("final"),
+    ];
+
+    let error = verify_exact_hot_suffix_preserved(&prepared, &replacement)
+        .expect_err("mutated hot suffix should fail proof");
+
+    assert_eq!(error.reason, ExactTailFailReason::HotSuffixMismatch);
+}
+
+#[test]
+fn hot_suffix_proof_rejects_truncated_hot_suffix() {
+    let prepared = prepared_for_hot_suffix(vec![user("hot"), assistant("final")], vec![]);
+    let replacement = vec![compaction_summary("summary"), user("hot")];
+
+    let error = verify_exact_hot_suffix_preserved(&prepared, &replacement)
+        .expect_err("truncated hot suffix should fail proof");
+
+    assert_eq!(error.reason, ExactTailFailReason::HotSuffixMismatch);
+}
+
+#[test]
+fn hot_suffix_proof_rejects_reordered_hot_suffix() {
+    let prepared = prepared_for_hot_suffix(vec![user("hot"), assistant("final")], vec![]);
+    let replacement = vec![
+        compaction_summary("summary"),
+        assistant("final"),
+        user("hot"),
+    ];
+
+    let error = verify_exact_hot_suffix_preserved(&prepared, &replacement)
+        .expect_err("reordered hot suffix should fail proof");
+
+    assert_eq!(error.reason, ExactTailFailReason::HotSuffixMismatch);
+}
+
+#[test]
+fn hot_suffix_proof_rejects_wrong_source_suffix() {
+    let prepared =
+        prepared_for_hot_suffix(vec![user("source hot"), assistant("source final")], vec![]);
+    let replacement = vec![
+        compaction_summary("summary"),
+        user("other hot"),
+        assistant("other final"),
+    ];
+
+    let error = verify_exact_hot_suffix_preserved(&prepared, &replacement)
+        .expect_err("wrong-source hot suffix should fail proof");
+
+    assert_eq!(error.reason, ExactTailFailReason::HotSuffixMismatch);
+}
+
+#[test]
+fn mid_turn_replacement_inserts_initial_context_before_protected_hot_suffix() {
     let summary = user(&format!("{SUMMARY_PREFIX}\ncold summary"));
     let initial_context = developer(vec![ContentItem::InputText {
         text: "<token_budget>\n900 tokens remain\n</token_budget>".to_string(),
@@ -918,9 +1122,9 @@ fn mid_turn_replacement_inserts_initial_context_before_last_protected_user_group
         actual,
         vec![
             summary,
+            initial_context,
             first_hot_user,
             first_hot_assistant,
-            initial_context,
             second_hot_user,
             second_hot_assistant,
         ]

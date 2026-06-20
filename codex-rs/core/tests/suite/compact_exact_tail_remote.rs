@@ -289,13 +289,113 @@ async fn exact_tail_remote_legacy_user_only_output_fails_without_installing_hist
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exact_tail_remote_v2_enabled_manual_routes_to_legacy_remote() -> Result<()> {
+async fn exact_tail_remote_legacy_backend_context_window_error_emits_diagnostic() -> Result<()> {
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
-                ev_assistant_message("remote-v2-route-cold-assistant", "REMOTE_V2_ROUTE_COLD"),
+                ev_assistant_message("remote-legacy-backend-cold", "REMOTE_LEGACY_BACKEND_COLD"),
+                ev_completed("remote-legacy-backend-cold-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("remote-legacy-backend-hot", "REMOTE_LEGACY_BACKEND_HOT"),
+                ev_completed("remote-legacy-backend-hot-response"),
+            ]),
+        ],
+    )
+    .await;
+    let compact_mock = mount_compact_response_once(
+        &server,
+        ResponseTemplate::new(400)
+            .insert_header("content-type", "application/json")
+            .set_body_json(json!({
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
+                }
+            })),
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(1);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    test.submit_turn("REMOTE_LEGACY_BACKEND_COLD_USER").await?;
+    test.submit_turn("REMOTE_LEGACY_BACKEND_HOT_USER").await?;
+    test.codex.submit(Op::Compact).await?;
+    let error_message = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::Error(err) => Some(err.message.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        error_message.contains("ExactTailBackendContextExceeded"),
+        "expected exact-tail remote legacy backend context-window failure, got {error_message}"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        2,
+        "remote legacy backend failure should happen after the two setup turns"
+    );
+    assert_eq!(
+        compact_mock.requests().len(),
+        1,
+        "remote legacy backend failure should issue exactly one compact request"
+    );
+    assert!(
+        replacement_history_from_rollout(&rollout_path).is_err(),
+        "failed remote legacy backend context-window error must not install compacted history"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("remote_legacy")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("failure")
+    );
+    assert_eq!(
+        diagnostic.get("failure_reason").and_then(Value::as_str),
+        Some("ExactTailBackendContextExceeded")
+    );
+    assert_eq!(
+        diagnostic
+            .get("hot_suffix_exact_match")
+            .and_then(Value::as_bool),
+        None
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Result<()> {
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message(
+                    "remote-v2-route-cold-assistant",
+                    "REMOTE_V2_ROUTE_COLD_ASSISTANT",
+                ),
                 ev_completed("remote-v2-route-cold-response"),
             ]),
             sse(vec![
@@ -304,6 +404,10 @@ async fn exact_tail_remote_v2_enabled_manual_routes_to_legacy_remote() -> Result
                     "REMOTE_V2_ROUTE_ASSISTANT_EXACT",
                 ),
                 ev_completed("remote-v2-route-hot-response"),
+            ]),
+            sse(vec![
+                ev_compaction_item("REMOTE_V2_ROUTE_EXACT_TAIL_SUMMARY"),
+                ev_completed("remote-v2-route-compact-response"),
             ]),
             sse(vec![
                 ev_assistant_message(
@@ -315,13 +419,6 @@ async fn exact_tail_remote_v2_enabled_manual_routes_to_legacy_remote() -> Result
         ],
     )
     .await;
-    let compacted_history = vec![codex_protocol::models::ResponseItem::Compaction {
-        id: None,
-        encrypted_content: "REMOTE_V2_ROUTE_EXACT_TAIL_SUMMARY".to_string(),
-        metadata: None,
-    }];
-    let compact_mock =
-        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
     let mut builder = test_codex()
         .with_auth(CodexAuth::from_api_key("dummy"))
         .with_config(|config| {
@@ -331,45 +428,125 @@ async fn exact_tail_remote_v2_enabled_manual_routes_to_legacy_remote() -> Result
             let _ = config.features.enable(Feature::RemoteCompactionV2);
         });
     let test = builder.build(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
 
     test.submit_turn("REMOTE_V2_ROUTE_COLD_USER").await?;
     test.submit_turn("REMOTE_V2_ROUTE_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(90),
+    )
     .await;
     test.submit_turn("REMOTE_V2_ROUTE_FOLLOW_UP_USER").await?;
 
+    let requests = response_mock.requests();
     assert_eq!(
-        compact_mock.requests().len(),
-        1,
-        "exact-tail should route remote-v2-enabled manual compaction through legacy remote"
+        requests.len(),
+        4,
+        "expected cold turn, hot turn, v2 compaction turn, and follow-up"
     );
-    let compact_body = compact_mock.single_request().body_json().to_string();
+    let compact_request = &requests[2];
+    assert_eq!(compact_request.path(), "/v1/responses");
+    let compact_body = compact_request.body_json();
+    let compact_body_text = compact_body.to_string();
+    assert_eq!(
+        compact_body.get("previous_response_id"),
+        None,
+        "exact-tail v2 compaction must not continue a previous Responses chain"
+    );
     assert!(
-        body_contains_text(&compact_body, "REMOTE_V2_ROUTE_COLD_USER"),
-        "cold user should be sent to legacy remote compact; compact body: {compact_body}"
+        compact_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("exact-tail-v2-compaction:")),
+        "exact-tail v2 compaction must use an isolated prompt cache key; body: {compact_body}"
+    );
+    assert!(
+        body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_COLD_USER"),
+        "cold user should be sent to v2 compact; compact body: {compact_body}"
+    );
+    assert!(
+        body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_COLD_ASSISTANT"),
+        "cold assistant should be sent to v2 compact; compact body: {compact_body}"
+    );
+    assert!(
+        body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_HOT_USER"),
+        "older same-turn user should remain cold when the target only selects the newest atomic group; compact body: {compact_body}"
+    );
+    assert!(
+        !body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_ASSISTANT_EXACT"),
+        "hot assistant must stay out of the v2 compact request; compact body: {compact_body}"
     );
     assert_eq!(
-        response_mock.requests().len(),
-        3,
-        "expected cold turn, hot turn, and follow-up"
+        compact_request
+            .input()
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+            .count(),
+        1,
+        "v2 compact input should append exactly one compaction_trigger"
+    );
+    assert_eq!(
+        compact_request
+            .input()
+            .last()
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str),
+        Some("compaction_trigger"),
+        "v2 compact input should end with compaction_trigger"
     );
     assert_ordered_input_texts(
-        &response_mock.requests()[2].input(),
+        &requests[3].input(),
         &[
+            "REMOTE_V2_ROUTE_COLD_USER",
+            "REMOTE_V2_ROUTE_HOT_USER",
             "REMOTE_V2_ROUTE_EXACT_TAIL_SUMMARY",
             "REMOTE_V2_ROUTE_ASSISTANT_EXACT",
             "REMOTE_V2_ROUTE_FOLLOW_UP_USER",
         ],
     );
     assert!(
-        !input_contains_text(
-            &response_mock.requests()[2].input(),
-            "REMOTE_V2_ROUTE_HOT_USER"
-        ),
-        "follow-up should not replay older same-turn user text outside the remote-v2-routed summary"
+        !input_contains_text(&requests[3].input(), "REMOTE_V2_ROUTE_COLD_ASSISTANT"),
+        "follow-up should not replay cold assistant text outside the v2 summary"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("remote_v2")
+    );
+    assert_eq!(
+        diagnostic.get("trigger").and_then(Value::as_str),
+        Some("manual")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("success")
+    );
+    assert_eq!(
+        diagnostic
+            .get("hot_suffix_exact_match")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        diagnostic
+            .get("planned_hot_suffix_item_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        diagnostic
+            .get("installed_hot_suffix_item_count")
+            .and_then(Value::as_u64),
+        Some(1)
     );
 
     shutdown_codex(&test).await?;
@@ -377,7 +554,309 @@ async fn exact_tail_remote_v2_enabled_manual_routes_to_legacy_remote() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exact_tail_remote_v2_enabled_auto_routes_to_legacy_remote() -> Result<()> {
+async fn exact_tail_remote_v2_backend_context_window_error_emits_diagnostic() -> Result<()> {
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("remote-v2-backend-cold", "REMOTE_V2_BACKEND_COLD"),
+                ev_completed("remote-v2-backend-cold-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("remote-v2-backend-hot", "REMOTE_V2_BACKEND_HOT"),
+                ev_completed("remote-v2-backend-hot-response"),
+            ]),
+            sse_failed(
+                "remote-v2-backend-compact-failed",
+                "context_length_exceeded",
+                "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            ),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(1);
+            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    test.submit_turn("REMOTE_V2_BACKEND_COLD_USER").await?;
+    test.submit_turn("REMOTE_V2_BACKEND_HOT_USER").await?;
+    test.codex.submit(Op::Compact).await?;
+    let error_message = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::Error(err) => Some(err.message.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        error_message.contains("ExactTailBackendContextExceeded"),
+        "expected exact-tail remote v2 backend context-window failure, got {error_message}"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        3,
+        "remote v2 backend failure should issue one v2 compaction request"
+    );
+    assert!(
+        replacement_history_from_rollout(&rollout_path).is_err(),
+        "failed remote v2 backend context-window error must not install compacted history"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("remote_v2")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("failure")
+    );
+    assert_eq!(
+        diagnostic.get("failure_reason").and_then(Value::as_str),
+        Some("ExactTailBackendContextExceeded")
+    );
+    assert_eq!(
+        diagnostic
+            .get("hot_suffix_exact_match")
+            .and_then(Value::as_bool),
+        None
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_v2_empty_compaction_fails_without_installing_history() -> Result<()> {
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message(
+                    "remote-v2-empty-cold-assistant",
+                    "REMOTE_V2_EMPTY_COLD_ASSISTANT",
+                ),
+                ev_completed("remote-v2-empty-cold-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "remote-v2-empty-hot-assistant",
+                    "REMOTE_V2_EMPTY_HOT_ASSISTANT",
+                ),
+                ev_completed("remote-v2-empty-hot-response"),
+            ]),
+            sse(vec![
+                ev_compaction_item(""),
+                ev_completed("remote-v2-empty-compact-response"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(1);
+            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    test.submit_turn("REMOTE_V2_EMPTY_COLD_USER").await?;
+    test.submit_turn("REMOTE_V2_EMPTY_HOT_USER").await?;
+    test.codex.submit(Op::Compact).await?;
+    let error_message = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::Error(err) => Some(err.message.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        error_message.contains("ExactTailNoUsableColdSummary"),
+        "expected exact-tail empty v2 compaction error, got {error_message}"
+    );
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "empty v2 compaction should fail before any follow-up request"
+    );
+    let compact_body = requests[2].body_json().to_string();
+    assert!(
+        body_contains_text(&compact_body, "REMOTE_V2_EMPTY_COLD_USER"),
+        "cold user should be sent to v2 compact before failure; compact body: {compact_body}"
+    );
+    assert!(
+        body_contains_text(&compact_body, "REMOTE_V2_EMPTY_HOT_USER"),
+        "older same-turn user should remain cold when the target only selects the newest atomic group; compact body: {compact_body}"
+    );
+    assert!(
+        !body_contains_text(&compact_body, "REMOTE_V2_EMPTY_HOT_ASSISTANT"),
+        "hot assistant must stay out of failed v2 compact request; compact body: {compact_body}"
+    );
+    assert!(
+        replacement_history_from_rollout(&rollout_path).is_err(),
+        "failed remote v2 exact-tail output must not install compacted history"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("remote_v2")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("failure")
+    );
+    assert_eq!(
+        diagnostic.get("failure_reason").and_then(Value::as_str),
+        Some("ExactTailNoUsableColdSummary")
+    );
+    assert_eq!(
+        diagnostic
+            .get("hot_suffix_exact_match")
+            .and_then(Value::as_bool),
+        None
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_v2_empty_compaction_fails_even_with_retained_old_summary() -> Result<()>
+{
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message(
+                    "remote-v2-old-summary-assistant",
+                    "REMOTE_V2_OLD_SUMMARY_ASSISTANT",
+                ),
+                ev_completed("remote-v2-old-summary-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "remote-v2-new-cold-assistant",
+                    "REMOTE_V2_NEW_COLD_ASSISTANT",
+                ),
+                ev_completed("remote-v2-new-cold-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("remote-v2-retained-hot", "REMOTE_V2_RETAINED_HOT"),
+                ev_completed("remote-v2-retained-hot-response"),
+            ]),
+            sse(vec![
+                ev_compaction_item(""),
+                ev_completed("remote-v2-old-summary-empty-compact-response"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(1);
+            let _ = config.features.enable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    let old_summary_user = summary_with_prefix("REMOTE_V2_OLD_RETAINED_SUMMARY");
+
+    test.submit_turn(&old_summary_user).await?;
+    test.submit_turn("REMOTE_V2_NEWLY_COLD_POST_SUMMARY_USER")
+        .await?;
+    test.submit_turn("REMOTE_V2_EMPTY_WITH_OLD_SUMMARY_HOT_USER")
+        .await?;
+    test.codex.submit(Op::Compact).await?;
+    let error_message = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::Error(err) => Some(err.message.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert!(
+        error_message.contains("ExactTailNoUsableColdSummary"),
+        "expected empty new v2 compaction output to fail even with retained old summary, got {error_message}"
+    );
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "empty v2 compaction should fail before any follow-up request"
+    );
+    let compact_body = requests[3].body_json().to_string();
+    assert!(
+        body_contains_text(&compact_body, "REMOTE_V2_OLD_RETAINED_SUMMARY"),
+        "retained old summary-shaped user should be present in compact request; compact body: {compact_body}"
+    );
+    assert!(
+        body_contains_text(&compact_body, "REMOTE_V2_NEWLY_COLD_POST_SUMMARY_USER"),
+        "new post-summary cold user should be present in compact request; compact body: {compact_body}"
+    );
+    assert!(
+        !body_contains_text(&compact_body, "REMOTE_V2_RETAINED_HOT"),
+        "hot assistant must stay out of failed v2 compact request; compact body: {compact_body}"
+    );
+    assert!(
+        replacement_history_from_rollout(&rollout_path).is_err(),
+        "failed remote v2 exact-tail output must not install compacted history"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("remote_v2")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("failure")
+    );
+    assert_eq!(
+        diagnostic.get("failure_reason").and_then(Value::as_str),
+        Some("ExactTailNoUsableColdSummary")
+    );
+    assert_eq!(
+        diagnostic
+            .get("hot_suffix_exact_match")
+            .and_then(Value::as_bool),
+        None
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_v2_enabled_auto_uses_cold_only_v2_request() -> Result<()> {
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
         &server,
@@ -385,7 +864,7 @@ async fn exact_tail_remote_v2_enabled_auto_routes_to_legacy_remote() -> Result<(
             sse(vec![
                 ev_assistant_message(
                     "remote-v2-route-auto-cold-assistant",
-                    "REMOTE_V2_ROUTE_AUTO_COLD",
+                    "REMOTE_V2_ROUTE_AUTO_COLD_ASSISTANT",
                 ),
                 ev_completed_with_tokens(
                     "remote-v2-route-auto-cold-response",
@@ -403,6 +882,10 @@ async fn exact_tail_remote_v2_enabled_auto_routes_to_legacy_remote() -> Result<(
                 ),
             ]),
             sse(vec![
+                ev_compaction_item("REMOTE_V2_ROUTE_AUTO_EXACT_TAIL_SUMMARY"),
+                ev_completed("remote-v2-route-auto-compact-response"),
+            ]),
+            sse(vec![
                 ev_assistant_message(
                     "remote-v2-route-auto-follow-up-assistant",
                     "REMOTE_V2_ROUTE_AUTO_FOLLOW_UP_DONE",
@@ -412,13 +895,6 @@ async fn exact_tail_remote_v2_enabled_auto_routes_to_legacy_remote() -> Result<(
         ],
     )
     .await;
-    let compacted_history = vec![codex_protocol::models::ResponseItem::Compaction {
-        id: None,
-        encrypted_content: "REMOTE_V2_ROUTE_AUTO_EXACT_TAIL_SUMMARY".to_string(),
-        metadata: None,
-    }];
-    let compact_mock =
-        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
     let mut builder = test_codex()
         .with_auth(CodexAuth::from_api_key("dummy"))
         .with_config(|config| {
@@ -437,35 +913,75 @@ async fn exact_tail_remote_v2_enabled_auto_routes_to_legacy_remote() -> Result<(
     test.submit_turn("REMOTE_V2_ROUTE_AUTO_FOLLOW_UP_USER")
         .await?;
 
+    let requests = response_mock.requests();
     assert_eq!(
-        compact_mock.requests().len(),
-        1,
-        "exact-tail should route remote-v2-enabled auto compaction through legacy remote"
+        requests.len(),
+        4,
+        "expected cold turn, hot turn, v2 compaction turn, and post-compaction follow-up"
     );
-    let compact_body = compact_mock.single_request().body_json().to_string();
+    let compact_request = &requests[2];
+    assert_eq!(compact_request.path(), "/v1/responses");
+    let compact_body = compact_request.body_json();
+    let compact_body_text = compact_body.to_string();
+    assert_eq!(
+        compact_body.get("previous_response_id"),
+        None,
+        "exact-tail v2 auto compaction must not continue a previous Responses chain"
+    );
     assert!(
-        body_contains_text(&compact_body, "REMOTE_V2_ROUTE_AUTO_COLD_USER"),
-        "cold user should be sent to legacy remote auto compact; compact body: {compact_body}"
+        compact_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("exact-tail-v2-compaction:")),
+        "exact-tail v2 auto compaction must use an isolated prompt cache key; body: {compact_body}"
+    );
+    assert!(
+        body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_AUTO_COLD_USER"),
+        "cold user should be sent to v2 auto compact; compact body: {compact_body}"
+    );
+    assert!(
+        body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_AUTO_COLD_ASSISTANT"),
+        "cold assistant should be sent to v2 auto compact; compact body: {compact_body}"
+    );
+    assert!(
+        body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_AUTO_HOT_USER"),
+        "older same-turn user should remain cold when the target only selects the newest atomic group; compact body: {compact_body}"
+    );
+    assert!(
+        !body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_AUTO_ASSISTANT_EXACT"),
+        "hot assistant must stay out of the v2 auto compact request; compact body: {compact_body}"
     );
     assert_eq!(
-        response_mock.requests().len(),
-        3,
-        "expected cold turn, hot turn, and post-compaction follow-up"
+        compact_request
+            .input()
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+            .count(),
+        1,
+        "v2 auto compact input should append exactly one compaction_trigger"
+    );
+    assert_eq!(
+        compact_request
+            .input()
+            .last()
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str),
+        Some("compaction_trigger"),
+        "v2 auto compact input should end with compaction_trigger"
     );
     assert_ordered_input_texts(
-        &response_mock.requests()[2].input(),
+        &requests[3].input(),
         &[
+            "REMOTE_V2_ROUTE_AUTO_COLD_USER",
+            "REMOTE_V2_ROUTE_AUTO_HOT_USER",
             "REMOTE_V2_ROUTE_AUTO_EXACT_TAIL_SUMMARY",
             "REMOTE_V2_ROUTE_AUTO_ASSISTANT_EXACT",
             "REMOTE_V2_ROUTE_AUTO_FOLLOW_UP_USER",
         ],
     );
     assert!(
-        !input_contains_text(
-            &response_mock.requests()[2].input(),
-            "REMOTE_V2_ROUTE_AUTO_HOT_USER"
-        ),
-        "follow-up should not replay older same-turn user text outside the remote-v2-routed auto summary"
+        !input_contains_text(&requests[3].input(), "REMOTE_V2_ROUTE_AUTO_COLD_ASSISTANT"),
+        "follow-up should not replay cold assistant text outside the v2 auto summary"
     );
 
     shutdown_codex(&test).await?;

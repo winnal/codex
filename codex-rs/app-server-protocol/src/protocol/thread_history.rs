@@ -370,6 +370,7 @@ impl ThreadHistoryBuilder {
             EventMsg::HookStarted(_) | EventMsg::HookCompleted(_) => {}
             EventMsg::Error(payload) => self.handle_error(payload),
             EventMsg::TokenCount(_) => {}
+            EventMsg::ExactTailCompactionDiagnostic(_) => {}
             EventMsg::ThreadRolledBack(payload) => self.handle_thread_rollback(payload),
             EventMsg::TurnAborted(payload) => self.handle_turn_aborted(payload),
             EventMsg::TurnStarted(payload) => self.handle_turn_started(payload),

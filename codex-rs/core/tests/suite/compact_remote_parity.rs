@@ -18,9 +18,11 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodexHarness;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_with_timeout;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use tokio::time::Duration;
 
 const FIXED_CWD: &str = "/tmp/codex_remote_compaction_parity_workspace";
 const IMAGE_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
@@ -617,7 +619,12 @@ async fn submit_user_input(codex: &codex_core::CodexThread, items: Vec<UserInput
 }
 
 async fn wait_for_turn_complete(codex: &codex_core::CodexThread) {
-    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event_with_timeout(
+        codex,
+        |ev| matches!(ev, EventMsg::TurnComplete(_)),
+        Duration::from_secs(90),
+    )
+    .await;
 }
 
 fn user_input_for_step(scenario_name: &str, idx: usize, step: Step) -> Vec<UserInput> {

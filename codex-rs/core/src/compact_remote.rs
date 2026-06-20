@@ -13,7 +13,10 @@ use crate::compact_exact_tail::ExactTailImplementation;
 use crate::compact_exact_tail::ExactTailPrepareInput;
 use crate::compact_exact_tail::build_exact_tail_replacement;
 use crate::compact_exact_tail::check_cold_input_fits;
+use crate::compact_exact_tail::emit_exact_tail_compaction_diagnostic;
+use crate::compact_exact_tail::emit_exact_tail_prepare_failure_diagnostic;
 use crate::compact_exact_tail::ensure_replacement_has_cold_summary;
+use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::compact_exact_tail::remote_legacy_summary_scaffold_overhead_tokens;
@@ -187,6 +190,7 @@ async fn run_remote_compact_task_inner_impl(
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
     let context_compaction_item = ContextCompactionItem::new();
+    let compaction_id = context_compaction_item.id.clone();
     // Use the UI compaction item ID as the trace compaction ID so protocol lifecycle events,
     // endpoint attempts, and the installed history checkpoint all have one join key.
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
@@ -202,7 +206,8 @@ async fn run_remote_compact_task_inner_impl(
     let source_history_items = source_history.raw_items().to_vec();
     let base_instructions = sess.get_base_instructions().await;
     let policy = CompactionHistoryPolicy::from_config(&turn_context.config);
-    let exact_tail_plan = prepare_exact_tail_plan(ExactTailPrepareInput {
+    let exact_tail_implementation = ExactTailImplementation::RemoteLegacy;
+    let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
         sess: sess.as_ref(),
         turn_context: turn_context.as_ref(),
         history_items: &source_history_items,
@@ -213,25 +218,62 @@ async fn run_remote_compact_task_inner_impl(
         estimated_summary_scaffold_overhead_tokens: remote_legacy_summary_scaffold_overhead_tokens(
         ),
         retained_cold_user_message_budget_tokens: 0,
-        implementation: ExactTailImplementation::RemoteLegacy,
+        implementation: exact_tail_implementation,
     })
     .await
-    .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)?;
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            let failure_reason = error.reason;
+            emit_exact_tail_prepare_failure_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                exact_tail_implementation,
+                failure_reason,
+            )
+            .await;
+            return Err(error.into_codex_err());
+        }
+    };
 
     let mut history = source_history;
     if let Some(prepared) = &exact_tail_plan {
         history.replace(prepared.plan.cold_history.clone());
-        check_cold_input_fits(
+        if let Err(error) = check_cold_input_fits(
             &prepared.plan,
             history.raw_items(),
             turn_context.model_context_window(),
-        )
-        .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)?;
+        ) {
+            let failure_reason = error.reason;
+            emit_exact_tail_compaction_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                &prepared.plan,
+                None,
+                Some(failure_reason),
+            )
+            .await;
+            return Err(error.into_codex_err());
+        }
         if let Some(context_window) = turn_context.model_context_window()
             && let Some(request_tokens) =
                 history.estimate_token_count_with_base_instructions(&base_instructions)
             && request_tokens > context_window
         {
+            emit_exact_tail_compaction_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                &prepared.plan,
+                None,
+                Some(super::compact_exact_tail::ExactTailFailReason::ColdInputTooLarge),
+            )
+            .await;
             return Err(exact_tail_cold_input_too_large_error(
                 request_tokens,
                 context_window,
@@ -288,7 +330,7 @@ async fn run_remote_compact_task_inner_impl(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    let mut new_history = sess
+    let mut new_history = match sess
         .services
         .model_client
         .compact_conversation_history(
@@ -308,19 +350,78 @@ async fn run_remote_compact_task_inner_impl(
             &compaction_trace,
             &responses_metadata,
         )
-        .await?;
+        .await
+    {
+        Ok(new_history) => new_history,
+        Err(error) => {
+            if let Some(prepared) = &exact_tail_plan
+                && matches!(error, CodexErr::ContextWindowExceeded)
+            {
+                emit_exact_tail_compaction_diagnostic(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &compaction_id,
+                    trigger,
+                    &prepared.plan,
+                    None,
+                    Some(super::compact_exact_tail::ExactTailFailReason::BackendContextExceeded),
+                )
+                .await;
+                return Err(exact_tail_backend_context_exceeded_error());
+            }
+            return Err(error);
+        }
+    };
     new_history = if let Some(prepared) = &exact_tail_plan {
         new_history.retain(should_keep_compacted_history_item);
-        ensure_replacement_has_cold_summary(&prepared.plan, &new_history)
-            .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)?;
+        if let Err(error) = ensure_replacement_has_cold_summary(&prepared.plan, &new_history) {
+            let failure_reason = error.reason;
+            emit_exact_tail_compaction_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                &prepared.plan,
+                None,
+                Some(failure_reason),
+            )
+            .await;
+            return Err(error.into_codex_err());
+        }
         let actual_summary_tokens = estimate_response_items_token_count(&new_history);
-        build_exact_tail_replacement(
+        let replacement = match build_exact_tail_replacement(
             prepared,
             new_history,
             initial_context_injection,
             actual_summary_tokens,
+        ) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                let failure_reason = error.reason;
+                emit_exact_tail_compaction_diagnostic(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &compaction_id,
+                    trigger,
+                    &prepared.plan,
+                    None,
+                    Some(failure_reason),
+                )
+                .await;
+                return Err(error.into_codex_err());
+            }
+        };
+        emit_exact_tail_compaction_diagnostic(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &compaction_id,
+            trigger,
+            &prepared.plan,
+            Some(&replacement.diagnostics),
+            None,
         )
-        .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)?
+        .await;
+        replacement.replacement_history
     } else {
         process_compacted_history(
             sess.as_ref(),

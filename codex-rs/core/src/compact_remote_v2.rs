@@ -9,10 +9,21 @@ use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
 use crate::compact_exact_tail::CompactionHistoryPolicy;
-use crate::compact_exact_tail::unsupported_remote_v2_ordering_error;
+use crate::compact_exact_tail::ExactTailImplementation;
+use crate::compact_exact_tail::ExactTailPrepareInput;
+use crate::compact_exact_tail::build_exact_tail_replacement;
+use crate::compact_exact_tail::check_cold_input_fits;
+use crate::compact_exact_tail::emit_exact_tail_compaction_diagnostic;
+use crate::compact_exact_tail::emit_exact_tail_prepare_failure_diagnostic;
+use crate::compact_exact_tail::ensure_replacement_has_cold_summary;
+use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
+use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
+use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::compact_remote::process_compacted_history;
-use crate::compact_remote::should_keep_compacted_history_item;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
+use crate::compact_remote_v2_retention::REMOTE_COMPACTION_V2_RETAINED_MESSAGE_TOKEN_BUDGET;
+use crate::compact_remote_v2_retention::build_v2_compacted_history;
+use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -33,24 +44,17 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
-use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TokenUsage;
-use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
 use codex_rollout_trace::InferenceTraceContext;
-use codex_utils_output_truncation::approx_token_count;
-use codex_utils_output_truncation::truncate_text;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-// Mirror the current /responses/compact retained-message default while the
-// server-side path remains the reference implementation.
-const RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 // Compact attempts can run much longer than normal turns, so keep the per-transport
 // retry budget smaller than the general Responses stream retry budget.
 const MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES: u64 = 2;
@@ -149,6 +153,7 @@ async fn run_remote_compact_task_inner(
         turn_context,
         client_session,
         initial_context_injection,
+        trigger,
         compaction_metadata,
         &mut analytics_details,
     )
@@ -186,17 +191,12 @@ async fn run_remote_compact_task_inner_impl(
     turn_context: &Arc<TurnContext>,
     client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
+    trigger: CompactionTrigger,
     compaction_metadata: CompactionTurnMetadata,
     analytics_details: &mut CompactionAnalyticsDetails,
 ) -> CodexResult<()> {
-    if matches!(
-        CompactionHistoryPolicy::from_config(&turn_context.config),
-        CompactionHistoryPolicy::PreserveRecentExact { .. }
-    ) {
-        return Err(unsupported_remote_v2_ordering_error().into_codex_err());
-    }
-
     let context_compaction_item = ContextCompactionItem::new();
+    let compaction_id = context_compaction_item.id.clone();
     let compaction_trace = sess.services.rollout_thread_trace.compaction_trace_context(
         turn_context.sub_id.as_str(),
         context_compaction_item.id.as_str(),
@@ -207,31 +207,111 @@ async fn run_remote_compact_task_inner_impl(
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
 
-    let mut history = sess.clone_history().await;
+    let source_history = sess.clone_history().await;
+    let source_history_items = source_history.raw_items().to_vec();
     let base_instructions = sess.get_base_instructions().await;
-    let (rewritten_outputs, estimated_deleted_tokens) =
-        trim_function_call_history_to_fit_context_window(
-            &mut history,
-            turn_context.as_ref(),
-            &base_instructions,
-        );
-    if rewritten_outputs > 0 {
-        info!(
-            turn_id = %turn_context.sub_id,
-            rewritten_outputs,
-            "rewrote history outputs before remote compaction v2"
-        );
-    }
-    if estimated_deleted_tokens > 0 {
-        let max_local_deleted_tokens = sess
-            .estimated_tokens_after_last_model_generated_item()
+    let policy = CompactionHistoryPolicy::from_config(&turn_context.config);
+    let exact_tail_implementation = ExactTailImplementation::RemoteV2;
+    let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
+        sess: sess.as_ref(),
+        turn_context: turn_context.as_ref(),
+        history_items: &source_history_items,
+        base_instructions: &base_instructions,
+        policy,
+        trigger,
+        initial_context_injection,
+        estimated_summary_scaffold_overhead_tokens: 0,
+        retained_cold_user_message_budget_tokens: REMOTE_COMPACTION_V2_RETAINED_MESSAGE_TOKEN_BUDGET
+            as i64,
+        implementation: exact_tail_implementation,
+    })
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            let failure_reason = error.reason;
+            emit_exact_tail_prepare_failure_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                exact_tail_implementation,
+                failure_reason,
+            )
             .await;
-        analytics_details.active_context_tokens_before = analytics_details
-            .active_context_tokens_before
-            .map(|active_context_tokens_before| {
-                active_context_tokens_before
-                    .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
-            });
+            return Err(error.into_codex_err());
+        }
+    };
+
+    let mut history = source_history;
+    if let Some(prepared) = &exact_tail_plan {
+        history.replace(prepared.plan.cold_history.clone());
+    }
+
+    if let Some(prepared) = &exact_tail_plan {
+        if let Err(error) = check_cold_input_fits(
+            &prepared.plan,
+            history.raw_items(),
+            turn_context.model_context_window(),
+        ) {
+            let failure_reason = error.reason;
+            emit_exact_tail_compaction_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                &prepared.plan,
+                None,
+                Some(failure_reason),
+            )
+            .await;
+            return Err(error.into_codex_err());
+        }
+        if let Some(context_window) = turn_context.model_context_window()
+            && let Some(request_tokens) =
+                history.estimate_token_count_with_base_instructions(&base_instructions)
+            && request_tokens > context_window
+        {
+            emit_exact_tail_compaction_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                &prepared.plan,
+                None,
+                Some(crate::compact_exact_tail::ExactTailFailReason::ColdInputTooLarge),
+            )
+            .await;
+            return Err(exact_tail_cold_input_too_large_error(
+                request_tokens,
+                context_window,
+            ));
+        }
+    } else {
+        let (rewritten_outputs, estimated_deleted_tokens) =
+            trim_function_call_history_to_fit_context_window(
+                &mut history,
+                turn_context.as_ref(),
+                &base_instructions,
+            );
+        if rewritten_outputs > 0 {
+            info!(
+                turn_id = %turn_context.sub_id,
+                rewritten_outputs,
+                "rewrote history outputs before remote compaction v2"
+            );
+        }
+        if estimated_deleted_tokens > 0 {
+            let max_local_deleted_tokens = sess
+                .estimated_tokens_after_last_model_generated_item()
+                .await;
+            analytics_details.active_context_tokens_before = analytics_details
+                .active_context_tokens_before
+                .map(|active_context_tokens_before| {
+                    active_context_tokens_before
+                        .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
+                });
+        }
     }
 
     let trace_input_history = history.raw_items().to_vec();
@@ -266,22 +346,44 @@ async fn run_remote_compact_task_inner_impl(
         "parallel_tool_calls": prompt.parallel_tool_calls,
     }));
 
+    let mut client_session = client_session;
     let mut owned_client_session;
-    let client_session = match client_session {
-        Some(client_session) => client_session,
-        None => {
-            owned_client_session = sess.services.model_client.new_session();
-            &mut owned_client_session
-        }
+    let compaction_output_result = if exact_tail_plan.is_some() {
+        let mut isolated_client_session = sess
+            .services
+            .model_client
+            .clone()
+            .with_prompt_cache_key_override(Some(format!(
+                "exact-tail-v2-compaction:{}",
+                turn_context.sub_id
+            )))
+            .new_session();
+        isolated_client_session.reset_responses_continuation();
+        run_remote_compaction_request_v2(
+            sess,
+            turn_context,
+            &mut isolated_client_session,
+            &prompt,
+            &responses_metadata,
+        )
+        .await
+    } else {
+        let standard_client_session = match client_session.as_deref_mut() {
+            Some(client_session) => client_session,
+            None => {
+                owned_client_session = sess.services.model_client.new_session();
+                &mut owned_client_session
+            }
+        };
+        run_remote_compaction_request_v2(
+            sess,
+            turn_context,
+            standard_client_session,
+            &prompt,
+            &responses_metadata,
+        )
+        .await
     };
-    let compaction_output_result = run_remote_compaction_request_v2(
-        sess,
-        turn_context,
-        client_session,
-        &prompt,
-        &responses_metadata,
-    )
-    .await;
 
     trace_attempt.record_result(
         compaction_output_result
@@ -291,24 +393,106 @@ async fn run_remote_compact_task_inner_impl(
     let RemoteCompactionV2Output {
         compaction_output,
         token_usage,
-    } = compaction_output_result?;
+    } = match compaction_output_result {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(prepared) = &exact_tail_plan
+                && matches!(error, CodexErr::ContextWindowExceeded)
+            {
+                emit_exact_tail_compaction_diagnostic(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &compaction_id,
+                    trigger,
+                    &prepared.plan,
+                    None,
+                    Some(crate::compact_exact_tail::ExactTailFailReason::BackendContextExceeded),
+                )
+                .await;
+                return Err(exact_tail_backend_context_exceeded_error());
+            }
+            return Err(error);
+        }
+    };
     if let Some(token_usage) = token_usage {
         sess.record_rollout_budget_usage(&token_usage)?;
-        analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
+        if exact_tail_plan.is_none() {
+            analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
+        }
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
     }
+    let compaction_output_tokens =
+        estimate_response_items_token_count(std::slice::from_ref(&compaction_output));
+    if let Some(prepared) = &exact_tail_plan
+        && let Err(error) = ensure_replacement_has_cold_summary(
+            &prepared.plan,
+            std::slice::from_ref(&compaction_output),
+        ) {
+            let failure_reason = error.reason;
+            emit_exact_tail_compaction_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                &prepared.plan,
+                None,
+                Some(failure_reason),
+            )
+            .await;
+            return Err(error.into_codex_err());
+        }
     let (compacted_history, retained_images) =
         build_v2_compacted_history(&prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
+    let new_history = if let Some(prepared) = &exact_tail_plan {
+        let actual_summary_tokens = compaction_output_tokens;
+        let replacement = match build_exact_tail_replacement(
+            prepared,
+            compacted_history,
+            initial_context_injection,
+            actual_summary_tokens,
+        ) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                let failure_reason = error.reason;
+                emit_exact_tail_compaction_diagnostic(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &compaction_id,
+                    trigger,
+                    &prepared.plan,
+                    None,
+                    Some(failure_reason),
+                )
+                .await;
+                return Err(error.into_codex_err());
+            }
+        };
+        emit_exact_tail_compaction_diagnostic(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &compaction_id,
+            trigger,
+            &prepared.plan,
+            Some(&replacement.diagnostics),
+            None,
+        )
+        .await;
+        if let Some(client_session) = client_session {
+            client_session.reset_responses_continuation();
+        }
+        replacement.replacement_history
+    } else {
+        process_compacted_history(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            compacted_history,
+            initial_context_injection,
+        )
+        .await
+    };
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let new_history = process_compacted_history(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        compacted_history,
-        initial_context_injection,
-    )
-    .await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -445,139 +629,6 @@ async fn collect_compaction_output(
     })
 }
 
-fn build_v2_compacted_history(
-    prompt_input: &[ResponseItem],
-    compaction_output: ResponseItem,
-) -> (Vec<ResponseItem>, usize) {
-    let retained = prompt_input
-        .iter()
-        .filter(|item| is_retained_for_remote_compaction_v2(item))
-        .filter(|item| should_keep_compacted_history_item(item))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut retained =
-        truncate_retained_messages_for_remote_compaction(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
-    let retained_image_count = retained
-        .iter()
-        .map(retained_input_image_count)
-        .sum::<usize>();
-    retained.push(compaction_output);
-    (retained, retained_image_count)
-}
-
-fn is_retained_for_remote_compaction_v2(item: &ResponseItem) -> bool {
-    let ResponseItem::Message { role, .. } = item else {
-        return false;
-    };
-
-    matches!(role.as_str(), "user" | "developer" | "system")
-}
-
-fn retained_input_image_count(item: &ResponseItem) -> usize {
-    let ResponseItem::Message { content, .. } = item else {
-        return 0;
-    };
-
-    content
-        .iter()
-        .filter(|item| matches!(item, ContentItem::InputImage { .. }))
-        .count()
-}
-
-fn truncate_retained_messages_for_remote_compaction(
-    items: Vec<ResponseItem>,
-    max_tokens: usize,
-) -> Vec<ResponseItem> {
-    let mut remaining = max_tokens;
-    let mut truncated_reversed = Vec::with_capacity(items.len());
-    for item in items.into_iter().rev() {
-        if remaining == 0 {
-            continue;
-        }
-
-        let token_count = message_text_token_count(&item).max(1);
-        if token_count <= remaining {
-            truncated_reversed.push(item);
-            remaining = remaining.saturating_sub(token_count);
-        } else if let Some(truncated_item) =
-            truncate_message_text_to_token_budget(item, /*max_tokens*/ remaining)
-        {
-            truncated_reversed.push(truncated_item);
-            remaining = 0;
-        }
-    }
-    truncated_reversed.reverse();
-    truncated_reversed
-}
-
-fn message_text_token_count(item: &ResponseItem) -> usize {
-    let ResponseItem::Message { content, .. } = item else {
-        return 0;
-    };
-
-    content
-        .iter()
-        .map(|item| match item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                approx_token_count(text)
-            }
-            ContentItem::InputImage { .. } => 0,
-        })
-        .sum()
-}
-
-fn truncate_message_text_to_token_budget(
-    item: ResponseItem,
-    max_tokens: usize,
-) -> Option<ResponseItem> {
-    let ResponseItem::Message {
-        id,
-        role,
-        content,
-        phase,
-        internal_chat_message_metadata_passthrough: metadata,
-    } = item
-    else {
-        return Some(item);
-    };
-
-    let mut remaining = max_tokens;
-    let mut truncated_content = Vec::with_capacity(content.len());
-    for mut content_item in content {
-        match &mut content_item {
-            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                if remaining == 0 {
-                    continue;
-                }
-
-                let token_count = approx_token_count(text);
-                if token_count <= remaining {
-                    remaining = remaining.saturating_sub(token_count);
-                } else {
-                    *text = truncate_text(text, TruncationPolicy::Tokens(remaining));
-                    remaining = 0;
-                }
-                if !text.is_empty() {
-                    truncated_content.push(content_item);
-                }
-            }
-            ContentItem::InputImage { .. } => truncated_content.push(content_item),
-        }
-    }
-
-    if truncated_content.is_empty() {
-        return None;
-    }
-
-    Some(ResponseItem::Message {
-        id,
-        role,
-        content: truncated_content,
-        phase,
-        internal_chat_message_metadata_passthrough: metadata,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,215 +662,6 @@ mod tests {
             rx_event,
             consumer_dropped: CancellationToken::new(),
         }
-    }
-
-    #[test]
-    fn build_v2_compacted_history_filters_to_installed_retention_shape() {
-        let input = vec![
-            message("developer", "dev", /*phase*/ None),
-            message("system", "sys", /*phase*/ None),
-            message("user", "user", /*phase*/ None),
-            message("assistant", "commentary", Some(MessagePhase::Commentary)),
-            message("assistant", "final", Some(MessagePhase::FinalAnswer)),
-            ResponseItem::FunctionCall {
-                id: None,
-                name: "shell_command".to_string(),
-                namespace: None,
-                arguments: "{}".to_string(),
-                call_id: "call_1".to_string(),
-                internal_chat_message_metadata_passthrough: None,
-            },
-            ResponseItem::Compaction {
-                id: None,
-                encrypted_content: "old".to_string(),
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ];
-        let output = ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "new".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        };
-
-        let (history, _) = build_v2_compacted_history(&input, output.clone());
-
-        assert_eq!(
-            history,
-            vec![message("user", "user", /*phase*/ None), output]
-        );
-    }
-
-    #[test]
-    fn build_v2_compacted_history_discards_messages_before_truncating() {
-        let old = message("user", "old", /*phase*/ None);
-        let new = message("user", "new", /*phase*/ None);
-        let huge_developer_message = "d".repeat((RETAINED_MESSAGE_TOKEN_BUDGET + 1) * 4);
-        let huge_contextual_message = format!(
-            "<environment_context>\n{}\n</environment_context>",
-            "c".repeat((RETAINED_MESSAGE_TOKEN_BUDGET + 1) * 4)
-        );
-        let input = vec![
-            old.clone(),
-            message("developer", &huge_developer_message, /*phase*/ None),
-            message("user", &huge_contextual_message, /*phase*/ None),
-            new.clone(),
-        ];
-        let output = ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "new".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        };
-
-        let (history, _) = build_v2_compacted_history(&input, output.clone());
-
-        assert_eq!(history, vec![old, new, output]);
-    }
-
-    #[test]
-    fn build_v2_compacted_history_counts_retained_input_images() {
-        let input = vec![ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![
-                ContentItem::InputText {
-                    text: "user".to_string(),
-                },
-                ContentItem::InputImage {
-                    image_url: "data:image/png;base64,abc".to_string(),
-                    detail: None,
-                },
-                ContentItem::InputImage {
-                    image_url: "data:image/png;base64,def".to_string(),
-                    detail: None,
-                },
-            ],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        }];
-        let output = ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "new".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        };
-
-        let (_, retained_image_count) = build_v2_compacted_history(&input, output);
-
-        assert_eq!(retained_image_count, 2);
-    }
-
-    #[test]
-    fn retained_history_truncation_keeps_newest_messages_first() {
-        let middle = message("user", "middle1234", /*phase*/ None);
-        let new = message("user", "new", /*phase*/ None);
-        let retained = vec![
-            message("user", "old-old", /*phase*/ None),
-            middle,
-            new.clone(),
-        ];
-
-        let truncated =
-            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 3);
-
-        assert_eq!(
-            truncated,
-            vec![
-                message("user", "midd…1 tokens truncated…1234", /*phase*/ None),
-                new,
-            ]
-        );
-    }
-
-    #[test]
-    fn retained_history_truncation_preserves_images_and_truncates_later_text_parts() {
-        let item = ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![
-                ContentItem::InputText {
-                    text: "abcdef".to_string(),
-                },
-                ContentItem::InputImage {
-                    image_url: "data:image/png;base64,abc".to_string(),
-                    detail: None,
-                },
-                ContentItem::OutputText {
-                    text: "uvwxyz".to_string(),
-                },
-            ],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        };
-
-        let truncated =
-            truncate_retained_messages_for_remote_compaction(vec![item], /*max_tokens*/ 3);
-
-        assert_eq!(
-            truncated,
-            vec![ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![
-                    ContentItem::InputText {
-                        text: "abcdef".to_string(),
-                    },
-                    ContentItem::InputImage {
-                        image_url: "data:image/png;base64,abc".to_string(),
-                        detail: None,
-                    },
-                    ContentItem::OutputText {
-                        text: "uv…1 tokens truncated…yz".to_string(),
-                    },
-                ],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn retained_history_truncation_charges_image_only_messages() {
-        let image_only_message = ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputImage {
-                image_url: "data:image/png;base64,abc".to_string(),
-                detail: None,
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        };
-        let newest = message("user", "new", /*phase*/ None);
-        let retained = vec![
-            message("user", "old", /*phase*/ None),
-            image_only_message.clone(),
-            newest.clone(),
-        ];
-
-        let truncated =
-            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 2);
-
-        assert_eq!(truncated, vec![image_only_message, newest]);
-    }
-
-    #[test]
-    fn retained_history_truncation_drops_image_only_messages_after_budget_is_spent() {
-        let image_only_message = ResponseItem::Message {
-            id: None,
-            role: "user".to_string(),
-            content: vec![ContentItem::InputImage {
-                image_url: "data:image/png;base64,abc".to_string(),
-                detail: None,
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        };
-        let newest = message("user", "new", /*phase*/ None);
-        let retained = vec![image_only_message, newest.clone()];
-
-        let truncated =
-            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 1);
-
-        assert_eq!(truncated, vec![newest]);
     }
 
     #[tokio::test]

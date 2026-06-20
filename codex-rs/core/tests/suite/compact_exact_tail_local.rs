@@ -105,6 +105,39 @@ async fn exact_tail_local_manual_compact_excludes_newest_atomic_hot_suffix_from_
         !input_contains_text(&replacement_history, "LOCAL_MANUAL_CONTEXT_MARKER"),
         "manual/pre-turn exact-tail replacement must not persist reinjectable initial context"
     );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("local")
+    );
+    assert_eq!(
+        diagnostic.get("trigger").and_then(Value::as_str),
+        Some("manual")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("success")
+    );
+    assert_eq!(
+        diagnostic
+            .get("hot_suffix_exact_match")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        diagnostic
+            .get("planned_hot_suffix_item_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        diagnostic
+            .get("installed_hot_suffix_item_count")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
 
     let follow_up_input = requests[3].input();
     assert_eq!(
@@ -172,7 +205,7 @@ async fn exact_tail_local_backend_context_window_error_fails_without_pruning() -
     .await;
 
     assert!(
-        error_message.contains("BackendContextExceededDespiteLocalFit"),
+        error_message.contains("ExactTailBackendContextExceeded"),
         "expected exact-tail backend context-window failure, got {error_message}"
     );
     assert_eq!(
@@ -183,6 +216,27 @@ async fn exact_tail_local_backend_context_window_error_fails_without_pruning() -
     assert!(
         replacement_history_from_rollout(&rollout_path).is_err(),
         "failed exact-tail backend context-window error must not install compacted history"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("local")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("failure")
+    );
+    assert_eq!(
+        diagnostic.get("failure_reason").and_then(Value::as_str),
+        Some("ExactTailBackendContextExceeded")
+    );
+    assert_eq!(
+        diagnostic
+            .get("hot_suffix_exact_match")
+            .and_then(Value::as_bool),
+        None
     );
 
     shutdown_codex(&test).await?;
@@ -268,6 +322,11 @@ async fn exact_tail_local_manual_rejects_oversize_reinjected_initial_context_ite
         config.compact_preserve_recent_tokens = Some(1);
     });
     let test = builder.build(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
 
     test.submit_turn("LOCAL_CONTEXT_ITEM_USER").await?;
     test.codex.submit(Op::Compact).await?;
@@ -287,6 +346,25 @@ async fn exact_tail_local_manual_rejects_oversize_reinjected_initial_context_ite
             .iter()
             .all(|request| !input_contains_text(&request.input(), SUMMARIZATION_PROMPT)),
         "oversize reinjected context should fail before issuing a local compaction request"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("local")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("failure")
+    );
+    assert_eq!(
+        diagnostic.get("failure_reason").and_then(Value::as_str),
+        Some("ExactTailModelVisibleItemTooLarge")
+    );
+    assert_eq!(
+        diagnostic.get("actual_hot_tokens").and_then(Value::as_i64),
+        None
     );
 
     shutdown_codex(&test).await?;
@@ -349,6 +427,27 @@ async fn exact_tail_local_empty_summary_fails_without_installing_history() -> Re
     assert!(
         replacement_history_from_rollout(&rollout_path).is_err(),
         "failed exact-tail summary must not install compacted history"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic.get("route").and_then(Value::as_str),
+        Some("local")
+    );
+    assert_eq!(
+        diagnostic.get("fit_result").and_then(Value::as_str),
+        Some("failure")
+    );
+    assert_eq!(
+        diagnostic.get("failure_reason").and_then(Value::as_str),
+        Some("ExactTailNoUsableColdSummary")
+    );
+    assert_eq!(
+        diagnostic
+            .get("hot_suffix_exact_match")
+            .and_then(Value::as_bool),
+        None
     );
 
     shutdown_codex(&test).await?;

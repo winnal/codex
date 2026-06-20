@@ -10,6 +10,8 @@ use crate::compact_exact_tail::ExactTailImplementation;
 use crate::compact_exact_tail::ExactTailPrepareInput;
 use crate::compact_exact_tail::build_exact_tail_replacement;
 use crate::compact_exact_tail::check_cold_input_fits;
+use crate::compact_exact_tail::emit_exact_tail_compaction_diagnostic;
+use crate::compact_exact_tail::emit_exact_tail_prepare_failure_diagnostic;
 use crate::compact_exact_tail::ensure_non_empty_local_summary;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
@@ -78,26 +80,10 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
 }
 
 pub(crate) fn should_use_remote_compact_task_v2(turn_context: &TurnContext) -> bool {
-    if !turn_context
+    turn_context
         .config
         .features
         .enabled(codex_features::Feature::RemoteCompactionV2)
-    {
-        return false;
-    }
-    if matches!(
-        CompactionHistoryPolicy::from_config(&turn_context.config),
-        CompactionHistoryPolicy::PreserveRecentExact { .. }
-    ) {
-        tracing::info!(
-            exact_tail_enabled = true,
-            implementation = "remote",
-            bypassed_implementation = "remote_v2",
-            "exact-tail compaction bypassed remote v2 ordering"
-        );
-        return false;
-    }
-    true
 }
 
 pub(crate) async fn run_inline_auto_compact_task(
@@ -238,7 +224,9 @@ async fn run_compact_task_inner_impl(
     trigger: CompactionTrigger,
     compaction_metadata: CompactionTurnMetadata,
 ) -> CodexResult<String> {
-    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    let context_compaction_item = ContextCompactionItem::new();
+    let compaction_id = context_compaction_item.id.clone();
+    let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(&turn_context, &compaction_item)
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
@@ -264,6 +252,16 @@ async fn run_compact_task_inner_impl(
     {
         Ok(plan) => plan,
         Err(error) => {
+            let failure_reason = error.reason;
+            emit_exact_tail_prepare_failure_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                ExactTailImplementation::Local,
+                failure_reason,
+            )
+            .await;
             let error = error.into_codex_err();
             send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
             return Err(error);
@@ -283,9 +281,19 @@ async fn run_compact_task_inner_impl(
             &prepared.plan,
             history.raw_items(),
             turn_context.model_context_window(),
-        )
-        .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)
-        {
+        ) {
+            let failure_reason = error.reason;
+            emit_exact_tail_compaction_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                &prepared.plan,
+                None,
+                Some(failure_reason),
+            )
+            .await;
+            let error = error.into_codex_err();
             send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
             return Err(error);
         }
@@ -295,6 +303,16 @@ async fn run_compact_task_inner_impl(
             && request_tokens > context_window
         {
             let error = exact_tail_cold_input_too_large_error(request_tokens, context_window);
+            emit_exact_tail_compaction_diagnostic(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &compaction_id,
+                trigger,
+                &prepared.plan,
+                None,
+                Some(super::compact_exact_tail::ExactTailFailReason::ColdInputTooLarge),
+            )
+            .await;
             send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
             return Err(error);
         }
@@ -350,6 +368,20 @@ async fn run_compact_task_inner_impl(
                     error!(
                         "Exact-tail local compaction request exceeded backend context window without a safe cold-pruning repair. Original error: {e}"
                     );
+                    if let Some(prepared) = &exact_tail_plan {
+                        emit_exact_tail_compaction_diagnostic(
+                            sess.as_ref(),
+                            turn_context.as_ref(),
+                            &compaction_id,
+                            trigger,
+                            &prepared.plan,
+                            None,
+                            Some(
+                                super::compact_exact_tail::ExactTailFailReason::BackendContextExceeded,
+                            ),
+                        )
+                        .await;
+                    }
                     send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
                     return Err(error);
                 }
@@ -395,9 +427,19 @@ async fn run_compact_task_inner_impl(
             let summary_suffix =
                 get_last_assistant_message_from_turn(&compaction_output.completed_items)
                     .unwrap_or_default();
-            if let Err(error) = ensure_non_empty_local_summary(&prepared.plan, &summary_suffix)
-                .map_err(super::compact_exact_tail::ExactTailError::into_codex_err)
-            {
+            if let Err(error) = ensure_non_empty_local_summary(&prepared.plan, &summary_suffix) {
+                let failure_reason = error.reason;
+                emit_exact_tail_compaction_diagnostic(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &compaction_id,
+                    trigger,
+                    &prepared.plan,
+                    None,
+                    Some(failure_reason),
+                )
+                .await;
+                let error = error.into_codex_err();
                 send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
                 return Err(error);
             }
@@ -427,10 +469,30 @@ async fn run_compact_task_inner_impl(
             initial_context_injection,
             estimate_response_items_token_count(&compaction_output.completed_items),
         ) {
-            Ok(replacement_history) => {
-                new_history = replacement_history;
+            Ok(replacement) => {
+                emit_exact_tail_compaction_diagnostic(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &compaction_id,
+                    trigger,
+                    &prepared.plan,
+                    Some(&replacement.diagnostics),
+                    None,
+                )
+                .await;
+                new_history = replacement.replacement_history;
             }
             Err(error) => {
+                emit_exact_tail_compaction_diagnostic(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    &compaction_id,
+                    trigger,
+                    &prepared.plan,
+                    None,
+                    Some(error.reason),
+                )
+                .await;
                 let error = error.into_codex_err();
                 send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
                 return Err(error);

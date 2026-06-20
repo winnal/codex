@@ -1020,6 +1020,10 @@ impl ModelClientSession {
             .set_connection_reused(/*connection_reused*/ false);
     }
 
+    pub(crate) fn reset_responses_continuation(&mut self) {
+        self.reset_websocket_session();
+    }
+
     #[allow(clippy::too_many_arguments)]
     /// Builds shared Responses API transport options and request-body options.
     ///

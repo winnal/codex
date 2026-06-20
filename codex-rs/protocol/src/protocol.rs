@@ -1269,6 +1269,9 @@ pub enum EventMsg {
     /// Conversation history was compacted (either automatically or manually).
     ContextCompacted(ContextCompactedEvent),
 
+    /// Content-free numeric diagnostics for exact-tail compaction.
+    ExactTailCompactionDiagnostic(ExactTailCompactionDiagnosticEvent),
+
     /// Conversation history was rolled back by dropping the last N user turns.
     ThreadRolledBack(ThreadRolledBackEvent),
 
@@ -1955,6 +1958,134 @@ pub struct SafetyBufferingEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ContextCompactedEvent;
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ExactTailCompactionRoute {
+    Local,
+    RemoteLegacy,
+    RemoteV2,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ExactTailCompactionTrigger {
+    Manual,
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ExactTailCompactionFitResult {
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct ExactTailCompactionDiagnosticEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub compaction_id: String,
+    pub route: ExactTailCompactionRoute,
+    pub trigger: ExactTailCompactionTrigger,
+    pub fit_result: ExactTailCompactionFitResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub requested_hot_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub actual_hot_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub hot_group_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cold_group_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub raw_item_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub group_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub cold_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub summary_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub replacement_tokens_estimate: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub final_replacement_tokens_estimate: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub effective_replacement_budget: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub safety_margin: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max_model_visible_item_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub largest_hot_item_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub hot_suffix_exact_match: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub planned_hot_suffix_item_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub installed_hot_suffix_item_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub filtered_stale_group_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub filtered_context_item_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub required_current_context_budget: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub final_replacement_extra_budget_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub conservative_cold_summary_budget: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub conservative_summary_budget_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub estimated_summary_scaffold_overhead_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retained_cold_user_message_budget_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub replacement_overhead_margin_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub available_for_hot: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub post_summary_cold_reserve_target_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub post_summary_cold_reserve_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub post_summary_cold_reserve_group_count: Option<usize>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnCompleteEvent {

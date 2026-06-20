@@ -205,6 +205,10 @@ async fn run_codex_tool_session_inner(
     loop {
         match thread.next_event().await {
             Ok(event) => {
+                if matches!(event.msg, EventMsg::ExactTailCompactionDiagnostic(_)) {
+                    continue;
+                }
+
                 outgoing
                     .send_event_as_notification(
                         &event,
@@ -267,7 +271,8 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::GuardianWarning(_)
                     | EventMsg::ModelVerification(_)
                     | EventMsg::SafetyBuffering(_)
-                    | EventMsg::TurnModerationMetadata(_) => {
+                    | EventMsg::TurnModerationMetadata(_)
+                    | EventMsg::ExactTailCompactionDiagnostic(_) => {
                         continue;
                     }
                     EventMsg::GuardianAssessment(_) => {

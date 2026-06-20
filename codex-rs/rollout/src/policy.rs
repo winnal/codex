@@ -84,6 +84,7 @@ pub fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::TokenCount(_)
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::ContextCompacted(_)
+        | EventMsg::ExactTailCompactionDiagnostic(_)
         | EventMsg::EnteredReviewMode(_)
         | EventMsg::ExitedReviewMode(_)
         | EventMsg::McpToolCallEnd(_)

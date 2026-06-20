@@ -924,6 +924,9 @@ pub(crate) async fn apply_bespoke_event_handling(
             // Core still fans out this deprecated event for legacy clients;
             // v2 clients receive the canonical ContextCompaction item instead.
         }
+        EventMsg::ExactTailCompactionDiagnostic(..) => {
+            // Persisted rollout diagnostics are intentionally not surfaced as UI notifications.
+        }
         EventMsg::DeprecationNotice(event) => {
             let notification = DeprecationNoticeNotification {
                 summary: event.summary,

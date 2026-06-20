@@ -82,6 +82,27 @@ fn map_api_error_maps_cyber_policy_from_400_body() {
 }
 
 #[test]
+fn map_api_error_maps_context_length_exceeded_from_400_body() {
+    let body = serde_json::json!({
+        "error": {
+            "message": "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            "type": "invalid_request_error",
+            "param": "input",
+            "code": "context_length_exceeded"
+        }
+    })
+    .to_string();
+    let err = map_api_error(ApiError::Transport(TransportError::Http {
+        status: http::StatusCode::BAD_REQUEST,
+        url: Some("http://example.com/v1/responses/compact".to_string()),
+        headers: None,
+        body: Some(body),
+    }));
+
+    assert!(matches!(err, CodexErr::ContextWindowExceeded));
+}
+
+#[test]
 fn map_api_error_maps_wrapped_websocket_cyber_policy_from_400_body() {
     let body = serde_json::json!({
         "type": "error",

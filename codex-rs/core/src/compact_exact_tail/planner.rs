@@ -101,6 +101,7 @@ pub(crate) fn plan_exact_tail(
     let group_count = groups.len();
 
     if let Some(newest_group) = groups.last()
+        && !group_contains_compaction_summary(newest_group)
         && newest_group.tokens > budget_reservation.available_for_hot
     {
         return Err(ExactTailError::new(
@@ -117,6 +118,7 @@ pub(crate) fn plan_exact_tail(
     let HotGroupSelection {
         selected_group_count,
         actual_hot_tokens,
+        post_summary_cold_reserve,
     } = select_hot_groups(&groups, target_tokens);
     if actual_hot_tokens > budget_reservation.available_for_hot {
         return Err(ExactTailError::new(
@@ -154,6 +156,11 @@ pub(crate) fn plan_exact_tail(
     ensure_model_visible_items_within_limit(&hot_suffix, max_model_visible_item_tokens)?;
 
     let cold_tokens = estimate_response_items_token_count(&cold_history);
+    let largest_hot_item_tokens = hot_suffix
+        .iter()
+        .map(|item| estimate_response_items_token_count(std::slice::from_ref(item)))
+        .max()
+        .unwrap_or(0);
     let cold_user_messages = collect_user_messages(&cold_history);
     let coverage = ExactTailCoverage {
         cold_covered_groups,
@@ -181,6 +188,10 @@ pub(crate) fn plan_exact_tail(
         max_model_visible_item_tokens,
         safety_margin: budget_reservation.safety_margin,
         available_for_hot: budget_reservation.available_for_hot,
+        largest_hot_item_tokens,
+        post_summary_cold_reserve_target_tokens: post_summary_cold_reserve.target_tokens,
+        post_summary_cold_reserve_tokens: post_summary_cold_reserve.tokens,
+        post_summary_cold_reserve_group_count: post_summary_cold_reserve.group_count,
     };
     trace_plan(&diagnostics);
     Ok(ExactTailPlan {
@@ -195,6 +206,15 @@ pub(crate) fn plan_exact_tail(
 struct HotGroupSelection {
     selected_group_count: usize,
     actual_hot_tokens: i64,
+    post_summary_cold_reserve: PostSummaryColdReserve,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PostSummaryColdReserve {
+    max_hot_group_count: usize,
+    target_tokens: i64,
+    tokens: i64,
+    group_count: usize,
 }
 
 fn select_hot_groups(
@@ -203,13 +223,14 @@ fn select_hot_groups(
 ) -> HotGroupSelection {
     let mut selected_group_count = 0usize;
     let mut actual_hot_tokens = 0i64;
-    let max_selected_group_count = max_hot_group_count_after_summary_reserve(groups);
+    let post_summary_cold_reserve = post_summary_cold_reserve(groups);
+    let max_selected_group_count = post_summary_cold_reserve.max_hot_group_count;
 
     for group in groups.iter().rev() {
         if selected_group_count >= max_selected_group_count {
             break;
         }
-        if selected_group_count > 0 && group_contains_compaction_summary(group) {
+        if group_contains_compaction_summary(group) {
             break;
         }
         let required_to_reach_target =
@@ -224,16 +245,27 @@ fn select_hot_groups(
     HotGroupSelection {
         selected_group_count,
         actual_hot_tokens,
+        post_summary_cold_reserve,
     }
 }
 
-fn max_hot_group_count_after_summary_reserve(groups: &[super::groups::ExactTailGroup]) -> usize {
+fn post_summary_cold_reserve(groups: &[super::groups::ExactTailGroup]) -> PostSummaryColdReserve {
     let Some(summary_index) = groups.iter().rposition(group_contains_compaction_summary) else {
-        return groups.len();
+        return PostSummaryColdReserve {
+            max_hot_group_count: groups.len(),
+            target_tokens: 0,
+            tokens: 0,
+            group_count: 0,
+        };
     };
     let post_summary_groups = &groups[summary_index + 1..];
     if post_summary_groups.len() <= 1 {
-        return groups.len();
+        return PostSummaryColdReserve {
+            max_hot_group_count: groups.len(),
+            target_tokens: 0,
+            tokens: 0,
+            group_count: 0,
+        };
     }
 
     let post_summary_tokens = post_summary_groups
@@ -254,9 +286,14 @@ fn max_hot_group_count_after_summary_reserve(groups: &[super::groups::ExactTailG
             break;
         }
     }
-    groups
-        .len()
-        .saturating_sub(summary_index + 1 + reserved_group_count)
+    PostSummaryColdReserve {
+        max_hot_group_count: groups
+            .len()
+            .saturating_sub(summary_index + 1 + reserved_group_count),
+        target_tokens: reserve_target,
+        tokens: reserved_tokens,
+        group_count: reserved_group_count,
+    }
 }
 
 fn group_contains_compaction_summary(group: &super::groups::ExactTailGroup) -> bool {
@@ -349,6 +386,11 @@ fn trace_plan(diagnostics: &ExactTailDiagnostics) {
         max_model_visible_item_tokens = diagnostics.max_model_visible_item_tokens,
         safety_margin = diagnostics.safety_margin,
         available_for_hot = diagnostics.available_for_hot,
+        largest_hot_item_tokens = diagnostics.largest_hot_item_tokens,
+        post_summary_cold_reserve_target_tokens =
+            diagnostics.post_summary_cold_reserve_target_tokens,
+        post_summary_cold_reserve_tokens = diagnostics.post_summary_cold_reserve_tokens,
+        post_summary_cold_reserve_group_count = diagnostics.post_summary_cold_reserve_group_count,
         hot_group_count = diagnostics.hot_group_count,
         cold_group_count = diagnostics.cold_group_count,
         filtered_context_item_count = diagnostics.filtered_context_item_count,

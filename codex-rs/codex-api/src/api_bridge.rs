@@ -61,13 +61,25 @@ pub fn map_api_error(err: ApiError) -> CodexErr {
                 }
 
                 if status == http::StatusCode::BAD_REQUEST {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&body_text)
-                        && let Some(error) = parsed.get("error")
-                        && error.get("code").and_then(Value::as_str)
-                            == Some(CYBER_POLICY_ERROR_CODE)
+                    let parsed_error = serde_json::from_str::<Value>(&body_text)
+                        .ok()
+                        .and_then(|parsed| parsed.get("error").cloned());
+                    if parsed_error
+                        .as_ref()
+                        .and_then(|error| error.get("code"))
+                        .and_then(Value::as_str)
+                        == Some("context_length_exceeded")
                     {
-                        let message = error
-                            .get("message")
+                        CodexErr::ContextWindowExceeded
+                    } else if parsed_error
+                        .as_ref()
+                        .and_then(|error| error.get("code"))
+                        .and_then(Value::as_str)
+                        == Some(CYBER_POLICY_ERROR_CODE)
+                    {
+                        let message = parsed_error
+                            .as_ref()
+                            .and_then(|error| error.get("message"))
                             .and_then(Value::as_str)
                             .filter(|message| !message.trim().is_empty())
                             .map(str::to_string)
