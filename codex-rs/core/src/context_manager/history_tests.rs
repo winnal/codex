@@ -1,4 +1,5 @@
 use super::*;
+use crate::context_manager::model_visible_tool_output_item_token_limit;
 use crate::context::world_state::EnvironmentsState;
 use crate::context::world_state::WorldState;
 use base64::Engine;
@@ -1196,9 +1197,11 @@ fn record_items_keeps_read_thread_sized_tool_output_within_serialized_item_budge
     history.record_items([&item], policy);
 
     let stored_tokens = estimate_response_items_token_count(&history.items);
+    let item_token_limit =
+        model_visible_tool_output_item_token_limit(i64::try_from(token_limit).unwrap_or(i64::MAX));
     assert!(
-        stored_tokens <= i64::try_from(token_limit).unwrap_or(i64::MAX),
-        "stored tool output item estimated to {stored_tokens} tokens, above {token_limit}"
+        stored_tokens <= item_token_limit,
+        "stored tool output item estimated to {stored_tokens} tokens, above {item_token_limit}"
     );
     let stored = match &history.items[0] {
         ResponseItem::FunctionCallOutput { output, .. } => output,
@@ -1207,7 +1210,46 @@ fn record_items_keeps_read_thread_sized_tool_output_within_serialized_item_budge
     assert!(
         stored
             .text_content()
-            .is_some_and(|content| content.contains("tokens truncated"))
+            .is_some_and(|content| content.contains("truncated"))
+    );
+}
+
+#[test]
+fn record_items_omits_unshrinkable_function_output_to_enforce_serialized_item_budget() {
+    let mut history = ContextManager::new();
+    let token_limit = 500;
+    let policy = TruncationPolicy::Tokens(token_limit);
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "image-output-call".to_string(),
+        output: FunctionCallOutputPayload::from_content_items(
+            std::iter::repeat_with(|| FunctionCallOutputContentItem::InputImage {
+                image_url: "data:image/png;base64,AAAA".to_string(),
+                detail: Some(ImageDetail::High),
+            })
+            .take(20)
+            .collect(),
+        ),
+        metadata: None,
+    };
+
+    history.record_items([&item], policy);
+
+    let stored_tokens = estimate_response_items_token_count(&history.items);
+    let item_token_limit =
+        model_visible_tool_output_item_token_limit(i64::try_from(token_limit).unwrap_or(i64::MAX));
+    assert!(
+        stored_tokens <= item_token_limit,
+        "stored tool output item estimated to {stored_tokens} tokens, above {item_token_limit}"
+    );
+    let stored = match &history.items[0] {
+        ResponseItem::FunctionCallOutput { output, .. } => output,
+        other => panic!("unexpected history item: {other:?}"),
+    };
+    assert!(
+        stored
+            .text_content()
+            .is_some_and(|content| content.contains("tool output omitted"))
     );
 }
 

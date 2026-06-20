@@ -1,3 +1,4 @@
+use super::tool_output_budget::model_visible_tool_output_item_token_limit_for_policy;
 use crate::context::ContextualUserFragment;
 use crate::context::world_state::WorldState;
 use crate::context_manager::normalize;
@@ -31,6 +32,10 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::LazyLock;
+
+const FUNCTION_OUTPUT_TRUNCATION_MAX_PASSES: usize = 16;
+const FUNCTION_OUTPUT_OMITTED_FOR_BUDGET: &str =
+    "[tool output omitted: exceeded configured model-visible item budget]";
 
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
@@ -455,14 +460,17 @@ fn truncate_function_output_item_to_policy(
     policy: TruncationPolicy,
     mut build_item: impl FnMut(FunctionCallOutputPayload) -> ResponseItem,
 ) -> ResponseItem {
-    let token_limit = i64::try_from(policy.token_budget()).unwrap_or(i64::MAX);
+    let token_limit = model_visible_tool_output_item_token_limit_for_policy(policy);
     let mut output_budget = policy.token_budget();
     let mut item = build_item(truncate_function_output_payload(original_output, policy));
 
-    for _ in 0..4 {
+    for _ in 0..FUNCTION_OUTPUT_TRUNCATION_MAX_PASSES {
         let item_tokens = estimate_response_items_token_count(std::slice::from_ref(&item));
         if item_tokens <= token_limit {
             return item;
+        }
+        if output_budget == 0 {
+            break;
         }
 
         let excess = usize::try_from(item_tokens.saturating_sub(token_limit))
@@ -479,7 +487,16 @@ fn truncate_function_output_item_to_policy(
         ));
     }
 
-    item
+    let omitted_payload =
+        FunctionCallOutputPayload::from_text(FUNCTION_OUTPUT_OMITTED_FOR_BUDGET.to_string());
+    let mut omitted_item = build_item(omitted_payload);
+    let omitted_tokens = estimate_response_items_token_count(std::slice::from_ref(&omitted_item));
+    if omitted_tokens <= token_limit {
+        return omitted_item;
+    }
+
+    omitted_item.clear_metadata();
+    omitted_item
 }
 
 pub(crate) fn truncate_function_output_payload(

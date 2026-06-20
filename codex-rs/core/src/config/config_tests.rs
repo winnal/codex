@@ -2,6 +2,7 @@ use crate::compact_exact_tail::CompactionHistoryPolicy;
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
+use crate::context_manager::model_visible_tool_output_item_token_limit;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
@@ -6923,7 +6924,7 @@ async fn exact_tail_preserves_configured_model_manager_tool_output_limit() -> st
         CompactionHistoryPolicy::from_config(&config),
         CompactionHistoryPolicy::PreserveRecentExact {
             target_tokens: 120_000,
-            max_model_visible_item_tokens: 20_000,
+            max_model_visible_item_tokens: model_visible_tool_output_item_token_limit(20_000),
         }
     );
 

@@ -1,4 +1,5 @@
 use super::*;
+use crate::context_manager::model_visible_tool_output_item_token_limit;
 use codex_analytics::CompactionTrigger;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -756,10 +757,12 @@ fn oversize_hot_tool_output_item_fails_closed() {
 
 #[test]
 fn configured_larger_item_cap_allows_read_thread_sized_tool_output() {
-    let output = function_output("call-1", &"read_thread summary payload ".repeat(2_400));
+    let output = function_output("call-1", &"x".repeat(84_000));
     let output_tokens = estimate_response_items_token_count(std::slice::from_ref(&output));
     assert!(output_tokens > EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS);
-    assert!(output_tokens < 20_000);
+    assert!(output_tokens > 20_000);
+    let configured_item_cap = model_visible_tool_output_item_token_limit(20_000);
+    assert!(output_tokens <= configured_item_cap);
     let history = [
         user("old"),
         user("recent"),
@@ -790,12 +793,12 @@ fn configured_larger_item_cap_allows_read_thread_sized_tool_output() {
         effective_replacement_budget: Some(200_000),
         required_current_context_budget: 0,
         final_replacement_extra_budget_tokens: 0,
-        max_model_visible_item_tokens: 20_000,
+        max_model_visible_item_tokens: configured_item_cap,
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
     })
-    .expect("configured 20k item cap should allow the read_thread-sized tool output");
+    .expect("configured 20k body cap should allow the read_thread-sized tool output");
 
     assert_eq!(actual.hot_suffix, vec![function_call("call-1"), output]);
 }

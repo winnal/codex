@@ -2,6 +2,7 @@ use crate::compact::COMPACT_USER_MESSAGE_MAX_TOKENS;
 use crate::compact::CompactedUserMessage;
 use crate::compact::InitialContextInjection;
 use crate::config::Config;
+use crate::context_manager::model_visible_tool_output_item_token_limit;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use codex_analytics::CompactionTrigger;
@@ -42,6 +43,7 @@ fn max_model_visible_item_tokens(config: &Config) -> i64 {
         .tool_output_token_limit
         .and_then(|tokens| i64::try_from(tokens).ok())
         .filter(|tokens| *tokens > 0)
+        .map(model_visible_tool_output_item_token_limit)
         .unwrap_or(EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS)
 }
 
