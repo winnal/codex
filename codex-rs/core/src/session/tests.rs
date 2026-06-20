@@ -1509,6 +1509,31 @@ disabled_tools = [
 }
 
 #[tokio::test]
+async fn reload_user_config_layer_updates_feature_gates_for_new_turns() {
+    let (session, initial_turn_context) = make_session_and_context().await;
+    assert!(crate::compact::should_use_remote_compact_task_v2(
+        &initial_turn_context
+    ));
+
+    let codex_home = session.codex_home().await;
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+    std::fs::write(
+        codex_home.join(CONFIG_TOML_FILE),
+        "[features]\nremote_compaction_v2 = false\n",
+    )
+    .expect("write user config");
+
+    session.reload_user_config_layer().await;
+
+    let config = session.get_config().await;
+    assert!(!config.features.enabled(Feature::RemoteCompactionV2));
+    let turn_context = session.new_default_turn().await;
+    assert!(!crate::compact::should_use_remote_compact_task_v2(
+        turn_context.as_ref()
+    ));
+}
+
+#[tokio::test]
 async fn refresh_runtime_config_updates_runtime_refreshable_fields_and_keeps_session_static_settings()
  {
     let (session, _turn_context) = make_session_and_context().await;
@@ -1516,7 +1541,10 @@ async fn refresh_runtime_config_updates_runtime_refreshable_fields_and_keeps_ses
     std::fs::create_dir_all(&codex_home).expect("create codex home");
     std::fs::write(
         codex_home.join(CONFIG_TOML_FILE),
-        r#"[apps.calendar]
+        r#"[features]
+remote_compaction_v2 = false
+
+[apps.calendar]
 enabled = false
 destructive_enabled = false
 
@@ -1537,6 +1565,7 @@ disabled_tools = [
     session.refresh_runtime_config(next_config).await;
 
     let config = session.get_config().await;
+    assert!(!config.features.enabled(Feature::RemoteCompactionV2));
     let apps_toml = config
         .config_layer_stack
         .effective_config()

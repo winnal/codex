@@ -1561,6 +1561,7 @@ impl Session {
             config.config_layer_stack = config
                 .config_layer_stack
                 .with_user_layer_from(&next_config.config_layer_stack);
+            config.features = next_config.features.clone();
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             let config = Arc::new(config);
@@ -1615,7 +1616,8 @@ impl Session {
     pub(crate) async fn reload_user_config_layer(&self) {
         // Refresh layer-backed runtime state for an existing session, including enabled plugin,
         // skill, and hook state. Derived config fields such as feature gates and legacy notify
-        // settings remain session-static.
+        // settings remain session-static, except feature gates which are reloaded so route
+        // selection follows the active user config.
         //
         // Prefer `refresh_runtime_config()` when the host can already provide a materialized
         // config snapshot. This file-based path exists for legacy local reload flows.
@@ -1679,7 +1681,17 @@ impl Session {
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
             config
         };
-        self.refresh_runtime_config(next_config).await;
+        match self
+            .get_config()
+            .await
+            .rebuild_preserving_session_layers(&next_config)
+            .await
+        {
+            Ok(next_config) => self.refresh_runtime_config(next_config).await,
+            Err(err) => {
+                warn!("failed to reload user config layer: {err}");
+            }
+        }
     }
 
     async fn build_settings_update_items(
