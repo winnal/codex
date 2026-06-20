@@ -16,6 +16,7 @@ use crate::compact_exact_tail::ensure_non_empty_local_summary;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::local_summary_scaffold_overhead_tokens;
+use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
@@ -231,10 +232,15 @@ async fn run_compact_task_inner_impl(
         .await;
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
-    let source_history = sess.clone_history().await;
-    let source_history_items = source_history.raw_items().to_vec();
+    let mut source_history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
     let policy = CompactionHistoryPolicy::from_config(&turn_context.config);
+    let normalized_tool_output_count = normalize_tool_outputs_for_exact_tail_policy(
+        &mut source_history,
+        policy,
+        turn_context.model_info.truncation_policy.into(),
+    );
+    let source_history_items = source_history.raw_items().to_vec();
     let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
         sess: sess.as_ref(),
         turn_context: turn_context.as_ref(),
@@ -246,6 +252,7 @@ async fn run_compact_task_inner_impl(
         estimated_summary_scaffold_overhead_tokens: local_summary_scaffold_overhead_tokens(),
         retained_cold_user_message_budget_tokens:
             EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS,
+        normalized_tool_output_count,
         implementation: ExactTailImplementation::Local,
     })
     .await

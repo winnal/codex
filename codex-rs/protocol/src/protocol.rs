@@ -2036,6 +2036,9 @@ pub struct ExactTailCompactionDiagnosticEvent {
     pub max_model_visible_item_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    pub normalized_tool_output_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub largest_hot_item_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

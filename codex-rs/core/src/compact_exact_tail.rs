@@ -2,6 +2,7 @@ use crate::compact::InitialContextInjection;
 use crate::compact::SUMMARY_PREFIX;
 use crate::compact::build_compacted_history;
 use crate::compact::is_summary_message;
+use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::context_manager::is_user_turn_boundary;
 use crate::session::session::Session;
@@ -16,6 +17,7 @@ use codex_protocol::protocol::ExactTailCompactionDiagnosticEvent;
 use codex_protocol::protocol::ExactTailCompactionFitResult;
 use codex_protocol::protocol::ExactTailCompactionRoute;
 use codex_protocol::protocol::ExactTailCompactionTrigger;
+use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use tracing::warn;
 
@@ -27,6 +29,19 @@ pub(crate) use planner::classify_exact_tail_history_item;
 pub(crate) use planner::exact_tail_replacement_budget;
 pub(crate) use planner::plan_exact_tail;
 pub(crate) use types::*;
+
+pub(crate) fn normalize_tool_outputs_for_exact_tail_policy(
+    history: &mut ContextManager,
+    policy: CompactionHistoryPolicy,
+    truncation_policy: TruncationPolicy,
+) -> usize {
+    match policy {
+        CompactionHistoryPolicy::PreserveRecentExact { .. } => {
+            history.normalize_tool_outputs_to_policy(truncation_policy)
+        }
+        CompactionHistoryPolicy::Standard => 0,
+    }
+}
 
 pub(crate) async fn prepare_exact_tail_plan(
     input: ExactTailPrepareInput<'_>,
@@ -41,6 +56,7 @@ pub(crate) async fn prepare_exact_tail_plan(
         initial_context_injection,
         estimated_summary_scaffold_overhead_tokens,
         retained_cold_user_message_budget_tokens,
+        normalized_tool_output_count,
         implementation,
     } = input;
 
@@ -75,7 +91,7 @@ pub(crate) async fn prepare_exact_tail_plan(
         InitialContextInjection::DoNotInject => required_current_context_budget,
         InitialContextInjection::BeforeLastUserMessage => base_instruction_tokens,
     };
-    let plan = plan_exact_tail(ExactTailPlanInput {
+    let mut plan = plan_exact_tail(ExactTailPlanInput {
         history_items,
         target_tokens,
         effective_replacement_budget: exact_tail_replacement_budget(
@@ -91,6 +107,7 @@ pub(crate) async fn prepare_exact_tail_plan(
         retained_cold_user_message_budget_tokens,
         implementation,
     })?;
+    plan.diagnostics.normalized_tool_output_count = normalized_tool_output_count;
 
     Ok(Some(PreparedExactTailPlan {
         plan,
@@ -390,6 +407,7 @@ pub(crate) async fn emit_exact_tail_compaction_diagnostic(
     event.effective_replacement_budget = Some(diagnostics.effective_replacement_budget);
     event.safety_margin = Some(diagnostics.safety_margin);
     event.max_model_visible_item_tokens = Some(diagnostics.max_model_visible_item_tokens);
+    event.normalized_tool_output_count = Some(diagnostics.normalized_tool_output_count);
     event.largest_hot_item_tokens = Some(diagnostics.largest_hot_item_tokens);
     event.hot_suffix_exact_match =
         replacement.map(|replacement| replacement.hot_suffix_exact_match);
@@ -470,6 +488,7 @@ fn exact_tail_diagnostic_event(
         effective_replacement_budget: None,
         safety_margin: None,
         max_model_visible_item_tokens: None,
+        normalized_tool_output_count: None,
         largest_hot_item_tokens: None,
         hot_suffix_exact_match: None,
         planned_hot_suffix_item_count: None,

@@ -154,6 +154,7 @@ pub(crate) struct ExactTailDiagnostics {
     pub(crate) required_current_context_budget: i64,
     pub(crate) final_replacement_extra_budget_tokens: i64,
     pub(crate) max_model_visible_item_tokens: i64,
+    pub(crate) normalized_tool_output_count: usize,
     pub(crate) safety_margin: i64,
     pub(crate) available_for_hot: i64,
     pub(crate) largest_hot_item_tokens: i64,
@@ -229,5 +230,6 @@ pub(crate) struct ExactTailPrepareInput<'a> {
     pub(crate) initial_context_injection: InitialContextInjection,
     pub(crate) estimated_summary_scaffold_overhead_tokens: i64,
     pub(crate) retained_cold_user_message_budget_tokens: i64,
+    pub(crate) normalized_tool_output_count: usize,
     pub(crate) implementation: ExactTailImplementation,
 }

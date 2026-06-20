@@ -18,6 +18,7 @@ use crate::compact_exact_tail::emit_exact_tail_prepare_failure_diagnostic;
 use crate::compact_exact_tail::ensure_replacement_has_cold_summary;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
+use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::compact_exact_tail::remote_legacy_summary_scaffold_overhead_tokens;
 use crate::context_manager::ContextManager;
@@ -202,10 +203,15 @@ async fn run_remote_compact_task_inner_impl(
     let compaction_item = TurnItem::ContextCompaction(context_compaction_item);
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
-    let source_history = sess.clone_history().await;
-    let source_history_items = source_history.raw_items().to_vec();
+    let mut source_history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
     let policy = CompactionHistoryPolicy::from_config(&turn_context.config);
+    let normalized_tool_output_count = normalize_tool_outputs_for_exact_tail_policy(
+        &mut source_history,
+        policy,
+        turn_context.model_info.truncation_policy.into(),
+    );
+    let source_history_items = source_history.raw_items().to_vec();
     let exact_tail_implementation = ExactTailImplementation::RemoteLegacy;
     let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
         sess: sess.as_ref(),
@@ -218,6 +224,7 @@ async fn run_remote_compact_task_inner_impl(
         estimated_summary_scaffold_overhead_tokens: remote_legacy_summary_scaffold_overhead_tokens(
         ),
         retained_cold_user_message_budget_tokens: 0,
+        normalized_tool_output_count,
         implementation: exact_tail_implementation,
     })
     .await

@@ -18,6 +18,7 @@ use crate::compact_exact_tail::emit_exact_tail_prepare_failure_diagnostic;
 use crate::compact_exact_tail::ensure_replacement_has_cold_summary;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
+use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::compact_remote::process_compacted_history;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
@@ -207,10 +208,15 @@ async fn run_remote_compact_task_inner_impl(
     sess.emit_turn_item_started(turn_context, &compaction_item)
         .await;
 
-    let source_history = sess.clone_history().await;
-    let source_history_items = source_history.raw_items().to_vec();
+    let mut source_history = sess.clone_history().await;
     let base_instructions = sess.get_base_instructions().await;
     let policy = CompactionHistoryPolicy::from_config(&turn_context.config);
+    let normalized_tool_output_count = normalize_tool_outputs_for_exact_tail_policy(
+        &mut source_history,
+        policy,
+        turn_context.model_info.truncation_policy.into(),
+    );
+    let source_history_items = source_history.raw_items().to_vec();
     let exact_tail_implementation = ExactTailImplementation::RemoteV2;
     let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
         sess: sess.as_ref(),
@@ -223,6 +229,7 @@ async fn run_remote_compact_task_inner_impl(
         estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: REMOTE_COMPACTION_V2_RETAINED_MESSAGE_TOKEN_BUDGET
             as i64,
+        normalized_tool_output_count,
         implementation: exact_tail_implementation,
     })
     .await
@@ -428,20 +435,21 @@ async fn run_remote_compact_task_inner_impl(
         && let Err(error) = ensure_replacement_has_cold_summary(
             &prepared.plan,
             std::slice::from_ref(&compaction_output),
-        ) {
-            let failure_reason = error.reason;
-            emit_exact_tail_compaction_diagnostic(
-                sess.as_ref(),
-                turn_context.as_ref(),
-                &compaction_id,
-                trigger,
-                &prepared.plan,
-                None,
-                Some(failure_reason),
-            )
-            .await;
-            return Err(error.into_codex_err());
-        }
+        )
+    {
+        let failure_reason = error.reason;
+        emit_exact_tail_compaction_diagnostic(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &compaction_id,
+            trigger,
+            &prepared.plan,
+            None,
+            Some(failure_reason),
+        )
+        .await;
+        return Err(error.into_codex_err());
+    }
     let (compacted_history, retained_images) =
         build_v2_compacted_history(&prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);

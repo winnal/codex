@@ -1215,6 +1215,89 @@ fn record_items_keeps_read_thread_sized_tool_output_within_serialized_item_budge
 }
 
 #[test]
+fn normalize_tool_outputs_to_policy_shrinks_legacy_larger_config_items() {
+    let mut history = ContextManager::new();
+    let old_token_limit = 25_000;
+    let new_token_limit = 20_000;
+    let old_policy = TruncationPolicy::Bytes(approx_bytes_for_tokens(old_token_limit));
+    let new_policy = TruncationPolicy::Bytes(approx_bytes_for_tokens(new_token_limit));
+    let long_output = "legacy read_thread payload ".repeat(25_000);
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "legacy-read-thread-call".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(long_output),
+            success: Some(true),
+        },
+        metadata: None,
+    };
+    let custom_item = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "legacy-custom-read-thread-call".to_string(),
+        name: Some("custom_tool".to_string()),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("legacy custom payload ".repeat(25_000)),
+            success: Some(true),
+        },
+        metadata: None,
+    };
+    history.record_items([&item, &custom_item], old_policy);
+    let old_item_token_limit = model_visible_tool_output_item_token_limit(
+        i64::try_from(old_token_limit).unwrap_or(i64::MAX),
+    );
+    for item in &history.items {
+        let stored_old_tokens = estimate_response_items_token_count(std::slice::from_ref(item));
+        assert!(
+            stored_old_tokens <= old_item_token_limit,
+            "stored legacy item estimated to {stored_old_tokens} tokens, above {old_item_token_limit}"
+        );
+    }
+
+    let normalized = history.normalize_tool_outputs_to_policy(new_policy);
+
+    assert_eq!(normalized, 2);
+    let new_item_token_limit = model_visible_tool_output_item_token_limit(
+        i64::try_from(new_token_limit).unwrap_or(i64::MAX),
+    );
+    for item in &history.items {
+        let stored_new_tokens = estimate_response_items_token_count(std::slice::from_ref(item));
+        assert!(
+            stored_new_tokens <= new_item_token_limit,
+            "normalized item estimated to {stored_new_tokens} tokens, above {new_item_token_limit}"
+        );
+        let output = match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => output,
+            other => panic!("unexpected history item: {other:?}"),
+        };
+        assert!(
+            output
+                .text_content()
+                .is_some_and(|content| content.contains("truncated"))
+        );
+    }
+}
+
+#[test]
+fn normalize_tool_outputs_to_policy_keeps_conforming_items() {
+    let mut history = ContextManager::new();
+    let policy = TruncationPolicy::Tokens(20_000);
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "small-call".to_string(),
+        output: FunctionCallOutputPayload::from_text("small output".to_string()),
+        metadata: None,
+    };
+    history.record_items([&item], policy);
+    let before = history.raw_items().to_vec();
+
+    let normalized = history.normalize_tool_outputs_to_policy(policy);
+
+    assert_eq!(normalized, 0);
+    assert_eq!(history.raw_items(), before);
+}
+
+#[test]
 fn record_items_omits_unshrinkable_function_output_to_enforce_serialized_item_budget() {
     let mut history = ContextManager::new();
     let token_limit = 500;

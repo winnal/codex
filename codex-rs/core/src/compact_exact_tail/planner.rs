@@ -186,6 +186,7 @@ pub(crate) fn plan_exact_tail(
         required_current_context_budget,
         final_replacement_extra_budget_tokens,
         max_model_visible_item_tokens,
+        normalized_tool_output_count: 0,
         safety_margin: budget_reservation.safety_margin,
         available_for_hot: budget_reservation.available_for_hot,
         largest_hot_item_tokens,

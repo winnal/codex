@@ -126,7 +126,7 @@ impl ContextManager {
                 continue;
             }
 
-            let processed = self.process_item(item_ref, policy);
+            let processed = process_item_for_policy(item_ref, policy);
             self.items.push(processed);
         }
     }
@@ -194,6 +194,30 @@ impl ContextManager {
         self.items = items;
         self.history_version = self.history_version.saturating_add(1);
         self.world_state_baseline = None;
+    }
+
+    pub(crate) fn normalize_tool_outputs_to_policy(&mut self, policy: TruncationPolicy) -> usize {
+        let mut normalized = 0usize;
+        for item in &mut self.items {
+            if !matches!(
+                item,
+                ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. }
+            ) {
+                continue;
+            }
+
+            let processed = process_item_for_policy(item, policy);
+            if processed != *item {
+                *item = processed;
+                normalized += 1;
+            }
+        }
+
+        if normalized > 0 {
+            self.history_version = self.history_version.saturating_add(1);
+        }
+
+        normalized
     }
 
     /// Replace image content in the last turn if it originated from a tool output.
@@ -360,53 +384,6 @@ impl ContextManager {
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
     }
 
-    fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
-        match item {
-            ResponseItem::FunctionCallOutput {
-                id,
-                call_id,
-                output,
-                internal_chat_message_metadata_passthrough: metadata,
-            } => truncate_function_output_item_to_policy(output, policy, |output| {
-                ResponseItem::FunctionCallOutput {
-                    id: id.clone(),
-                    call_id: call_id.clone(),
-                    output,
-                    internal_chat_message_metadata_passthrough: metadata.clone(),
-                }
-            }),
-            ResponseItem::CustomToolCallOutput {
-                id,
-                call_id,
-                name,
-                output,
-                internal_chat_message_metadata_passthrough: metadata,
-            } => truncate_function_output_item_to_policy(output, policy, |output| {
-                ResponseItem::CustomToolCallOutput {
-                    id: id.clone(),
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    output,
-                    internal_chat_message_metadata_passthrough: metadata.clone(),
-                }
-            }),
-            ResponseItem::Message { .. }
-            | ResponseItem::AgentMessage { .. }
-            | ResponseItem::Reasoning { .. }
-            | ResponseItem::LocalShellCall { .. }
-            | ResponseItem::FunctionCall { .. }
-            | ResponseItem::ToolSearchCall { .. }
-            | ResponseItem::ToolSearchOutput { .. }
-            | ResponseItem::WebSearchCall { .. }
-            | ResponseItem::ImageGenerationCall { .. }
-            | ResponseItem::CustomToolCall { .. }
-            | ResponseItem::Compaction { .. }
-            | ResponseItem::CompactionTrigger { .. }
-            | ResponseItem::ContextCompaction { .. }
-            | ResponseItem::Other => item.clone(),
-        }
-    }
-
     /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.
     ///
     /// Returns the adjusted cut index after removing contextual developer/user items immediately
@@ -452,6 +429,53 @@ impl ContextManager {
             }
         }
         cut_idx
+    }
+}
+
+fn process_item_for_policy(item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
+    match item {
+        ResponseItem::FunctionCallOutput {
+            id,
+            call_id,
+            output,
+            internal_chat_message_metadata_passthrough: metadata,
+        } => truncate_function_output_item_to_policy(output, policy, |output| {
+            ResponseItem::FunctionCallOutput {
+                id: id.clone(),
+                call_id: call_id.clone(),
+                output,
+                internal_chat_message_metadata_passthrough: metadata.clone(),
+            }
+        }),
+        ResponseItem::CustomToolCallOutput {
+            id,
+            call_id,
+            name,
+            output,
+            internal_chat_message_metadata_passthrough: metadata,
+        } => truncate_function_output_item_to_policy(output, policy, |output| {
+            ResponseItem::CustomToolCallOutput {
+                id: id.clone(),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                output,
+                internal_chat_message_metadata_passthrough: metadata.clone(),
+            }
+        }),
+        ResponseItem::Message { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::CompactionTrigger { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::Other => item.clone(),
     }
 }
 

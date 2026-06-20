@@ -1,4 +1,5 @@
 use super::*;
+use crate::context_manager::ContextManager;
 use crate::context_manager::model_visible_tool_output_item_token_limit;
 use codex_analytics::CompactionTrigger;
 use codex_protocol::AgentPath;
@@ -7,10 +8,13 @@ use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_bytes_for_tokens;
 use pretty_assertions::assert_eq;
 
 fn user(text: &str) -> ResponseItem {
@@ -173,6 +177,54 @@ fn planner_keeps_whole_groups_until_requested_target_is_reached() {
     assert_eq!(actual.cold_history, vec![old]);
     assert_eq!(actual.hot_suffix, vec![middle, recent]);
     assert!(actual.diagnostics.actual_hot_tokens >= target);
+}
+
+#[test]
+fn exact_tail_normalizes_legacy_tool_outputs_only_for_exact_preserve_policy() {
+    let old_policy = TruncationPolicy::Bytes(approx_bytes_for_tokens(25_000));
+    let new_policy = TruncationPolicy::Bytes(approx_bytes_for_tokens(20_000));
+    let item = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "legacy-large-output".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("legacy exact-tail output ".repeat(25_000)),
+            success: Some(true),
+        },
+        metadata: None,
+    };
+    let mut standard_history = ContextManager::new();
+    standard_history.record_items([&item], old_policy);
+    let mut exact_history = standard_history.clone();
+    let new_item_token_limit = model_visible_tool_output_item_token_limit(20_000);
+    assert!(
+        estimate_response_items_token_count(standard_history.raw_items()) > new_item_token_limit,
+        "test setup should simulate a legacy item that no longer fits the lowered config"
+    );
+
+    let standard_normalized = normalize_tool_outputs_for_exact_tail_policy(
+        &mut standard_history,
+        CompactionHistoryPolicy::Standard,
+        new_policy,
+    );
+    let exact_normalized = normalize_tool_outputs_for_exact_tail_policy(
+        &mut exact_history,
+        CompactionHistoryPolicy::PreserveRecentExact {
+            target_tokens: 1,
+            max_model_visible_item_tokens: new_item_token_limit,
+        },
+        new_policy,
+    );
+
+    assert_eq!(standard_normalized, 0);
+    assert!(
+        estimate_response_items_token_count(standard_history.raw_items()) > new_item_token_limit,
+        "standard compaction should not normalize exact-tail-only compatibility"
+    );
+    assert_eq!(exact_normalized, 1);
+    assert!(
+        estimate_response_items_token_count(exact_history.raw_items()) <= new_item_token_limit,
+        "exact-tail source history should be normalized to the active item envelope"
+    );
 }
 
 #[test]
