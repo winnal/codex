@@ -50,6 +50,34 @@ pub(super) fn set_test_compact_prompt(config: &mut Config) {
     config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
 }
 
+pub(super) fn explicitly_enable_remote_compaction_v2(config: &mut Config) {
+    let _ = config.features.enable(Feature::RemoteCompactionV2);
+    let user_config_path = codex_utils_absolute_path::AbsolutePathBuf::resolve_path_against_base(
+        codex_config::CONFIG_TOML_FILE,
+        &config.codex_home,
+    );
+    let mut user_config = config
+        .config_layer_stack
+        .effective_user_config()
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    let root = user_config
+        .as_table_mut()
+        .expect("user config root should be a table");
+    let features = root
+        .entry("features".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    features
+        .as_table_mut()
+        .expect("features config should be a table")
+        .insert(
+            Feature::RemoteCompactionV2.key().to_string(),
+            toml::Value::Boolean(true),
+        );
+    config.config_layer_stack = config
+        .config_layer_stack
+        .with_user_config(&user_config_path, user_config);
+}
+
 pub(super) fn ev_completed_with_usage(id: &str, input_tokens: i64, output_tokens: i64) -> Value {
     json!({
         "type": "response.completed",

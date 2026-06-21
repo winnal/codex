@@ -425,7 +425,7 @@ async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Resu
             set_test_compact_prompt(config);
             config.model_context_window = Some(200_000);
             config.compact_preserve_recent_tokens = Some(1);
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+            explicitly_enable_remote_compaction_v2(config);
         });
     let test = builder.build(&server).await?;
     let rollout_path = test
@@ -581,7 +581,7 @@ async fn exact_tail_remote_v2_backend_context_window_error_emits_diagnostic() ->
             set_test_compact_prompt(config);
             config.model_context_window = Some(200_000);
             config.compact_preserve_recent_tokens = Some(1);
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+            explicitly_enable_remote_compaction_v2(config);
         });
     let test = builder.build(&server).await?;
     let rollout_path = test
@@ -671,7 +671,7 @@ async fn exact_tail_remote_v2_empty_compaction_fails_without_installing_history(
             set_test_compact_prompt(config);
             config.model_context_window = Some(200_000);
             config.compact_preserve_recent_tokens = Some(1);
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+            explicitly_enable_remote_compaction_v2(config);
         });
     let test = builder.build(&server).await?;
     let rollout_path = test
@@ -780,7 +780,7 @@ async fn exact_tail_remote_v2_empty_compaction_fails_even_with_retained_old_summ
             set_test_compact_prompt(config);
             config.model_context_window = Some(200_000);
             config.compact_preserve_recent_tokens = Some(1);
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+            explicitly_enable_remote_compaction_v2(config);
         });
     let test = builder.build(&server).await?;
     let rollout_path = test
@@ -904,7 +904,7 @@ async fn exact_tail_remote_v2_enabled_auto_uses_cold_only_v2_request() -> Result
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
             config.compact_preserve_recent_tokens = Some(1);
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
+            explicitly_enable_remote_compaction_v2(config);
         });
     let test = builder.build(&server).await?;
 

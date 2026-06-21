@@ -18,6 +18,7 @@ use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::local_summary_scaffold_overhead_tokens;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
+use crate::config::Config;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -40,6 +41,7 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
+use codex_app_server_protocol::ConfigLayerSource;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -81,10 +83,55 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
 }
 
 pub(crate) fn should_use_remote_compact_task_v2(turn_context: &TurnContext) -> bool {
-    turn_context
-        .config
+    should_use_remote_compact_task_v2_for_config(&turn_context.config)
+}
+
+fn should_use_remote_compact_task_v2_for_config(config: &Config) -> bool {
+    if !config
         .features
         .enabled(codex_features::Feature::RemoteCompactionV2)
+    {
+        return false;
+    }
+
+    if matches!(
+        CompactionHistoryPolicy::from_config(config),
+        CompactionHistoryPolicy::PreserveRecentExact { .. }
+    ) && !remote_compaction_v2_explicitly_enabled(config)
+    {
+        tracing::info!(
+            exact_tail_enabled = true,
+            implementation = "remote",
+            bypassed_implementation = "remote_v2",
+            "exact-tail compaction bypassed default remote v2 route"
+        );
+        return false;
+    }
+
+    true
+}
+
+fn remote_compaction_v2_explicitly_enabled(config: &Config) -> bool {
+    config
+        .config_layer_stack
+        .layers_high_to_low()
+        .into_iter()
+        .filter(|layer| {
+            matches!(
+                layer.name,
+                ConfigLayerSource::User { .. } | ConfigLayerSource::Project { .. }
+            )
+        })
+        .find_map(remote_compaction_v2_layer_value)
+        .unwrap_or(false)
+}
+
+fn remote_compaction_v2_layer_value(layer: &codex_config::ConfigLayerEntry) -> Option<bool> {
+    layer
+        .config
+        .get("features")?
+        .get(codex_features::Feature::RemoteCompactionV2.key())?
+        .as_bool()
 }
 
 pub(crate) async fn run_inline_auto_compact_task(

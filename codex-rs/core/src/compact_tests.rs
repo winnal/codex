@@ -1,4 +1,10 @@
 use super::*;
+use crate::config::Config;
+use crate::config::ConfigBuilder;
+use codex_app_server_protocol::ConfigLayerSource;
+use codex_config::ConfigLayerEntry;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
@@ -273,6 +279,194 @@ fn should_use_remote_compact_task_for_azure_provider() {
 
     assert!(should_use_remote_compact_task(&provider));
 }
+
+async fn load_config(config_toml: &str) -> Config {
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    if !config_toml.is_empty() {
+        std::fs::write(
+            codex_home.path().join(codex_config::CONFIG_TOML_FILE),
+            config_toml,
+        )
+        .expect("write config");
+    }
+    ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("load config")
+}
+
+fn add_remote_compaction_v2_layer(config: &mut Config, name: ConfigLayerSource, enabled: bool) {
+    let mut layers = config
+        .config_layer_stack
+        .get_layers(
+            ConfigLayerStackOrdering::LowestPrecedenceFirst,
+            /*include_disabled*/ true,
+        )
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let layer = ConfigLayerEntry::new(
+        name,
+        toml::toml! {
+            [features]
+            remote_compaction_v2 = enabled
+        }
+        .into(),
+    );
+    match layer.name {
+        ConfigLayerSource::Project { .. } => {
+            let index = layers
+                .iter()
+                .rposition(|existing| matches!(existing.name, ConfigLayerSource::Project { .. }))
+                .map(|index| index + 1)
+                .unwrap_or_else(|| {
+                    layers
+                        .iter()
+                        .position(|existing| existing.name.precedence() > layer.name.precedence())
+                        .unwrap_or(layers.len())
+                });
+            layers.insert(index, layer);
+        }
+        _ => {
+            let index = layers
+                .iter()
+                .position(|existing| existing.name.precedence() > layer.name.precedence())
+                .unwrap_or(layers.len());
+            layers.insert(index, layer);
+        }
+    }
+    config.config_layer_stack = ConfigLayerStack::new(
+        layers,
+        config.config_layer_stack.requirements().clone(),
+        config.config_layer_stack.requirements_toml().clone(),
+    )
+    .expect("build config layer stack");
+    if enabled {
+        let _ = config
+            .features
+            .enable(codex_features::Feature::RemoteCompactionV2);
+    } else {
+        let _ = config
+            .features
+            .disable(codex_features::Feature::RemoteCompactionV2);
+    }
+}
+
+fn add_session_remote_compaction_v2_flag(config: &mut Config, enabled: bool) {
+    add_remote_compaction_v2_layer(config, ConfigLayerSource::SessionFlags, enabled);
+}
+
+fn add_project_remote_compaction_v2_flag(config: &mut Config, enabled: bool) {
+    add_remote_compaction_v2_layer(
+        config,
+        ConfigLayerSource::Project {
+            dot_codex_folder: config.cwd.join(".codex-test-exact-tail"),
+        },
+        enabled,
+    );
+}
+
+#[tokio::test]
+async fn remote_compaction_v2_route_uses_default_without_exact_tail() {
+    let config = load_config("").await;
+
+    assert!(
+        config
+            .features
+            .enabled(codex_features::Feature::RemoteCompactionV2)
+    );
+    assert!(should_use_remote_compact_task_v2_for_config(&config));
+}
+
+#[tokio::test]
+async fn exact_tail_remote_compaction_v2_requires_explicit_enablement() {
+    let config = load_config("compact_preserve_recent_tokens = 60000\n").await;
+
+    assert!(
+        config
+            .features
+            .enabled(codex_features::Feature::RemoteCompactionV2)
+    );
+    assert!(!should_use_remote_compact_task_v2_for_config(&config));
+}
+
+#[tokio::test]
+async fn exact_tail_remote_compaction_v2_honors_explicit_enablement() {
+    let config = load_config(
+        r#"compact_preserve_recent_tokens = 60000
+
+[features]
+remote_compaction_v2 = true
+"#,
+    )
+    .await;
+
+    assert!(should_use_remote_compact_task_v2_for_config(&config));
+}
+
+#[tokio::test]
+async fn exact_tail_remote_compaction_v2_honors_explicit_disablement() {
+    let config = load_config(
+        r#"compact_preserve_recent_tokens = 60000
+
+[features]
+remote_compaction_v2 = false
+"#,
+    )
+    .await;
+
+    assert!(
+        !config
+            .features
+            .enabled(codex_features::Feature::RemoteCompactionV2)
+    );
+    assert!(!should_use_remote_compact_task_v2_for_config(&config));
+}
+
+#[tokio::test]
+async fn exact_tail_remote_compaction_v2_honors_project_enablement() {
+    let mut config = load_config("compact_preserve_recent_tokens = 60000\n").await;
+    add_project_remote_compaction_v2_flag(&mut config, true);
+
+    assert!(should_use_remote_compact_task_v2_for_config(&config));
+}
+
+#[tokio::test]
+async fn exact_tail_remote_compaction_v2_honors_project_disablement_over_user_enablement() {
+    let mut config = load_config(
+        r#"compact_preserve_recent_tokens = 60000
+
+[features]
+remote_compaction_v2 = true
+"#,
+    )
+    .await;
+    add_project_remote_compaction_v2_flag(&mut config, false);
+
+    assert!(!should_use_remote_compact_task_v2_for_config(&config));
+}
+
+#[tokio::test]
+async fn exact_tail_remote_compaction_v2_ignores_session_flag_enablement() {
+    let mut config = load_config(
+        r#"compact_preserve_recent_tokens = 60000
+
+[features]
+remote_compaction_v2 = false
+"#,
+    )
+    .await;
+    add_session_remote_compaction_v2_flag(&mut config, true);
+
+    assert!(
+        config
+            .features
+            .enabled(codex_features::Feature::RemoteCompactionV2)
+    );
+    assert!(!should_use_remote_compact_task_v2_for_config(&config));
+}
+
 #[tokio::test]
 async fn process_compacted_history_replaces_developer_messages() {
     let compacted_history = vec![
