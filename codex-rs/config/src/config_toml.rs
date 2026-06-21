@@ -36,6 +36,7 @@ use codex_model_provider_info::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR;
 use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::config_types::CompactExactTailStrategy;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
@@ -178,6 +179,16 @@ pub struct ConfigToml {
     /// when it cannot safely preserve the requested recent suffix.
     #[schemars(range(min = 1))]
     pub compact_preserve_recent_tokens: Option<i64>,
+
+    /// Exact-tail compaction strategy. Only applies when
+    /// `compact_preserve_recent_tokens` is set.
+    pub compact_exact_tail_strategy: Option<CompactExactTailStrategy>,
+
+    /// Retained cold-message budget for the semantic transcript exact-tail
+    /// strategy. Only applies when `compact_exact_tail_strategy` is
+    /// `semantic_transcript`.
+    #[schemars(range(min = 10000, max = 64000))]
+    pub compact_exact_tail_semantic_transcript_retained_message_token_budget: Option<i64>,
 
     /// Default approval policy for executing commands.
     pub approval_policy: Option<AskForApproval>,

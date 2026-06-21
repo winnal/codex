@@ -1061,6 +1061,47 @@ pub async fn mount_compact_json_once(server: &MockServer, body: serde_json::Valu
     .await
 }
 
+/// Mount a `/responses/compact` mock that returns each JSON response body in order.
+pub async fn mount_compact_json_sequence(
+    server: &MockServer,
+    bodies: Vec<serde_json::Value>,
+) -> ResponseMock {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Debug)]
+    struct JsonSequenceResponder {
+        num_calls: AtomicUsize,
+        bodies: Vec<serde_json::Value>,
+    }
+
+    impl Respond for JsonSequenceResponder {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
+            let body = self
+                .bodies
+                .get(call_num)
+                .expect("missing body for compact request");
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(body.clone())
+        }
+    }
+
+    let num_calls = bodies.len();
+    let responder = JsonSequenceResponder {
+        num_calls: AtomicUsize::new(0),
+        bodies,
+    };
+    let (mock, response_mock) = compact_mock();
+    mock.respond_with(responder)
+        .up_to_n_times(num_calls as u64)
+        .expect(num_calls as u64)
+        .mount(server)
+        .await;
+    response_mock
+}
+
 /// Mount a `/responses/compact` mock that mirrors the default remote compaction shape:
 /// keep user+developer messages from the request, drop assistant/tool artifacts, and append one
 /// compaction item carrying the provided summary text.

@@ -48,6 +48,7 @@ mod compact;
 mod compact_exact_tail_flow;
 mod compact_exact_tail_local;
 mod compact_exact_tail_remote;
+mod compact_exact_tail_semantic_transcript;
 mod compact_exact_tail_support;
 mod compact_remote;
 mod compact_remote_parity;

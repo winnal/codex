@@ -72,6 +72,7 @@ use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
 use codex_models_manager::bundled_models_response;
 use codex_network_proxy::NetworkMode;
+use codex_protocol::config_types::CompactExactTailStrategy;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::models::ActivePermissionProfile;
@@ -6896,6 +6897,94 @@ async fn load_config_sets_compact_preserve_recent_tokens() -> std::io::Result<()
     .await?;
 
     assert_eq!(config.compact_preserve_recent_tokens, Some(120_000));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_sets_exact_tail_semantic_transcript_strategy() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let cfg = ConfigToml {
+        compact_preserve_recent_tokens: Some(60_000),
+        compact_exact_tail_strategy: Some(CompactExactTailStrategy::SemanticTranscript),
+        compact_exact_tail_semantic_transcript_retained_message_token_budget: Some(32_000),
+        ..Default::default()
+    };
+
+    let config = Config::load_from_base_config_with_overrides(
+        cfg,
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.compact_exact_tail_strategy,
+        CompactExactTailStrategy::SemanticTranscript
+    );
+    assert_eq!(
+        config.compact_exact_tail_semantic_transcript_retained_message_token_budget,
+        32_000
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn semantic_transcript_retained_budget_defaults_and_validates() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml {
+            compact_exact_tail_strategy: Some(CompactExactTailStrategy::SemanticTranscript),
+            ..Default::default()
+        },
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+    assert_eq!(
+        config.compact_exact_tail_semantic_transcript_retained_message_token_budget,
+        32_000
+    );
+
+    for valid in [10_000, 32_000, 64_000] {
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                compact_exact_tail_semantic_transcript_retained_message_token_budget: Some(valid),
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
+        assert_eq!(
+            config.compact_exact_tail_semantic_transcript_retained_message_token_budget,
+            valid
+        );
+    }
+
+    for invalid in [-1, 0, 9_999, 64_001] {
+        let codex_home = TempDir::new()?;
+        let error = Config::load_from_base_config_with_overrides(
+            ConfigToml {
+                compact_exact_tail_semantic_transcript_retained_message_token_budget: Some(invalid),
+                ..Default::default()
+            },
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await
+        .expect_err("invalid semantic transcript retained budget should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            error
+                .to_string()
+                .contains("compact_exact_tail_semantic_transcript_retained_message_token_budget"),
+            "error should name semantic transcript budget, got {error}"
+        );
+    }
 
     Ok(())
 }

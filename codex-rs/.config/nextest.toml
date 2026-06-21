@@ -25,6 +25,9 @@ max-threads = 4
 [test-groups.core_apply_patch_cli_integration]
 max-threads = 1
 
+[test-groups.core_exact_tail_compaction_integration]
+max-threads = 1
+
 [test-groups.windows_sandbox_legacy_sessions]
 max-threads = 1
 
@@ -61,6 +64,14 @@ test-group = 'app_server_integration_local'
 # sensitive to Windows runner process-startup stalls when many cases launch at once.
 filter = 'package(codex-core) & kind(test) & test(apply_patch_cli)'
 test-group = 'core_apply_patch_cli_integration'
+
+[[profile.default.overrides]]
+# These integration tests run full Codex compaction turns against per-test mock
+# servers. Parallel cases can exceed the local 30s slow timeout even when each
+# case passes in isolation.
+filter = 'package(codex-core) & kind(test) & (test(compact_exact_tail_remote) | test(compact_exact_tail_semantic_transcript))'
+test-group = 'core_exact_tail_compaction_integration'
+slow-timeout = { period = "45s", terminate-after = 2 }
 
 [[profile.default.overrides]]
 # These tests create restricted-token Windows child processes and private desktops.

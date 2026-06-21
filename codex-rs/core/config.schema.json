@@ -382,6 +382,39 @@
       },
       "type": "object"
     },
+    "CompactExactTailStrategy": {
+      "description": "Selects which exact-tail compaction implementation to use when `compact_preserve_recent_tokens` is active.",
+      "oneOf": [
+        {
+          "description": "Preserve existing compatibility routing.",
+          "enum": [
+            "auto"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use the legacy remote compaction endpoint.",
+          "enum": [
+            "remote_legacy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use remote compaction v2.",
+          "enum": [
+            "remote_v2"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use semantic transcript input with the legacy remote compaction endpoint.",
+          "enum": [
+            "semantic_transcript"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "ConfigProfile": {
       "additionalProperties": false,
       "description": "Collection of common configuration options that a user can define as a unit in `config.toml`.",
@@ -4641,6 +4674,21 @@
       ],
       "default": null,
       "description": "Preferred backend for storing CLI auth credentials. file (default): Use a file in the Codex home directory. keyring: Use an OS-specific keyring service. auto: Use the keyring if available, otherwise use a file."
+    },
+    "compact_exact_tail_semantic_transcript_retained_message_token_budget": {
+      "description": "Retained cold-message budget for the semantic transcript exact-tail strategy. Only applies when `compact_exact_tail_strategy` is `semantic_transcript`.",
+      "format": "int64",
+      "maximum": 64000.0,
+      "minimum": 10000.0,
+      "type": "integer"
+    },
+    "compact_exact_tail_strategy": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CompactExactTailStrategy"
+        }
+      ],
+      "description": "Exact-tail compaction strategy. Only applies when `compact_preserve_recent_tokens` is set."
     },
     "compact_preserve_recent_tokens": {
       "description": "Approximate number of recent conversation tokens to preserve exactly when compaction summarizes older history.\n\nThis is a whole-group target, not an exact guarantee. Exact-tail compaction fails closed instead of falling back to standard compaction when it cannot safely preserve the requested recent suffix.",

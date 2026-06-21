@@ -86,6 +86,7 @@ use codex_model_provider_info::merge_configured_model_providers;
 use codex_models_manager::ModelsManagerConfig;
 use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::config_types::CompactExactTailStrategy;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
@@ -637,6 +638,13 @@ pub struct Config {
     /// Approximate recent conversation-token target to preserve exactly during
     /// compaction. `None` keeps standard compaction behavior.
     pub compact_preserve_recent_tokens: Option<i64>,
+
+    /// Exact-tail compaction implementation strategy.
+    pub compact_exact_tail_strategy: CompactExactTailStrategy,
+
+    /// Retained cold-message token budget for semantic transcript exact-tail
+    /// compaction.
+    pub compact_exact_tail_semantic_transcript_retained_message_token_budget: i64,
 
     /// Key into the model_providers map that specifies which provider to use.
     pub model_provider_id: String,
@@ -3576,6 +3584,15 @@ impl Config {
                 "`compact_preserve_recent_tokens` must be a positive integer when set",
             ));
         }
+        if let Some(tokens) =
+            cfg.compact_exact_tail_semantic_transcript_retained_message_token_budget
+            && !(10_000..=64_000).contains(&tokens)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "`compact_exact_tail_semantic_transcript_retained_message_token_budget` must be between 10000 and 64000 when set",
+            ));
+        }
 
         // Load base instructions override from a file if specified. If the
         // path is relative, resolve it against the effective cwd so the
@@ -3768,6 +3785,10 @@ impl Config {
                 .model_auto_compact_token_limit_scope
                 .unwrap_or_default(),
             compact_preserve_recent_tokens: cfg.compact_preserve_recent_tokens,
+            compact_exact_tail_strategy: cfg.compact_exact_tail_strategy.unwrap_or_default(),
+            compact_exact_tail_semantic_transcript_retained_message_token_budget: cfg
+                .compact_exact_tail_semantic_transcript_retained_message_token_budget
+                .unwrap_or(32_000),
             model_provider_id,
             model_provider,
             cwd: resolved_cwd,

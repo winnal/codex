@@ -604,6 +604,14 @@ fn validate_config_toml(config: &ConfigToml) -> anyhow::Result<()> {
     {
         anyhow::bail!("`compact_preserve_recent_tokens` must be a positive integer when set");
     }
+    if let Some(tokens) =
+        config.compact_exact_tail_semantic_transcript_retained_message_token_budget
+        && !(10_000..=64_000).contains(&tokens)
+    {
+        anyhow::bail!(
+            "`compact_exact_tail_semantic_transcript_retained_message_token_budget` must be between 10000 and 64000 when set"
+        );
+    }
     Ok(())
 }
 

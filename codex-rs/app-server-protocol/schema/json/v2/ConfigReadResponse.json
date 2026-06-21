@@ -237,6 +237,39 @@
         }
       ]
     },
+    "CompactExactTailStrategy": {
+      "description": "Selects which exact-tail compaction implementation to use when `compact_preserve_recent_tokens` is active.",
+      "oneOf": [
+        {
+          "description": "Preserve existing compatibility routing.",
+          "enum": [
+            "auto"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use the legacy remote compaction endpoint.",
+          "enum": [
+            "remote_legacy"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use remote compaction v2.",
+          "enum": [
+            "remote_v2"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Use semantic transcript input with the legacy remote compaction endpoint.",
+          "enum": [
+            "semantic_transcript"
+          ],
+          "type": "string"
+        }
+      ]
+    },
     "Config": {
       "additionalProperties": true,
       "properties": {
@@ -270,6 +303,25 @@
             }
           ],
           "description": "[UNSTABLE] Optional default for where approval requests are routed for review."
+        },
+        "compact_exact_tail_semantic_transcript_retained_message_token_budget": {
+          "format": "int64",
+          "maximum": 64000.0,
+          "minimum": 10000.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "compact_exact_tail_strategy": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CompactExactTailStrategy"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "compact_preserve_recent_tokens": {
           "format": "int64",

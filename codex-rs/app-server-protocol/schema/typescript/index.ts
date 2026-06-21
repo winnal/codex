@@ -12,6 +12,7 @@ export type { ClientInfo } from "./ClientInfo";
 export type { ClientNotification } from "./ClientNotification";
 export type { ClientRequest } from "./ClientRequest";
 export type { CollaborationMode } from "./CollaborationMode";
+export type { CompactExactTailStrategy } from "./CompactExactTailStrategy";
 export type { ContentItem } from "./ContentItem";
 export type { ConversationGitInfo } from "./ConversationGitInfo";
 export type { ConversationSummary } from "./ConversationSummary";

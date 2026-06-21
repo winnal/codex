@@ -1,4 +1,5 @@
 use super::*;
+use crate::compact_route::compact_route_for_config;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
 use codex_app_server_protocol::ConfigLayerSource;
@@ -7,6 +8,8 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
+use codex_protocol::config_types::CompactExactTailStrategy;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use pretty_assertions::assert_eq;
@@ -465,6 +468,118 @@ remote_compaction_v2 = false
             .enabled(codex_features::Feature::RemoteCompactionV2)
     );
     assert!(!should_use_remote_compact_task_v2_for_config(&config));
+}
+
+#[tokio::test]
+async fn semantic_transcript_strategy_routes_to_semantic_transcript_regardless_of_v2_setting() {
+    for config_toml in [
+        r#"compact_preserve_recent_tokens = 60000
+compact_exact_tail_strategy = "semantic_transcript"
+"#,
+        r#"compact_preserve_recent_tokens = 60000
+compact_exact_tail_strategy = "semantic_transcript"
+
+[features]
+remote_compaction_v2 = false
+"#,
+        r#"compact_preserve_recent_tokens = 60000
+compact_exact_tail_strategy = "semantic_transcript"
+
+[features]
+remote_compaction_v2 = true
+"#,
+    ] {
+        let config = load_config(config_toml).await;
+        assert_eq!(
+            config.compact_exact_tail_strategy,
+            CompactExactTailStrategy::SemanticTranscript
+        );
+        assert_eq!(
+            compact_route_for_config(&config, &config.model_provider).expect("route"),
+            CompactRoute::SemanticTranscript
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_tail_auto_route_preserves_remote_v2_explicit_source_semantics() {
+    let config = load_config("compact_preserve_recent_tokens = 60000\n").await;
+    assert_eq!(
+        compact_route_for_config(&config, &config.model_provider).expect("route"),
+        CompactRoute::RemoteLegacy
+    );
+
+    let config = load_config(
+        r#"compact_preserve_recent_tokens = 60000
+
+[features]
+remote_compaction_v2 = true
+"#,
+    )
+    .await;
+    assert_eq!(
+        compact_route_for_config(&config, &config.model_provider).expect("route"),
+        CompactRoute::RemoteV2
+    );
+
+    let config = load_config(
+        r#"compact_preserve_recent_tokens = 60000
+
+[features]
+remote_compaction_v2 = false
+"#,
+    )
+    .await;
+    assert_eq!(
+        compact_route_for_config(&config, &config.model_provider).expect("route"),
+        CompactRoute::RemoteLegacy
+    );
+}
+
+#[tokio::test]
+async fn exact_tail_remote_legacy_strategy_routes_to_legacy_even_when_v2_enabled() {
+    let config = load_config(
+        r#"compact_preserve_recent_tokens = 60000
+compact_exact_tail_strategy = "remote_legacy"
+
+[features]
+remote_compaction_v2 = true
+"#,
+    )
+    .await;
+
+    assert_eq!(
+        compact_route_for_config(&config, &config.model_provider).expect("route"),
+        CompactRoute::RemoteLegacy
+    );
+}
+
+#[tokio::test]
+async fn exact_tail_explicit_remote_strategies_fail_when_remote_unavailable() {
+    for (strategy, route_name) in [
+        ("remote_legacy", "remote"),
+        ("remote_v2", "remote_v2"),
+        ("semantic_transcript", "semantic_transcript"),
+    ] {
+        let mut config = load_config(&format!(
+            r#"compact_preserve_recent_tokens = 60000
+compact_exact_tail_strategy = "{strategy}"
+"#
+        ))
+        .await;
+        config.model_provider.name = "Example".to_string();
+        config.model_provider.base_url = Some("https://example.com/v1".to_string());
+
+        let err = compact_route_for_config(&config, &config.model_provider)
+            .expect_err("explicit exact-tail remote strategy should fail without remote provider");
+        let CodexErr::Stream(message, _) = err else {
+            panic!("expected stream error for {strategy}");
+        };
+        assert!(
+            message.contains(route_name),
+            "error should name unavailable route {route_name}: {message}"
+        );
+    }
 }
 
 #[tokio::test]

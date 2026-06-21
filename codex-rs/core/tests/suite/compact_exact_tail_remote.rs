@@ -50,14 +50,11 @@ async fn exact_tail_remote_legacy_manual_compact_excludes_newest_atomic_hot_suff
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn(&cold_user).await?;
-    test.submit_turn(&hot_user).await?;
+    submit_turn(&test, &cold_user).await?;
+    submit_turn(&test, &hot_user).await?;
     test.codex.submit(Op::Compact).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-    test.submit_turn("REMOTE_FOLLOW_UP_USER").await?;
+    wait_for_compact_turn_complete(&test).await;
+    submit_turn(&test, "REMOTE_FOLLOW_UP_USER").await?;
 
     let compact_request = compact_mock.single_request();
     let compact_body = compact_request.body_json().to_string();
@@ -104,6 +101,33 @@ async fn exact_tail_remote_legacy_manual_compact_excludes_newest_atomic_hot_suff
 
     shutdown_codex(&test).await?;
     Ok(())
+}
+
+async fn submit_turn(test: &TestCodex, prompt: &str) -> Result<()> {
+    test.submit_turn_with_completion_timeout(prompt, Duration::from_secs(90))
+        .await
+}
+
+async fn wait_for_compact_turn_complete(test: &TestCodex) {
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(90),
+    )
+    .await;
+}
+
+async fn wait_for_error_message(test: &TestCodex) -> String {
+    let event = wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::Error(_)),
+        Duration::from_secs(90),
+    )
+    .await;
+    let EventMsg::Error(err) = event else {
+        unreachable!("predicate should only match error events");
+    };
+    err.message
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -161,9 +185,9 @@ async fn exact_tail_remote_legacy_auto_compact_excludes_newest_atomic_hot_suffix
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn(&cold_user).await?;
-    test.submit_turn(&hot_user).await?;
-    test.submit_turn("REMOTE_AUTO_FOLLOW_UP_USER").await?;
+    submit_turn(&test, &cold_user).await?;
+    submit_turn(&test, &hot_user).await?;
+    submit_turn(&test, "REMOTE_AUTO_FOLLOW_UP_USER").await?;
 
     let compact_request = compact_mock.single_request();
     let compact_body = compact_request.body_json().to_string();
@@ -256,14 +280,10 @@ async fn exact_tail_remote_legacy_user_only_output_fails_without_installing_hist
         .clone()
         .expect("rollout path");
 
-    test.submit_turn("REMOTE_USER_ONLY_COLD_USER").await?;
-    test.submit_turn("REMOTE_USER_ONLY_HOT_USER").await?;
+    submit_turn(&test, "REMOTE_USER_ONLY_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_USER_ONLY_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = wait_for_error_message(&test).await;
 
     assert!(
         error_message.contains("ExactTailNoUsableColdSummary"),
@@ -332,14 +352,10 @@ async fn exact_tail_remote_legacy_backend_context_window_error_emits_diagnostic(
         .clone()
         .expect("rollout path");
 
-    test.submit_turn("REMOTE_LEGACY_BACKEND_COLD_USER").await?;
-    test.submit_turn("REMOTE_LEGACY_BACKEND_HOT_USER").await?;
+    submit_turn(&test, "REMOTE_LEGACY_BACKEND_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_LEGACY_BACKEND_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = wait_for_error_message(&test).await;
 
     assert!(
         error_message.contains("ExactTailBackendContextExceeded"),
@@ -434,16 +450,11 @@ async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Resu
         .clone()
         .expect("rollout path");
 
-    test.submit_turn("REMOTE_V2_ROUTE_COLD_USER").await?;
-    test.submit_turn("REMOTE_V2_ROUTE_HOT_USER").await?;
+    submit_turn(&test, "REMOTE_V2_ROUTE_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_V2_ROUTE_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
-    wait_for_event_with_timeout(
-        &test.codex,
-        |event| matches!(event, EventMsg::TurnComplete(_)),
-        Duration::from_secs(90),
-    )
-    .await;
-    test.submit_turn("REMOTE_V2_ROUTE_FOLLOW_UP_USER").await?;
+    wait_for_compact_turn_complete(&test).await;
+    submit_turn(&test, "REMOTE_V2_ROUTE_FOLLOW_UP_USER").await?;
 
     let requests = response_mock.requests();
     assert_eq!(
@@ -590,14 +601,10 @@ async fn exact_tail_remote_v2_backend_context_window_error_emits_diagnostic() ->
         .clone()
         .expect("rollout path");
 
-    test.submit_turn("REMOTE_V2_BACKEND_COLD_USER").await?;
-    test.submit_turn("REMOTE_V2_BACKEND_HOT_USER").await?;
+    submit_turn(&test, "REMOTE_V2_BACKEND_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_V2_BACKEND_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = wait_for_error_message(&test).await;
 
     assert!(
         error_message.contains("ExactTailBackendContextExceeded"),
@@ -680,14 +687,10 @@ async fn exact_tail_remote_v2_empty_compaction_fails_without_installing_history(
         .clone()
         .expect("rollout path");
 
-    test.submit_turn("REMOTE_V2_EMPTY_COLD_USER").await?;
-    test.submit_turn("REMOTE_V2_EMPTY_HOT_USER").await?;
+    submit_turn(&test, "REMOTE_V2_EMPTY_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_V2_EMPTY_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = wait_for_error_message(&test).await;
 
     assert!(
         error_message.contains("ExactTailNoUsableColdSummary"),
@@ -790,17 +793,11 @@ async fn exact_tail_remote_v2_empty_compaction_fails_even_with_retained_old_summ
         .expect("rollout path");
     let old_summary_user = summary_with_prefix("REMOTE_V2_OLD_RETAINED_SUMMARY");
 
-    test.submit_turn(&old_summary_user).await?;
-    test.submit_turn("REMOTE_V2_NEWLY_COLD_POST_SUMMARY_USER")
-        .await?;
-    test.submit_turn("REMOTE_V2_EMPTY_WITH_OLD_SUMMARY_HOT_USER")
-        .await?;
+    submit_turn(&test, &old_summary_user).await?;
+    submit_turn(&test, "REMOTE_V2_NEWLY_COLD_POST_SUMMARY_USER").await?;
+    submit_turn(&test, "REMOTE_V2_EMPTY_WITH_OLD_SUMMARY_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = wait_for_error_message(&test).await;
 
     assert!(
         error_message.contains("ExactTailNoUsableColdSummary"),
@@ -908,10 +905,9 @@ async fn exact_tail_remote_v2_enabled_auto_uses_cold_only_v2_request() -> Result
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn("REMOTE_V2_ROUTE_AUTO_COLD_USER").await?;
-    test.submit_turn("REMOTE_V2_ROUTE_AUTO_HOT_USER").await?;
-    test.submit_turn("REMOTE_V2_ROUTE_AUTO_FOLLOW_UP_USER")
-        .await?;
+    submit_turn(&test, "REMOTE_V2_ROUTE_AUTO_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_V2_ROUTE_AUTO_HOT_USER").await?;
+    submit_turn(&test, "REMOTE_V2_ROUTE_AUTO_FOLLOW_UP_USER").await?;
 
     let requests = response_mock.requests();
     assert_eq!(

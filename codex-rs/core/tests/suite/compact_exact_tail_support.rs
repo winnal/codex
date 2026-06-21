@@ -17,6 +17,7 @@ pub(super) use core_test_support::responses::ev_completed;
 pub(super) use core_test_support::responses::ev_completed_with_tokens;
 pub(super) use core_test_support::responses::ev_function_call;
 pub(super) use core_test_support::responses::mount_compact_json_once;
+pub(super) use core_test_support::responses::mount_compact_json_sequence;
 pub(super) use core_test_support::responses::mount_compact_response_once;
 pub(super) use core_test_support::responses::mount_sse_sequence;
 pub(super) use core_test_support::responses::sse;

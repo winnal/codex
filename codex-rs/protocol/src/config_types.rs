@@ -36,6 +36,26 @@ pub enum AutoCompactTokenLimitScope {
     BodyAfterPrefix,
 }
 
+/// Selects which exact-tail compaction implementation to use when
+/// `compact_preserve_recent_tokens` is active.
+#[derive(
+    Debug, Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS,
+)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CompactExactTailStrategy {
+    /// Preserve existing compatibility routing.
+    #[default]
+    Auto,
+    /// Use the legacy remote compaction endpoint.
+    RemoteLegacy,
+    /// Use remote compaction v2.
+    RemoteV2,
+    /// Use semantic transcript input with the legacy remote compaction endpoint.
+    SemanticTranscript,
+}
+
 /// A summary of the reasoning performed by the model. This can be useful for
 /// debugging and understanding the model's reasoning process.
 /// See https://platform.openai.com/docs/guides/reasoning?api-mode=responses#reasoning-summaries

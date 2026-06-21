@@ -23,6 +23,8 @@ mod compact_exact_tail;
 mod compact_remote;
 mod compact_remote_v2;
 mod compact_remote_v2_retention;
+mod compact_route;
+mod compact_semantic_transcript;
 mod config_lock;
 pub use codex_thread::BackgroundTerminalInfo;
 pub use codex_thread::CodexThread;

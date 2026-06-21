@@ -193,6 +193,16 @@ pub(crate) fn plan_exact_tail(
         post_summary_cold_reserve_target_tokens: post_summary_cold_reserve.target_tokens,
         post_summary_cold_reserve_tokens: post_summary_cold_reserve.tokens,
         post_summary_cold_reserve_group_count: post_summary_cold_reserve.group_count,
+        actual_summary_tokens: None,
+        attempted_replacement_tokens_estimate: None,
+        attempted_final_replacement_tokens_estimate: None,
+        semantic_transcript_tokens: None,
+        semantic_transcript_item_count: None,
+        semantic_transcript_tool_observation_count: None,
+        raw_cold_tokens: None,
+        semantic_transcript_reduction_tokens: None,
+        retained_cold_message_tokens: None,
+        retained_cold_message_count: None,
     };
     trace_plan(&diagnostics);
     Ok(ExactTailPlan {

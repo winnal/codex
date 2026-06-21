@@ -5,6 +5,7 @@ use super::WindowsSandboxSetupMode;
 use super::shared::default_enabled;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
+use codex_protocol::config_types::CompactExactTailStrategy;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::Verbosity;
@@ -249,6 +250,9 @@ pub struct Config {
     pub model_auto_compact_token_limit_scope: Option<AutoCompactTokenLimitScope>,
     #[schemars(range(min = 1))]
     pub compact_preserve_recent_tokens: Option<i64>,
+    pub compact_exact_tail_strategy: Option<CompactExactTailStrategy>,
+    #[schemars(range(min = 10000, max = 64000))]
+    pub compact_exact_tail_semantic_transcript_retained_message_token_budget: Option<i64>,
     pub model_provider: Option<String>,
     #[experimental(nested)]
     pub approval_policy: Option<AskForApproval>,

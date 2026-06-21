@@ -18,6 +18,8 @@ use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::local_summary_scaffold_overhead_tokens;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
+pub(crate) use crate::compact_route::CompactRoute;
+pub(crate) use crate::compact_route::compact_route;
 use crate::config::Config;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
@@ -82,11 +84,12 @@ pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bo
     provider.supports_remote_compaction()
 }
 
+#[cfg(test)]
 pub(crate) fn should_use_remote_compact_task_v2(turn_context: &TurnContext) -> bool {
     should_use_remote_compact_task_v2_for_config(&turn_context.config)
 }
 
-fn should_use_remote_compact_task_v2_for_config(config: &Config) -> bool {
+pub(crate) fn should_use_remote_compact_task_v2_for_config(config: &Config) -> bool {
     if !config
         .features
         .enabled(codex_features::Feature::RemoteCompactionV2)

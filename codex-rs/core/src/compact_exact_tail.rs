@@ -399,11 +399,15 @@ pub(crate) async fn emit_exact_tail_compaction_diagnostic(
     event.raw_item_count = Some(diagnostics.raw_item_count);
     event.group_count = Some(diagnostics.group_count);
     event.cold_tokens = Some(diagnostics.cold_tokens);
-    event.summary_tokens = replacement.map(|replacement| replacement.actual_summary_tokens);
-    event.replacement_tokens_estimate =
-        replacement.map(|replacement| replacement.replacement_tokens_estimate);
-    event.final_replacement_tokens_estimate =
-        replacement.map(|replacement| replacement.final_replacement_tokens_estimate);
+    event.summary_tokens = replacement
+        .map(|replacement| replacement.actual_summary_tokens)
+        .or(diagnostics.actual_summary_tokens);
+    event.replacement_tokens_estimate = replacement
+        .map(|replacement| replacement.replacement_tokens_estimate)
+        .or(diagnostics.attempted_replacement_tokens_estimate);
+    event.final_replacement_tokens_estimate = replacement
+        .map(|replacement| replacement.final_replacement_tokens_estimate)
+        .or(diagnostics.attempted_final_replacement_tokens_estimate);
     event.effective_replacement_budget = Some(diagnostics.effective_replacement_budget);
     event.safety_margin = Some(diagnostics.safety_margin);
     event.max_model_visible_item_tokens = Some(diagnostics.max_model_visible_item_tokens);
@@ -433,6 +437,14 @@ pub(crate) async fn emit_exact_tail_compaction_diagnostic(
     event.post_summary_cold_reserve_tokens = Some(diagnostics.post_summary_cold_reserve_tokens);
     event.post_summary_cold_reserve_group_count =
         Some(diagnostics.post_summary_cold_reserve_group_count);
+    event.semantic_transcript_tokens = diagnostics.semantic_transcript_tokens;
+    event.semantic_transcript_item_count = diagnostics.semantic_transcript_item_count;
+    event.semantic_transcript_tool_observation_count =
+        diagnostics.semantic_transcript_tool_observation_count;
+    event.raw_cold_tokens = diagnostics.raw_cold_tokens;
+    event.semantic_transcript_reduction_tokens = diagnostics.semantic_transcript_reduction_tokens;
+    event.retained_cold_message_tokens = diagnostics.retained_cold_message_tokens;
+    event.retained_cold_message_count = diagnostics.retained_cold_message_count;
     sess.send_event(turn_context, EventMsg::ExactTailCompactionDiagnostic(event))
         .await;
 }
@@ -506,6 +518,13 @@ fn exact_tail_diagnostic_event(
         post_summary_cold_reserve_target_tokens: None,
         post_summary_cold_reserve_tokens: None,
         post_summary_cold_reserve_group_count: None,
+        semantic_transcript_tokens: None,
+        semantic_transcript_item_count: None,
+        semantic_transcript_tool_observation_count: None,
+        raw_cold_tokens: None,
+        semantic_transcript_reduction_tokens: None,
+        retained_cold_message_tokens: None,
+        retained_cold_message_count: None,
     }
 }
 
@@ -514,6 +533,7 @@ fn diagnostic_route(implementation: ExactTailImplementation) -> ExactTailCompact
         ExactTailImplementation::Local => ExactTailCompactionRoute::Local,
         ExactTailImplementation::RemoteLegacy => ExactTailCompactionRoute::RemoteLegacy,
         ExactTailImplementation::RemoteV2 => ExactTailCompactionRoute::RemoteV2,
+        ExactTailImplementation::SemanticTranscript => ExactTailCompactionRoute::SemanticTranscript,
     }
 }
 

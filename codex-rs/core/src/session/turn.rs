@@ -10,10 +10,10 @@ use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::collect_explicit_skill_mentions;
+use crate::compact::CompactRoute;
 use crate::compact::InitialContextInjection;
+use crate::compact::compact_route;
 use crate::compact::run_inline_auto_compact_task;
-use crate::compact::should_use_remote_compact_task;
-use crate::compact::should_use_remote_compact_task_v2;
 use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
@@ -989,13 +989,14 @@ async fn run_auto_compact(
     reason: CompactionReason,
     phase: CompactionPhase,
 ) -> CodexResult<()> {
-    if should_use_remote_compact_task(turn_context.provider.info()) {
-        if should_use_remote_compact_task_v2(turn_context) {
-            emit_compact_metric(
-                &sess.services.session_telemetry,
-                "remote_v2",
-                /*manual*/ false,
-            );
+    let route = compact_route(turn_context)?;
+    emit_compact_metric(
+        &sess.services.session_telemetry,
+        route.metric_name(),
+        /*manual*/ false,
+    );
+    match route {
+        CompactRoute::RemoteV2 => {
             run_inline_remote_auto_compact_task_v2(
                 Arc::clone(sess),
                 Arc::clone(turn_context),
@@ -1005,36 +1006,39 @@ async fn run_auto_compact(
                 phase,
             )
             .await?;
-            return Ok(());
         }
-        emit_compact_metric(
-            &sess.services.session_telemetry,
-            "remote",
-            /*manual*/ false,
-        );
-        run_inline_remote_auto_compact_task(
-            Arc::clone(sess),
-            Arc::clone(turn_context),
-            client_session.turn_state(),
-            initial_context_injection,
-            reason,
-            phase,
-        )
-        .await?;
-    } else {
-        emit_compact_metric(
-            &sess.services.session_telemetry,
-            "local",
-            /*manual*/ false,
-        );
-        run_inline_auto_compact_task(
-            Arc::clone(sess),
-            Arc::clone(turn_context),
-            initial_context_injection,
-            reason,
-            phase,
-        )
-        .await?;
+        CompactRoute::RemoteLegacy => {
+            run_inline_remote_auto_compact_task(
+                Arc::clone(sess),
+                Arc::clone(turn_context),
+                client_session.turn_state(),
+                initial_context_injection,
+                reason,
+                phase,
+            )
+            .await?;
+        }
+        CompactRoute::SemanticTranscript => {
+            crate::compact_semantic_transcript::run_inline_remote_auto_compact_task(
+                Arc::clone(sess),
+                Arc::clone(turn_context),
+                client_session.turn_state(),
+                initial_context_injection,
+                reason,
+                phase,
+            )
+            .await?;
+        }
+        CompactRoute::Local => {
+            run_inline_auto_compact_task(
+                Arc::clone(sess),
+                Arc::clone(turn_context),
+                initial_context_injection,
+                reason,
+                phase,
+            )
+            .await?;
+        }
     }
     Ok(())
 }

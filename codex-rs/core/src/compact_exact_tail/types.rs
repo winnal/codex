@@ -52,6 +52,7 @@ pub(crate) enum ExactTailImplementation {
     Local,
     RemoteLegacy,
     RemoteV2,
+    SemanticTranscript,
 }
 
 impl ExactTailImplementation {
@@ -60,6 +61,7 @@ impl ExactTailImplementation {
             Self::Local => "local",
             Self::RemoteLegacy => "remote",
             Self::RemoteV2 => "remote_v2",
+            Self::SemanticTranscript => "semantic_transcript",
         }
     }
 }
@@ -161,6 +163,16 @@ pub(crate) struct ExactTailDiagnostics {
     pub(crate) post_summary_cold_reserve_target_tokens: i64,
     pub(crate) post_summary_cold_reserve_tokens: i64,
     pub(crate) post_summary_cold_reserve_group_count: usize,
+    pub(crate) actual_summary_tokens: Option<i64>,
+    pub(crate) attempted_replacement_tokens_estimate: Option<i64>,
+    pub(crate) attempted_final_replacement_tokens_estimate: Option<i64>,
+    pub(crate) semantic_transcript_tokens: Option<i64>,
+    pub(crate) semantic_transcript_item_count: Option<usize>,
+    pub(crate) semantic_transcript_tool_observation_count: Option<usize>,
+    pub(crate) raw_cold_tokens: Option<i64>,
+    pub(crate) semantic_transcript_reduction_tokens: Option<i64>,
+    pub(crate) retained_cold_message_tokens: Option<i64>,
+    pub(crate) retained_cold_message_count: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

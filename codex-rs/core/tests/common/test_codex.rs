@@ -774,6 +774,22 @@ impl TestCodex {
             .await
     }
 
+    pub async fn submit_turn_with_completion_timeout(
+        &self,
+        prompt: &str,
+        completion_timeout: Duration,
+    ) -> Result<()> {
+        self.submit_turn_with_permission_profile_context(
+            prompt,
+            AskForApproval::Never,
+            PermissionProfile::Disabled,
+            /*service_tier*/ None,
+            /*environments*/ None,
+            completion_timeout,
+        )
+        .await
+    }
+
     pub async fn submit_turn_with_permission_profile(
         &self,
         prompt: &str,
@@ -807,6 +823,7 @@ impl TestCodex {
             PermissionProfile::Disabled,
             Some(service_tier.map(str::to_string)),
             /*environments*/ None,
+            SUBMIT_TURN_COMPLETE_TIMEOUT,
         )
         .await
     }
@@ -827,6 +844,7 @@ impl TestCodex {
             permission_profile,
             /*service_tier*/ None,
             /*environments*/ None,
+            SUBMIT_TURN_COMPLETE_TIMEOUT,
         )
         .await
     }
@@ -843,6 +861,7 @@ impl TestCodex {
             permission_profile,
             /*service_tier*/ None,
             /*environments*/ None,
+            SUBMIT_TURN_COMPLETE_TIMEOUT,
         )
         .await
     }
@@ -858,6 +877,7 @@ impl TestCodex {
             PermissionProfile::Disabled,
             /*service_tier*/ None,
             environments,
+            SUBMIT_TURN_COMPLETE_TIMEOUT,
         )
         .await
     }
@@ -869,6 +889,7 @@ impl TestCodex {
         permission_profile: PermissionProfile,
         service_tier: Option<Option<String>>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
+        completion_timeout: Duration,
     ) -> Result<()> {
         self.submit_turn_with_context(
             prompt,
@@ -876,6 +897,7 @@ impl TestCodex {
             permission_profile,
             service_tier,
             environments,
+            completion_timeout,
         )
         .await
     }
@@ -887,6 +909,7 @@ impl TestCodex {
         permission_profile: PermissionProfile,
         service_tier: Option<Option<String>>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
+        completion_timeout: Duration,
     ) -> Result<()> {
         let (sandbox_policy, permission_profile) =
             turn_permission_fields(permission_profile, self.config.cwd.as_path());
@@ -933,7 +956,7 @@ impl TestCodex {
                 EventMsg::TurnComplete(event) => event.turn_id == turn_id,
                 _ => false,
             },
-            SUBMIT_TURN_COMPLETE_TIMEOUT,
+            completion_timeout,
         )
         .await;
         Ok(())

@@ -26,6 +26,7 @@ use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::ToolsV2;
 use codex_app_server_protocol::WriteStatus;
 use codex_core::config::set_project_trust_level;
+use codex_protocol::config_types::CompactExactTailStrategy;
 use codex_protocol::config_types::TrustLevel;
 use codex_protocol::config_types::WebSearchContextSize;
 use codex_protocol::config_types::WebSearchLocation;
@@ -144,6 +145,78 @@ async fn config_read_rejects_non_positive_compact_preserve_recent_tokens() -> Re
 
     assert!(
         err.error.message.contains("compact_preserve_recent_tokens"),
+        "unexpected error: {err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_read_includes_semantic_transcript_exact_tail_settings() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(
+        &codex_home,
+        r#"
+compact_preserve_recent_tokens = 60000
+compact_exact_tail_strategy = "semantic_transcript"
+compact_exact_tail_semantic_transcript_retained_message_token_budget = 32000
+"#,
+    )?;
+
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    let ConfigReadResponse { config, .. } = to_response(resp)?;
+
+    assert_eq!(config.compact_preserve_recent_tokens, Some(60_000));
+    assert_eq!(
+        config.compact_exact_tail_strategy,
+        Some(CompactExactTailStrategy::SemanticTranscript)
+    );
+    assert_eq!(
+        config.compact_exact_tail_semantic_transcript_retained_message_token_budget,
+        Some(32_000)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_read_rejects_invalid_semantic_transcript_retained_budget() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    write_config(
+        &codex_home,
+        "compact_exact_tail_semantic_transcript_retained_message_token_budget = 64001\n",
+    )?;
+
+    let mut mcp = TestAppServer::new(codex_home.path()).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert!(
+        err.error
+            .message
+            .contains("compact_exact_tail_semantic_transcript_retained_message_token_budget"),
         "unexpected error: {err:?}"
     );
     Ok(())
@@ -873,6 +946,109 @@ async fn config_value_write_round_trips_compact_preserve_recent_tokens() -> Resu
     let read: ConfigReadResponse = to_response(read_resp)?;
 
     assert_eq!(read.config.compact_preserve_recent_tokens, Some(120_000));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_value_write_round_trips_semantic_transcript_exact_tail_settings() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let codex_home = temp_dir.path().canonicalize()?;
+    write_config(&temp_dir, "")?;
+
+    let mut mcp = TestAppServer::new(&codex_home).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    for (key_path, value) in [
+        ("compact_preserve_recent_tokens", json!(60_000)),
+        ("compact_exact_tail_strategy", json!("semantic_transcript")),
+        (
+            "compact_exact_tail_semantic_transcript_retained_message_token_budget",
+            json!(32_000),
+        ),
+    ] {
+        let write_id = mcp
+            .send_config_value_write_request(ConfigValueWriteParams {
+                file_path: None,
+                key_path: key_path.to_string(),
+                value,
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await?;
+        let write_resp: JSONRPCResponse = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(write_id)),
+        )
+        .await??;
+        let write: ConfigWriteResponse = to_response(write_resp)?;
+        assert_eq!(write.status, WriteStatus::Ok);
+    }
+
+    let read_id = mcp
+        .send_config_read_request(ConfigReadParams {
+            include_layers: false,
+            cwd: None,
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let read: ConfigReadResponse = to_response(read_resp)?;
+
+    assert_eq!(read.config.compact_preserve_recent_tokens, Some(60_000));
+    assert_eq!(
+        read.config.compact_exact_tail_strategy,
+        Some(CompactExactTailStrategy::SemanticTranscript)
+    );
+    assert_eq!(
+        read.config
+            .compact_exact_tail_semantic_transcript_retained_message_token_budget,
+        Some(32_000)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_value_write_rejects_invalid_semantic_transcript_retained_budget() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let codex_home = temp_dir.path().canonicalize()?;
+    write_config(&temp_dir, "")?;
+
+    let mut mcp = TestAppServer::new(&codex_home).await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let write_id = mcp
+        .send_config_value_write_request(ConfigValueWriteParams {
+            file_path: None,
+            key_path: "compact_exact_tail_semantic_transcript_retained_message_token_budget"
+                .to_string(),
+            value: json!(64001),
+            merge_strategy: MergeStrategy::Replace,
+            expected_version: None,
+        })
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(write_id)),
+    )
+    .await??;
+    let code = err
+        .error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("config_write_error_code"))
+        .and_then(|value| value.as_str());
+
+    assert_eq!(code, Some("configValidationError"));
+    assert!(
+        err.error
+            .message
+            .contains("compact_exact_tail_semantic_transcript_retained_message_token_budget"),
+        "unexpected error: {err:?}"
+    );
+    assert_eq!(std::fs::read_to_string(codex_home.join("config.toml"))?, "");
     Ok(())
 }
 

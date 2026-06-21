@@ -15,6 +15,22 @@ fn message(role: &str, text: &str, phase: Option<MessagePhase>) -> ResponseItem 
     }
 }
 
+fn message_text(item: &ResponseItem) -> String {
+    let ResponseItem::Message { content, .. } = item else {
+        panic!("expected message item: {item:?}");
+    };
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                Some(text.as_str())
+            }
+            ContentItem::InputImage { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn build_v2_compacted_history_filters_to_installed_retention_shape() {
     let input = vec![
@@ -119,6 +135,33 @@ fn build_v2_compacted_history_counts_retained_input_images() {
 }
 
 #[test]
+fn retained_history_standard_v2_keeps_text_budget_boundary() {
+    let retained = truncate_retained_messages_for_remote_compaction(
+        vec![
+            message("user", "old should be dropped", /*phase*/ None),
+            message("user", &"word ".repeat(30), /*phase*/ None),
+            message("user", "new", /*phase*/ None),
+        ],
+        /*max_tokens*/ 3,
+        /*max_item_tokens*/ usize::MAX,
+    );
+
+    assert_eq!(retained.len(), 2);
+    assert!(message_text(&retained[0]).contains("tokens truncated"));
+    assert_eq!(retained[1], message("user", "new", /*phase*/ None));
+    assert!(
+        !retained
+            .iter()
+            .any(|item| message_text(item).contains("old should be dropped")),
+        "standard v2 boundary truncation should exhaust the retained budget"
+    );
+    assert!(
+        estimate_response_items_token_count(&retained) > 3,
+        "standard v2 should preserve text-budget semantics rather than wrapper-inclusive item cap"
+    );
+}
+
+#[test]
 fn retained_history_truncation_keeps_newest_messages_first() {
     let middle = message("user", "middle1234", /*phase*/ None);
     let new = message("user", "new", /*phase*/ None);
@@ -128,8 +171,11 @@ fn retained_history_truncation_keeps_newest_messages_first() {
         new.clone(),
     ];
 
-    let truncated =
-        truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 3);
+    let truncated = truncate_retained_messages_for_remote_compaction(
+        retained,
+        /*max_tokens*/ 3,
+        /*max_item_tokens*/ usize::MAX,
+    );
 
     assert_eq!(
         truncated,
@@ -161,8 +207,11 @@ fn retained_history_truncation_preserves_images_and_truncates_later_text_parts()
         metadata: None,
     };
 
-    let truncated =
-        truncate_retained_messages_for_remote_compaction(vec![item], /*max_tokens*/ 3);
+    let truncated = truncate_retained_messages_for_remote_compaction(
+        vec![item],
+        /*max_tokens*/ 3,
+        /*max_item_tokens*/ usize::MAX,
+    );
 
     assert_eq!(
         truncated,
@@ -206,8 +255,11 @@ fn retained_history_truncation_charges_image_only_messages() {
         newest.clone(),
     ];
 
-    let truncated =
-        truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 2);
+    let truncated = truncate_retained_messages_for_remote_compaction(
+        retained,
+        /*max_tokens*/ 2,
+        /*max_item_tokens*/ usize::MAX,
+    );
 
     assert_eq!(truncated, vec![image_only_message, newest]);
 }
@@ -227,8 +279,32 @@ fn retained_history_truncation_drops_image_only_messages_after_budget_is_spent()
     let newest = message("user", "new", /*phase*/ None);
     let retained = vec![image_only_message, newest.clone()];
 
-    let truncated =
-        truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 1);
+    let truncated = truncate_retained_messages_for_remote_compaction(
+        retained,
+        /*max_tokens*/ 1,
+        /*max_item_tokens*/ usize::MAX,
+    );
 
     assert_eq!(truncated, vec![newest]);
+}
+
+#[test]
+fn retained_history_semantic_item_cap_truncates_individual_messages() {
+    let input = vec![message(
+        "user",
+        &"word ".repeat(10_000),
+        /*phase*/ None,
+    )];
+
+    let (retained, _) = retained_messages_for_remote_compaction_v2_with_item_cap(
+        &input, /*max_tokens*/ 20_000, /*max_item_tokens*/ 512,
+    );
+
+    assert_eq!(retained.len(), 1);
+    let serialized = serde_json::to_string(&retained).expect("serialize retained messages");
+    assert!(serialized.contains("tokens truncated"));
+    assert!(
+        estimate_response_items_token_count(&retained) <= 512,
+        "retained semantic item should fit cap: {retained:?}"
+    );
 }

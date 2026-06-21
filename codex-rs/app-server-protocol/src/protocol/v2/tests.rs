@@ -1636,6 +1636,8 @@ fn config_granular_approval_policy_is_marked_experimental() {
         model_auto_compact_token_limit: None,
         model_auto_compact_token_limit_scope: None,
         compact_preserve_recent_tokens: None,
+        compact_exact_tail_strategy: None,
+        compact_exact_tail_semantic_transcript_retained_message_token_budget: None,
         model_provider: None,
         approval_policy: Some(AskForApproval::Granular {
             sandbox_approval: false,
@@ -1676,6 +1678,8 @@ fn config_approvals_reviewer_is_marked_experimental() {
         model_auto_compact_token_limit: None,
         model_auto_compact_token_limit_scope: None,
         compact_preserve_recent_tokens: None,
+        compact_exact_tail_strategy: None,
+        compact_exact_tail_semantic_transcript_retained_message_token_budget: None,
         model_provider: None,
         approval_policy: None,
         approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
