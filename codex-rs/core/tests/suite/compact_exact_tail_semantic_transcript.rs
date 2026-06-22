@@ -1,11 +1,14 @@
 use super::compact_exact_tail_support::*;
 use codex_protocol::config_types::CompactExactTailStrategy;
-use codex_protocol::models::ResponseItem;
+use core_test_support::responses;
 use core_test_support::test_codex::TestCodexBuilder;
 use pretty_assertions::assert_eq;
 
+const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const BETA_FEATURES_HEADER: &str = "x-codex-beta-features";
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exact_tail_semantic_transcript_manual_uses_legacy_endpoint_even_when_v2_enabled()
+async fn exact_tail_semantic_transcript_manual_uses_v2_summary_only_when_default_v2_disabled()
 -> Result<()> {
     let server = start_mock_server().await;
     let cold_user = format!("SEM_ROUTE_COLD_USER {}", "semantic cold user ".repeat(100));
@@ -30,6 +33,10 @@ async fn exact_tail_semantic_transcript_manual_uses_legacy_endpoint_even_when_v2
                 ev_completed("semantic-route-hot-response"),
             ]),
             sse(vec![
+                ev_compaction_item("SEM_ROUTE_EXACT_TAIL_SUMMARY"),
+                ev_completed("semantic-route-compact-response"),
+            ]),
+            sse(vec![
                 ev_assistant_message(
                     "semantic-route-follow-up-assistant",
                     "SEM_ROUTE_FOLLOW_UP_DONE",
@@ -39,14 +46,9 @@ async fn exact_tail_semantic_transcript_manual_uses_legacy_endpoint_even_when_v2
         ],
     )
     .await;
-    let compacted_history = vec![ResponseItem::Compaction {
-        id: None,
-        encrypted_content: "SEM_ROUTE_EXACT_TAIL_SUMMARY".to_string(),
-        metadata: None,
-    }];
-    let compact_mock =
-        mount_compact_json_once(&server, json!({ "output": compacted_history })).await;
-    let mut builder = semantic_builder_with_remote_v2();
+    let mut builder = semantic_builder().with_config(|config| {
+        let _ = config.features.disable(Feature::RemoteCompactionV2);
+    });
     let test = builder.build(&server).await?;
     let rollout_path = test
         .session_configured
@@ -65,12 +67,21 @@ async fn exact_tail_semantic_transcript_manual_uses_legacy_endpoint_even_when_v2
     .await;
     submit_turn(&test, "SEM_ROUTE_FOLLOW_UP_USER").await?;
 
+    let requests = response_mock.requests();
     assert_eq!(
-        compact_mock.requests().len(),
-        1,
-        "semantic transcript should use the legacy compact endpoint"
+        requests.len(),
+        4,
+        "expected cold, hot, v2 semantic compact, and follow-up requests"
     );
-    let compact_body = compact_mock.single_request().body_json().to_string();
+    let compact_request = &requests[2];
+    let compact_body = compact_request.body_json().to_string();
+    assert!(
+        compact_request
+            .header(BETA_FEATURES_HEADER)
+            .as_deref()
+            .is_some_and(header_contains_remote_v2),
+        "semantic transcript v2 compact request must advertise remote_compaction_v2 even when default routing is disabled"
+    );
     assert!(
         body_contains_text(&compact_body, "SEM_ROUTE_COLD_USER"),
         "semantic transcript compact request should include cold user text; body: {compact_body}"
@@ -87,19 +98,15 @@ async fn exact_tail_semantic_transcript_manual_uses_legacy_endpoint_even_when_v2
         !body_contains_text(&compact_body, "SEM_ROUTE_HOT_ASSISTANT"),
         "exact hot assistant must stay out of semantic transcript compact request; body: {compact_body}"
     );
+    assert_single_trailing_compaction_trigger(compact_request);
     assert!(
-        !compact_body.contains("compaction_trigger"),
-        "semantic transcript must not send a remote-v2 compaction trigger; body: {compact_body}"
+        !body_contains_text(&compact_body, SUMMARIZATION_PROMPT),
+        "semantic transcript should not route through the legacy prompt-shaped compactor; body: {compact_body}"
     );
 
-    let requests = response_mock.requests();
-    assert_eq!(
-        requests.len(),
-        3,
-        "semantic transcript should not consume a v2 compaction response turn"
-    );
+    let follow_up_input = requests[3].input();
     assert_ordered_input_texts(
-        &requests[2].input(),
+        &follow_up_input,
         &[
             "SEM_ROUTE_COLD_USER",
             "SEM_ROUTE_HOT_USER",
@@ -107,6 +114,20 @@ async fn exact_tail_semantic_transcript_manual_uses_legacy_endpoint_even_when_v2
             "SEM_ROUTE_HOT_ASSISTANT",
             "SEM_ROUTE_FOLLOW_UP_USER",
         ],
+    );
+    assert!(
+        !input_contains_text(&follow_up_input, "SEM_ROUTE_COLD_ASSISTANT"),
+        "cold assistant should exist only inside the v2 summary, not as duplicated exact retained prefix"
+    );
+    assert_eq!(
+        input_text_match_count(&follow_up_input, "SEM_ROUTE_COLD_USER"),
+        1,
+        "retained cold user anchor should appear once"
+    );
+    assert_eq!(
+        input_text_match_count(&follow_up_input, "SEM_ROUTE_HOT_USER"),
+        1,
+        "retained older same-turn user anchor should appear once"
     );
     let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
     assert_eq!(diagnostics.len(), 1);
@@ -139,8 +160,7 @@ async fn exact_tail_semantic_transcript_manual_uses_legacy_endpoint_even_when_v2
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exact_tail_semantic_transcript_auto_uses_legacy_endpoint_even_when_v2_enabled()
--> Result<()> {
+async fn exact_tail_semantic_transcript_auto_uses_v2_summary_only_request() -> Result<()> {
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
         &server,
@@ -154,19 +174,16 @@ async fn exact_tail_semantic_transcript_auto_uses_legacy_endpoint_even_when_v2_e
                 ev_completed_with_tokens("semantic-auto-hot-response", /*total_tokens*/ 500),
             ]),
             sse(vec![
+                ev_compaction_item("SEM_AUTO_EXACT_TAIL_SUMMARY"),
+                ev_completed("semantic-auto-compact-response"),
+            ]),
+            sse(vec![
                 ev_assistant_message("semantic-auto-follow-up", "SEM_AUTO_FOLLOW_UP_DONE"),
                 ev_completed("semantic-auto-follow-up-response"),
             ]),
         ],
     )
     .await;
-    let compacted_history = vec![ResponseItem::Compaction {
-        id: None,
-        encrypted_content: "SEM_AUTO_EXACT_TAIL_SUMMARY".to_string(),
-        metadata: None,
-    }];
-    let compact_mock =
-        mount_compact_json_once(&server, json!({ "output": compacted_history })).await;
     let mut builder = semantic_builder_with_remote_v2().with_config(|config| {
         config.model_auto_compact_token_limit = Some(100);
         config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::BodyAfterPrefix;
@@ -177,29 +194,139 @@ async fn exact_tail_semantic_transcript_auto_uses_legacy_endpoint_even_when_v2_e
     submit_turn(&test, "SEM_AUTO_HOT_USER").await?;
     submit_turn(&test, "SEM_AUTO_FOLLOW_UP_USER").await?;
 
+    let requests = response_mock.requests();
     assert_eq!(
-        compact_mock.requests().len(),
-        1,
-        "semantic auto compaction should use legacy compact endpoint"
+        requests.len(),
+        4,
+        "expected cold, hot, v2 semantic compact, and follow-up requests"
     );
-    let compact_body = compact_mock.single_request().body_json().to_string();
+    let compact_body = requests[2].body_json().to_string();
     assert!(
         body_contains_text(&compact_body, "SEM_AUTO_COLD_ASSISTANT"),
         "semantic auto compact request should include cold assistant transcript; body: {compact_body}"
     );
-    assert!(
-        !compact_body.contains("compaction_trigger"),
-        "semantic auto compaction must not send remote-v2 trigger; body: {compact_body}"
-    );
+    assert_single_trailing_compaction_trigger(&requests[2]);
+    let follow_up_input = requests[3].input();
     assert_ordered_input_texts(
-        &response_mock.requests()[2].input(),
+        &follow_up_input,
         &[
             "SEM_AUTO_EXACT_TAIL_SUMMARY",
             "SEM_AUTO_HOT_ASSISTANT",
             "SEM_AUTO_FOLLOW_UP_USER",
         ],
     );
+    assert!(
+        !input_contains_text(&follow_up_input, "SEM_AUTO_COLD_ASSISTANT"),
+        "cold assistant should be represented by the v2 summary only, not leaked as exact prefix"
+    );
+    assert_eq!(
+        input_text_match_count(&follow_up_input, "SEM_AUTO_COLD_USER"),
+        1,
+        "retained auto cold user anchor should appear once"
+    );
 
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_semantic_transcript_auto_preserves_turn_state_and_resets_continuation()
+-> Result<()> {
+    let server = start_mock_server().await;
+    let response_mock = responses::mount_response_sequence(
+        &server,
+        vec![
+            responses::sse_response(sse(vec![
+                ev_assistant_message("semantic-state-cold", "SEM_STATE_COLD_ASSISTANT"),
+                ev_completed_with_tokens("semantic-state-cold-response", /*total_tokens*/ 50),
+            ])),
+            responses::sse_response(sse(vec![
+                ev_function_call("semantic-state-call-before", DUMMY_FUNCTION_NAME, "{}"),
+                ev_completed_with_tokens(
+                    "semantic-state-first-response",
+                    /*total_tokens*/ 500,
+                ),
+            ]))
+            .insert_header(TURN_STATE_HEADER, "sampling-state"),
+            responses::sse_response(sse(vec![
+                ev_compaction_item("SEM_STATE_EXACT_TAIL_SUMMARY"),
+                ev_completed("semantic-state-compact-response"),
+            ]))
+            .insert_header(TURN_STATE_HEADER, "compact-state"),
+            responses::sse_response(sse(vec![
+                ev_function_call("semantic-state-call-after", DUMMY_FUNCTION_NAME, "{}"),
+                ev_completed_with_tokens("semantic-state-after-response", /*total_tokens*/ 80),
+            ]))
+            .insert_header(TURN_STATE_HEADER, "continuation-state"),
+            responses::sse_response(sse(vec![
+                ev_assistant_message("semantic-state-final", "SEM_STATE_FINAL"),
+                ev_completed_with_tokens("semantic-state-final-response", /*total_tokens*/ 80),
+            ])),
+        ],
+    )
+    .await;
+    let mut builder = semantic_builder().with_config(|config| {
+        config.model_auto_compact_token_limit = Some(200);
+        config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::BodyAfterPrefix;
+    });
+    let test = builder.build(&server).await?;
+
+    submit_turn(&test, "SEM_STATE_COLD_USER").await?;
+    submit_turn(&test, "SEM_STATE_HOT_TOOL_USER").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(requests[0].header(TURN_STATE_HEADER), None);
+    assert_eq!(requests[1].header(TURN_STATE_HEADER), None);
+
+    let compact_request = &requests[2];
+    let compact_body = compact_request.body_json();
+    assert_eq!(
+        compact_request.header(TURN_STATE_HEADER).as_deref(),
+        Some("sampling-state")
+    );
+    assert_eq!(
+        compact_body.get("previous_response_id"),
+        None,
+        "semantic v2 compaction must not continue the sampling Responses chain"
+    );
+    assert!(
+        compact_request
+            .header(BETA_FEATURES_HEADER)
+            .as_deref()
+            .is_some_and(header_contains_remote_v2),
+        "semantic v2 compaction must advertise the remote_compaction_v2 capability"
+    );
+    assert!(
+        compact_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("semantic-transcript-v2-compaction:")),
+        "semantic v2 compaction must use an isolated prompt cache key; body: {compact_body}"
+    );
+    assert_single_trailing_compaction_trigger(compact_request);
+
+    let post_compaction_body = requests[3].body_json();
+    assert_eq!(
+        requests[3].header(TURN_STATE_HEADER).as_deref(),
+        Some("sampling-state")
+    );
+    assert_eq!(
+        requests[4].header(TURN_STATE_HEADER).as_deref(),
+        Some("sampling-state")
+    );
+    assert_eq!(
+        post_compaction_body.get("previous_response_id"),
+        None,
+        "post-compaction sampling must reset stale continuation state"
+    );
+    assert!(
+        !post_compaction_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("semantic-transcript-v2-compaction:")),
+        "post-compaction sampling must not inherit the isolated compact cache key"
+    );
     shutdown_codex(&test).await?;
     Ok(())
 }
@@ -223,19 +350,20 @@ async fn exact_tail_semantic_transcript_respects_raised_effective_item_cap() -> 
                 ev_completed("semantic-raised-hot-response"),
             ]),
             sse(vec![
+                ev_compaction_item("SEM_RAISED_EXACT_TAIL_SUMMARY"),
+                ev_completed("semantic-raised-compact-response"),
+            ]),
+            sse(vec![
                 ev_assistant_message("semantic-raised-follow-up", "SEM_RAISED_FOLLOW_UP_DONE"),
                 ev_completed("semantic-raised-follow-up-response"),
             ]),
         ],
     )
     .await;
-    let compacted_history = vec![ResponseItem::Compaction {
-        id: None,
-        encrypted_content: "SEM_RAISED_EXACT_TAIL_SUMMARY".to_string(),
-        metadata: None,
-    }];
-    let compact_mock =
-        mount_compact_json_once(&server, json!({ "output": compacted_history })).await;
+    // Reviewed cap exception: semantic transcript should honor the active
+    // user-configured exact-tail/model-visible item envelope. The default
+    // safety cap remains 10k, but an explicit tool_output_token_limit override
+    // raises the effective cap for already-bounded model-visible items.
     let mut builder = semantic_builder().with_config(|config| {
         config.tool_output_token_limit = Some(20_000);
     });
@@ -257,8 +385,9 @@ async fn exact_tail_semantic_transcript_respects_raised_effective_item_cap() -> 
     .await;
     submit_turn(&test, "SEM_RAISED_FOLLOW_UP_USER").await?;
 
-    assert_eq!(compact_mock.requests().len(), 1);
-    let compact_body = compact_mock.single_request().body_json().to_string();
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 4);
+    let compact_body = requests[2].body_json().to_string();
     assert!(
         body_contains_text(&compact_body, "SEM_RAISED_COLD_END"),
         "raised cap should preserve the cold user anchor in the semantic transcript request; body: {compact_body}"
@@ -267,7 +396,8 @@ async fn exact_tail_semantic_transcript_respects_raised_effective_item_cap() -> 
         !compact_body.contains("tokens truncated"),
         "raised cap should avoid fixed-10k truncation marker in the semantic transcript request; body: {compact_body}"
     );
-    let follow_up_input = response_mock.requests()[2].input();
+    assert_single_trailing_compaction_trigger(&requests[2]);
+    let follow_up_input = requests[3].input();
     assert!(
         input_contains_text(&follow_up_input, "SEM_RAISED_COLD_END"),
         "raised cap should retain the full cold user anchor in the installed prefix"
@@ -311,6 +441,10 @@ async fn exact_tail_semantic_transcript_recompacts_prior_retained_prefix_and_sum
                 ev_completed("semantic-cycle-hot-response"),
             ]),
             sse(vec![
+                ev_compaction_item("SEM_CYCLE_SUMMARY_ONE"),
+                ev_completed("semantic-cycle-compact-one-response"),
+            ]),
+            sse(vec![
                 ev_assistant_message(
                     "semantic-cycle-after-first",
                     "SEM_CYCLE_AFTER_FIRST_ASSISTANT",
@@ -318,17 +452,13 @@ async fn exact_tail_semantic_transcript_recompacts_prior_retained_prefix_and_sum
                 ev_completed("semantic-cycle-after-first-response"),
             ]),
             sse(vec![
+                ev_compaction_item("SEM_CYCLE_SUMMARY_TWO"),
+                ev_completed("semantic-cycle-compact-two-response"),
+            ]),
+            sse(vec![
                 ev_assistant_message("semantic-cycle-follow-up", "SEM_CYCLE_FOLLOW_UP_DONE"),
                 ev_completed("semantic-cycle-follow-up-response"),
             ]),
-        ],
-    )
-    .await;
-    let compact_mock = mount_compact_json_sequence(
-        &server,
-        vec![
-            json!({ "output": [compaction_item("SEM_CYCLE_SUMMARY_ONE")] }),
-            json!({ "output": [compaction_item("SEM_CYCLE_SUMMARY_TWO")] }),
         ],
     )
     .await;
@@ -347,9 +477,13 @@ async fn exact_tail_semantic_transcript_recompacts_prior_retained_prefix_and_sum
     manual_compact_and_wait(&test).await?;
     submit_turn(&test, "SEM_CYCLE_FOLLOW_UP_USER").await?;
 
-    let compact_requests = compact_mock.requests();
-    assert_eq!(compact_requests.len(), 2);
-    let second_compact_body = compact_requests[1].body_json().to_string();
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        6,
+        "expected cold, hot, first compact, after-first, second compact, and follow-up"
+    );
+    let second_compact_body = requests[4].body_json().to_string();
     assert!(
         body_contains_text(&second_compact_body, "SEM_CYCLE_SUMMARY_ONE"),
         "second semantic transcript should include the prior summary; body: {second_compact_body}"
@@ -362,6 +496,7 @@ async fn exact_tail_semantic_transcript_recompacts_prior_retained_prefix_and_sum
         body_contains_text(&second_compact_body, "SEM_CYCLE_AFTER_FIRST_USER"),
         "second semantic transcript should include newly cold user text; body: {second_compact_body}"
     );
+    assert_single_trailing_compaction_trigger(&requests[4]);
 
     let replacement = replacement_history_from_rollout(&rollout_path)?;
     assert!(
@@ -377,7 +512,7 @@ async fn exact_tail_semantic_transcript_recompacts_prior_retained_prefix_and_sum
         1
     );
     assert_ordered_input_texts(
-        &response_mock.requests()[3].input(),
+        &requests[5].input(),
         &[
             "SEM_CYCLE_COLD_USER",
             "SEM_CYCLE_AFTER_FIRST_USER",
@@ -406,10 +541,13 @@ async fn exact_tail_semantic_transcript_rejects_empty_summary_with_old_retained_
                 ev_assistant_message("semantic-empty-hot", "SEM_EMPTY_HOT_ASSISTANT"),
                 ev_completed("semantic-empty-hot-response"),
             ]),
+            sse(vec![
+                ev_compaction_item(""),
+                ev_completed("semantic-empty-compact-response"),
+            ]),
         ],
     )
     .await;
-    let compact_mock = mount_compact_json_once(&server, json!({ "output": [] })).await;
     let mut builder = semantic_builder();
     let test = builder.build(&server).await?;
     let rollout_path = test
@@ -432,7 +570,6 @@ async fn exact_tail_semantic_transcript_rejects_empty_summary_with_old_retained_
     )
     .await;
 
-    assert_eq!(compact_mock.requests().len(), 1);
     assert!(
         replacement_history_from_rollout(&rollout_path).is_err(),
         "failed semantic compaction should not install replacement history"
@@ -457,10 +594,10 @@ async fn exact_tail_semantic_transcript_rejects_empty_summary_with_old_retained_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exact_tail_semantic_transcript_accepts_large_legacy_summary_with_retained_budgets()
+async fn exact_tail_semantic_transcript_accepts_bounded_v2_summary_with_retained_budgets()
 -> Result<()> {
     for retained_budget in [32_000, 64_000] {
-        run_large_legacy_summary_success(retained_budget).await?;
+        run_bounded_v2_summary_success(retained_budget).await?;
     }
     Ok(())
 }
@@ -479,20 +616,16 @@ async fn exact_tail_semantic_transcript_replacement_failure_reports_summary_toke
                 ev_assistant_message("semantic-fail-hot", "SEM_FAIL_HOT_ASSISTANT"),
                 ev_completed("semantic-fail-hot-response"),
             ]),
+            sse(vec![
+                ev_compaction_item(&format!(
+                    "SEM_FAIL_LARGE_SUMMARY {}",
+                    "summary ".repeat(60_000)
+                )),
+                ev_completed("semantic-fail-compact-response"),
+            ]),
         ],
     )
     .await;
-    let compacted_history = (0..30)
-        .map(|index| ResponseItem::Compaction {
-            id: None,
-            encrypted_content: format!(
-                "SEM_FAIL_LARGE_SUMMARY_{index} {}",
-                "summary ".repeat(3_000)
-            ),
-            metadata: None,
-        })
-        .collect::<Vec<_>>();
-    mount_compact_json_once(&server, json!({ "output": compacted_history })).await;
     let mut builder = semantic_builder().with_config(|config| {
         config.model_context_window = Some(80_000);
     });
@@ -513,6 +646,11 @@ async fn exact_tail_semantic_transcript_replacement_failure_reports_summary_toke
     )
     .await;
 
+    assert!(
+        replacement_history_from_rollout(&rollout_path).is_err(),
+        "oversized semantic summary must not install replacement history"
+    );
+
     let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
     let diagnostic = diagnostics.last().expect("semantic failure diagnostic");
     assert_eq!(
@@ -525,7 +663,7 @@ async fn exact_tail_semantic_transcript_replacement_failure_reports_summary_toke
     );
     assert_eq!(
         diagnostic.get("failure_reason").and_then(Value::as_str),
-        Some("ExactTailReplacementTooLarge")
+        Some("ExactTailModelVisibleItemTooLarge")
     );
     assert!(
         diagnostic
@@ -583,20 +721,6 @@ fn semantic_builder_with_remote_v2() -> TestCodexBuilder {
     semantic_builder().with_config(explicitly_enable_remote_compaction_v2)
 }
 
-fn compaction_item(text: &str) -> ResponseItem {
-    ResponseItem::Compaction {
-        id: None,
-        encrypted_content: text.to_string(),
-        metadata: None,
-    }
-}
-
-fn large_legacy_summary_items(marker: &str) -> Vec<ResponseItem> {
-    (0..10)
-        .map(|index| compaction_item(&format!("{marker}_{index} {}", "summary ".repeat(3_000))))
-        .collect()
-}
-
 async fn manual_compact_and_wait(test: &TestCodex) -> Result<()> {
     test.codex.submit(Op::Compact).await?;
     wait_for_event_with_timeout(
@@ -613,7 +737,35 @@ async fn submit_turn(test: &TestCodex, prompt: &str) -> Result<()> {
         .await
 }
 
-async fn run_large_legacy_summary_success(retained_budget: i64) -> Result<()> {
+fn header_contains_remote_v2(header: &str) -> bool {
+    header
+        .split(',')
+        .any(|feature| feature == "remote_compaction_v2")
+}
+
+fn assert_single_trailing_compaction_trigger(
+    request: &core_test_support::responses::ResponsesRequest,
+) {
+    let input = request.input();
+    assert_eq!(
+        input
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+            .count(),
+        1,
+        "semantic v2 compaction input should contain exactly one compaction_trigger"
+    );
+    assert_eq!(
+        input
+            .last()
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str),
+        Some("compaction_trigger"),
+        "semantic v2 compaction input should end with compaction_trigger"
+    );
+}
+
+async fn run_bounded_v2_summary_success(retained_budget: i64) -> Result<()> {
     let server = start_mock_server().await;
     let marker = format!("SEM_LARGE_SUMMARY_{retained_budget}");
     let response_mock = mount_sse_sequence(
@@ -634,6 +786,12 @@ async fn run_large_legacy_summary_success(retained_budget: i64) -> Result<()> {
                 ev_completed(&format!("semantic-large-hot-response-{retained_budget}")),
             ]),
             sse(vec![
+                ev_compaction_item(&format!("{marker} {}", "summary ".repeat(800))),
+                ev_completed(&format!(
+                    "semantic-large-compact-response-{retained_budget}"
+                )),
+            ]),
+            sse(vec![
                 ev_assistant_message(
                     &format!("semantic-large-follow-up-{retained_budget}"),
                     &format!("SEM_LARGE_FOLLOW_UP_DONE_{retained_budget}"),
@@ -643,11 +801,6 @@ async fn run_large_legacy_summary_success(retained_budget: i64) -> Result<()> {
                 )),
             ]),
         ],
-    )
-    .await;
-    let compact_mock = mount_compact_json_once(
-        &server,
-        json!({ "output": large_legacy_summary_items(&marker) }),
     )
     .await;
     let mut builder = semantic_builder().with_config(move |config| {
@@ -670,10 +823,11 @@ async fn run_large_legacy_summary_success(retained_budget: i64) -> Result<()> {
     )
     .await?;
 
-    assert_eq!(compact_mock.requests().len(), 1);
-    let follow_up_input = response_mock.requests()[2].input();
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 4);
+    let follow_up_input = requests[3].input();
     assert!(
-        input_contains_text(&follow_up_input, &format!("{marker}_9")),
+        input_contains_text(&follow_up_input, &marker),
         "large returned summary should be installed for retained budget {retained_budget}: {follow_up_input:#?}"
     );
     assert!(
@@ -698,8 +852,8 @@ async fn run_large_legacy_summary_success(retained_budget: i64) -> Result<()> {
         diagnostic
             .get("summary_tokens")
             .and_then(Value::as_i64)
-            .is_some_and(|tokens| tokens > 25_000),
-        "large summary success should report returned summary tokens: {diagnostic:#?}"
+            .is_some_and(|tokens| tokens > 0),
+        "bounded summary success should report returned summary tokens: {diagnostic:#?}"
     );
 
     shutdown_codex(&test).await?;

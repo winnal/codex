@@ -1273,7 +1273,21 @@ pub async fn start_mock_server() -> MockServer {
 /// request message, the server records the payload and streams the matching
 /// events as WebSocket text frames before moving to the next request.
 pub async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSocketTestServer {
-    let connections = connections
+    let connections = websocket_connection_configs(connections);
+    start_websocket_server_with_headers(connections).await
+}
+
+pub async fn start_websocket_server_concurrent(
+    connections: Vec<Vec<Vec<Value>>>,
+) -> WebSocketTestServer {
+    let connections = websocket_connection_configs(connections);
+    start_websocket_server_concurrent_with_headers(connections).await
+}
+
+fn websocket_connection_configs(
+    connections: Vec<Vec<Vec<Value>>>,
+) -> Vec<WebSocketConnectionConfig> {
+    connections
         .into_iter()
         .map(|requests| WebSocketConnectionConfig {
             requests,
@@ -1281,8 +1295,7 @@ pub async fn start_websocket_server(connections: Vec<Vec<Vec<Value>>>) -> WebSoc
             accept_delay: None,
             close_after_requests: true,
         })
-        .collect();
-    start_websocket_server_with_headers(connections).await
+        .collect()
 }
 
 pub async fn start_websocket_server_with_headers(
@@ -1461,6 +1474,178 @@ pub async fn start_websocket_server_with_headers(
         shutdown: shutdown_tx,
         task,
     }
+}
+
+pub async fn start_websocket_server_concurrent_with_headers(
+    connections: Vec<WebSocketConnectionConfig>,
+) -> WebSocketTestServer {
+    let start = std::time::Instant::now();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind websocket server");
+    let addr = listener.local_addr().expect("websocket server address");
+    let uri = format!("ws://{addr}");
+    let connections_log = Arc::new(Mutex::new(Vec::new()));
+    let handshakes_log = Arc::new(Mutex::new(Vec::new()));
+    let request_log_updated = Arc::new(Notify::new());
+    let requests = Arc::clone(&connections_log);
+    let handshakes = Arc::clone(&handshakes_log);
+    let request_log = Arc::clone(&request_log_updated);
+    let connections = Arc::new(Mutex::new(VecDeque::from(connections)));
+    let shutdown_notify = Arc::new(Notify::new());
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let task_shutdown_notify = Arc::clone(&shutdown_notify);
+
+    let task = tokio::spawn(async move {
+        loop {
+            let accept_res = tokio::select! {
+                _ = &mut shutdown_rx => {
+                    task_shutdown_notify.notify_waiters();
+                    return;
+                },
+                accept_res = listener.accept() => accept_res,
+            };
+            let (stream, _) = match accept_res {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+            // Keep the normal test-server behavior: ordinary HTTP probes can
+            // share this listener, and only a successful websocket handshake
+            // consumes one scripted connection.
+            let connection = {
+                let pending = connections.lock().unwrap();
+                pending.front().cloned()
+            };
+
+            let Some(connection) = connection else {
+                continue;
+            };
+
+            if let Some(delay) = connection.accept_delay {
+                tokio::time::sleep(delay).await;
+            }
+
+            let response_headers = connection.response_headers.clone();
+            let handshake_log = Arc::clone(&handshakes);
+            let callback = move |req: &Request, mut response: Response| {
+                let headers = req
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), value.to_string()))
+                    })
+                    .collect();
+                handshake_log.lock().unwrap().push(WebSocketHandshake {
+                    uri: req.uri().to_string(),
+                    headers,
+                });
+
+                let headers_mut = response.headers_mut();
+                for (name, value) in &response_headers {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(name.as_bytes()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        headers_mut.insert(name, value);
+                    }
+                }
+
+                Ok(response)
+            };
+
+            let ws_stream = match accept_hdr_async_with_config(
+                stream,
+                callback,
+                Some(websocket_accept_config()),
+            )
+            .await
+            {
+                Ok(ws) => ws,
+                Err(_) => continue,
+            };
+            connections.lock().unwrap().pop_front();
+
+            let requests = Arc::clone(&requests);
+            let request_log = Arc::clone(&request_log);
+            let shutdown_notify = Arc::clone(&task_shutdown_notify);
+            tokio::spawn(async move {
+                serve_accepted_websocket_connection(
+                    ws_stream,
+                    connection,
+                    requests,
+                    request_log,
+                    shutdown_notify,
+                    start,
+                )
+                .await;
+            });
+        }
+    });
+
+    WebSocketTestServer {
+        uri,
+        connections: connections_log,
+        handshakes: handshakes_log,
+        request_log_updated,
+        shutdown: shutdown_tx,
+        task,
+    }
+}
+
+async fn serve_accepted_websocket_connection(
+    mut ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    connection: WebSocketConnectionConfig,
+    requests: Arc<Mutex<Vec<Vec<WebSocketRequest>>>>,
+    request_log: Arc<Notify>,
+    shutdown_notify: Arc<Notify>,
+    start: std::time::Instant,
+) {
+    let connection_index = {
+        let mut log = requests.lock().unwrap();
+        log.push(Vec::new());
+        log.len() - 1
+    };
+    let close_after_requests = connection.close_after_requests;
+    for request_events in connection.requests {
+        let message = tokio::select! {
+            _ = shutdown_notify.notified() => return,
+            message = ws_stream.next() => message,
+        };
+        let Some(Ok(message)) = message else {
+            break;
+        };
+        if let Some(body) = parse_ws_request_body(message) {
+            let mut log = requests.lock().unwrap();
+            if let Some(connection_log) = log.get_mut(connection_index) {
+                connection_log.push(WebSocketRequest { body });
+            }
+            request_log.notify_waiters();
+        }
+
+        for event in &request_events {
+            let Ok(payload) = serde_json::to_string(event) else {
+                continue;
+            };
+            if ws_stream.send(Message::Text(payload.into())).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    if close_after_requests {
+        let _ = ws_stream.close(None).await;
+    } else {
+        let _ = shutdown_notify.notified().await;
+    }
+
+    eprintln!(
+        "[ws concurrent test server +{}ms] connection={} finished",
+        start.elapsed().as_millis(),
+        connection_index
+    );
 }
 
 fn parse_ws_request_body(message: Message) -> Option<Value> {

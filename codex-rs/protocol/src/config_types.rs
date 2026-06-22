@@ -52,7 +52,7 @@ pub enum CompactExactTailStrategy {
     RemoteLegacy,
     /// Use remote compaction v2.
     RemoteV2,
-    /// Use semantic transcript input with the legacy remote compaction endpoint.
+    /// Use semantic transcript input with remote v2 summary-only compaction.
     SemanticTranscript,
 }
 

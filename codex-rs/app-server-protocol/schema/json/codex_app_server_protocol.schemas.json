@@ -7786,7 +7786,7 @@
             "type": "string"
           },
           {
-            "description": "Use semantic transcript input with the legacy remote compaction endpoint.",
+            "description": "Use semantic transcript input with remote v2 summary-only compaction.",
             "enum": [
               "semantic_transcript"
             ],

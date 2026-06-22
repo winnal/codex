@@ -16,13 +16,14 @@ pub(super) use core_test_support::responses::ev_assistant_message;
 pub(super) use core_test_support::responses::ev_completed;
 pub(super) use core_test_support::responses::ev_completed_with_tokens;
 pub(super) use core_test_support::responses::ev_function_call;
+pub(super) use core_test_support::responses::ev_response_created;
 pub(super) use core_test_support::responses::mount_compact_json_once;
-pub(super) use core_test_support::responses::mount_compact_json_sequence;
 pub(super) use core_test_support::responses::mount_compact_response_once;
 pub(super) use core_test_support::responses::mount_sse_sequence;
 pub(super) use core_test_support::responses::sse;
 pub(super) use core_test_support::responses::sse_failed;
 pub(super) use core_test_support::responses::start_mock_server;
+pub(super) use core_test_support::responses::start_websocket_server_concurrent;
 pub(super) use core_test_support::skip_if_no_network;
 pub(super) use core_test_support::test_codex::TestCodex;
 pub(super) use core_test_support::test_codex::test_codex;
@@ -45,6 +46,32 @@ pub(super) const DUMMY_CALL_ID: &str = "call-multi-auto";
 
 pub(super) fn summary_with_prefix(summary: &str) -> String {
     format!("{SUMMARY_PREFIX}\n{summary}")
+}
+
+pub(super) fn ws_warm_response(response_id: &str) -> Vec<Value> {
+    vec![ev_response_created(response_id), ev_completed(response_id)]
+}
+
+pub(super) fn ws_assistant_response(
+    message_id: &str,
+    response_id: &str,
+    text: &str,
+    total_tokens: Option<i64>,
+) -> Vec<Value> {
+    match total_tokens {
+        Some(total_tokens) => vec![
+            ev_assistant_message(message_id, text),
+            ev_completed_with_tokens(response_id, total_tokens),
+        ],
+        None => vec![
+            ev_assistant_message(message_id, text),
+            ev_completed(response_id),
+        ],
+    }
+}
+
+pub(super) fn ws_compaction_response(summary: &str, response_id: &str) -> Vec<Value> {
+    vec![ev_compaction_item(summary), ev_completed(response_id)]
 }
 
 pub(super) fn set_test_compact_prompt(config: &mut Config) {

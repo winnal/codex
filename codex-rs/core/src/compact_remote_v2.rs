@@ -41,6 +41,7 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
+use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -364,8 +365,12 @@ async fn run_remote_compact_task_inner_impl(
                 "exact-tail-v2-compaction:{}",
                 turn_context.sub_id
             )))
-            .new_session();
-        isolated_client_session.reset_responses_continuation();
+            .with_beta_feature_advertised(Feature::RemoteCompactionV2.key())
+            .new_ephemeral_session();
+        let turn_state = client_session.as_ref().map(|session| session.turn_state());
+        if let Some(turn_state) = turn_state {
+            isolated_client_session = isolated_client_session.with_turn_state(turn_state);
+        }
         run_remote_compaction_request_v2(
             sess,
             turn_context,
@@ -490,6 +495,9 @@ async fn run_remote_compact_task_inner_impl(
         if let Some(client_session) = client_session {
             client_session.reset_responses_continuation();
         }
+        sess.services
+            .model_client
+            .reset_cached_responses_continuation();
         replacement.replacement_history
     } else {
         process_compacted_history(
@@ -532,12 +540,12 @@ async fn run_remote_compact_task_inner_impl(
     Ok(())
 }
 
-struct RemoteCompactionV2Output {
-    compaction_output: ResponseItem,
-    token_usage: Option<TokenUsage>,
+pub(crate) struct RemoteCompactionV2Output {
+    pub(crate) compaction_output: ResponseItem,
+    pub(crate) token_usage: Option<TokenUsage>,
 }
 
-async fn run_remote_compaction_request_v2(
+pub(crate) async fn run_remote_compaction_request_v2(
     sess: &Session,
     turn_context: &TurnContext,
     client_session: &mut ModelClientSession,

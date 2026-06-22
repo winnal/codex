@@ -1,5 +1,9 @@
 use super::compact_exact_tail_support::*;
+use codex_protocol::config_types::CompactExactTailStrategy;
 use pretty_assertions::assert_eq;
+
+const TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const BETA_FEATURES_HEADER: &str = "x-codex-beta-features";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_tail_remote_legacy_manual_compact_excludes_newest_atomic_hot_suffix_from_compaction_request()
@@ -565,6 +569,286 @@ async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_v2_strategy_advertises_beta_when_default_v2_disabled() -> Result<()> {
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message(
+                    "remote-v2-disabled-cold-assistant",
+                    "REMOTE_V2_DISABLED_COLD_ASSISTANT",
+                ),
+                ev_completed("remote-v2-disabled-cold-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "remote-v2-disabled-hot-assistant",
+                    "REMOTE_V2_DISABLED_HOT_ASSISTANT",
+                ),
+                ev_completed("remote-v2-disabled-hot-response"),
+            ]),
+            sse(vec![
+                ev_compaction_item("REMOTE_V2_DISABLED_SUMMARY"),
+                ev_completed("remote-v2-disabled-compact-response"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(1);
+            config.compact_exact_tail_strategy = CompactExactTailStrategy::RemoteV2;
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build(&server).await?;
+
+    submit_turn(&test, "REMOTE_V2_DISABLED_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_V2_DISABLED_HOT_USER").await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_compact_turn_complete(&test).await;
+
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected cold turn, hot turn, and explicit remote-v2 compaction request"
+    );
+    let compact_request = &requests[2];
+    assert_eq!(compact_request.path(), "/v1/responses");
+    assert!(
+        compact_request
+            .header(BETA_FEATURES_HEADER)
+            .as_deref()
+            .is_some_and(header_contains_remote_v2),
+        "explicit remote-v2 exact-tail compaction must advertise remote_compaction_v2 even when the default feature is disabled"
+    );
+    let compact_body = compact_request.body_json();
+    assert_eq!(
+        compact_body.get("previous_response_id"),
+        None,
+        "exact-tail v2 compaction must not continue a previous Responses chain"
+    );
+    assert!(
+        compact_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("exact-tail-v2-compaction:")),
+        "exact-tail v2 compaction must use an isolated prompt cache key; body: {compact_body}"
+    );
+    assert_eq!(
+        compact_request
+            .input()
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
+            .count(),
+        1,
+        "explicit remote-v2 input should append exactly one compaction_trigger"
+    );
+    assert_eq!(
+        compact_request
+            .input()
+            .last()
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str),
+        Some("compaction_trigger"),
+        "explicit remote-v2 input should end with compaction_trigger"
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_v2_manual_clears_cached_websocket_continuation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server_concurrent(vec![
+        vec![
+            ws_warm_response("remote-v2-manual-warm"),
+            ws_assistant_response(
+                "remote-v2-manual-cold",
+                "remote-v2-manual-cold-response",
+                "REMOTE_V2_MANUAL_COLD",
+                None,
+            ),
+            ws_assistant_response(
+                "remote-v2-manual-hot",
+                "remote-v2-manual-hot-response",
+                "REMOTE_V2_MANUAL_HOT",
+                None,
+            ),
+            ws_assistant_response(
+                "remote-v2-manual-stale",
+                "remote-v2-manual-stale-response",
+                "REMOTE_V2_MANUAL_STALE_REUSE",
+                None,
+            ),
+        ],
+        vec![ws_compaction_response(
+            "REMOTE_V2_MANUAL_SUMMARY",
+            "remote-v2-manual-compact-response",
+        )],
+        vec![ws_assistant_response(
+            "remote-v2-manual-follow",
+            "remote-v2-manual-follow-response",
+            "REMOTE_V2_MANUAL_FOLLOW",
+            None,
+        )],
+    ])
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(1);
+            explicitly_enable_remote_compaction_v2(config);
+        });
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    submit_turn(&test, "REMOTE_V2_MANUAL_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_V2_MANUAL_HOT_USER").await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_compact_turn_complete(&test).await;
+    submit_turn(&test, "REMOTE_V2_MANUAL_FOLLOW_USER").await?;
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 3);
+    assert_eq!(
+        connections[0].len(),
+        3,
+        "manual follow-up must not reuse the pre-compaction websocket"
+    );
+    let post_compaction = &connections[2];
+    assert_eq!(post_compaction.len(), 1);
+    let follow_body = post_compaction[0].body_json();
+    assert_ne!(
+        follow_body
+            .get("previous_response_id")
+            .and_then(Value::as_str),
+        Some("remote-v2-manual-hot-response"),
+        "manual exact-tail v2 compaction must clear stale pre-compaction continuation"
+    );
+    assert_eq!(follow_body.get("previous_response_id"), None);
+
+    shutdown_codex(&test).await?;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_v2_auto_clears_cached_websocket_continuation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server_concurrent(vec![
+        vec![
+            ws_warm_response("remote-v2-auto-warm"),
+            ws_assistant_response(
+                "remote-v2-auto-cold",
+                "remote-v2-auto-cold-response",
+                "REMOTE_V2_AUTO_COLD",
+                Some(50),
+            ),
+            vec![
+                json!({
+                    "type": "response.metadata",
+                    "headers": {(TURN_STATE_HEADER): "sampling-state"},
+                }),
+                ev_function_call("remote-v2-auto-call", DUMMY_FUNCTION_NAME, "{}"),
+                ev_completed_with_tokens("remote-v2-auto-hot-response", /*total_tokens*/ 500),
+            ],
+            ws_assistant_response(
+                "remote-v2-auto-stale",
+                "remote-v2-auto-stale-response",
+                "REMOTE_V2_AUTO_STALE_REUSE",
+                None,
+            ),
+        ],
+        vec![ws_compaction_response(
+            "REMOTE_V2_AUTO_SUMMARY",
+            "remote-v2-auto-compact-response",
+        )],
+        vec![ws_assistant_response(
+            "remote-v2-auto-final",
+            "remote-v2-auto-final-response",
+            "REMOTE_V2_AUTO_FINAL",
+            None,
+        )],
+    ])
+    .await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.model_auto_compact_token_limit = Some(100);
+            config.model_auto_compact_token_limit_scope =
+                AutoCompactTokenLimitScope::BodyAfterPrefix;
+            config.compact_preserve_recent_tokens = Some(1);
+            explicitly_enable_remote_compaction_v2(config);
+        });
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    submit_turn(&test, "REMOTE_V2_AUTO_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_V2_AUTO_HOT_USER").await?;
+
+    let connections = server.connections();
+    assert_eq!(connections.len(), 3);
+    assert_eq!(
+        connections[0].len(),
+        3,
+        "auto follow-up must not reuse the pre-compaction websocket"
+    );
+    let compact_body = connections[1][0].body_json();
+    assert_eq!(compact_body.get("previous_response_id"), None);
+    assert_eq!(
+        compact_body["client_metadata"][TURN_STATE_HEADER],
+        json!("sampling-state"),
+        "exact-tail v2 auto compaction must carry the active turn-state"
+    );
+    assert!(
+        compact_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("exact-tail-v2-compaction:")),
+        "exact-tail v2 auto compaction must use an isolated prompt cache key; body: {compact_body}"
+    );
+    assert!(
+        compact_body
+            .to_string()
+            .contains("\"type\":\"compaction_trigger\""),
+        "exact-tail v2 auto compaction should append a compaction trigger; body: {compact_body}"
+    );
+
+    let post_compaction = &connections[2];
+    assert_eq!(post_compaction.len(), 1);
+    let follow_body = post_compaction[0].body_json();
+    assert_ne!(
+        follow_body
+            .get("previous_response_id")
+            .and_then(Value::as_str),
+        Some("remote-v2-auto-hot-response"),
+        "exact-tail v2 auto compaction must clear stale pre-compaction continuation"
+    );
+    assert_eq!(follow_body.get("previous_response_id"), None);
+    assert!(
+        !follow_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .is_some_and(|key| key.starts_with("exact-tail-v2-compaction:")),
+        "post-compaction sampling must not inherit the isolated compact cache key"
+    );
+
+    shutdown_codex(&test).await?;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_tail_remote_v2_backend_context_window_error_emits_diagnostic() -> Result<()> {
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
@@ -982,4 +1266,10 @@ async fn exact_tail_remote_v2_enabled_auto_uses_cold_only_v2_request() -> Result
 
     shutdown_codex(&test).await?;
     Ok(())
+}
+
+fn header_contains_remote_v2(header: &str) -> bool {
+    header
+        .split(',')
+        .any(|feature| feature.trim() == "remote_compaction_v2")
 }

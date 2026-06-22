@@ -471,7 +471,7 @@ remote_compaction_v2 = false
 }
 
 #[tokio::test]
-async fn semantic_transcript_strategy_routes_to_semantic_transcript_regardless_of_v2_setting() {
+async fn semantic_transcript_strategy_uses_v2_summary_route_regardless_of_default_v2_setting() {
     for config_toml in [
         r#"compact_preserve_recent_tokens = 60000
 compact_exact_tail_strategy = "semantic_transcript"

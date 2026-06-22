@@ -1,8 +1,5 @@
-use std::sync::Arc;
-use std::sync::OnceLock;
-
 use crate::Prompt;
-use crate::client::CompactConversationRequestSettings;
+use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
@@ -21,8 +18,8 @@ use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
-use crate::compact_exact_tail::remote_legacy_summary_scaffold_overhead_tokens;
-use crate::compact_remote::should_keep_compacted_history_item;
+use crate::compact_remote_v2::RemoteCompactionV2Output;
+use crate::compact_remote_v2::run_remote_compaction_request_v2;
 use crate::compact_remote_v2_retention::retained_messages_for_remote_compaction_v2_with_item_cap;
 use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_response_items_token_count;
@@ -39,15 +36,17 @@ use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::CompactionTrigger;
-use codex_app_server_protocol::AuthMode;
+use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 mod renderer;
@@ -56,7 +55,7 @@ pub(crate) use renderer::render_semantic_transcript;
 pub(crate) async fn run_inline_remote_auto_compact_task(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
-    turn_state: Arc<OnceLock<String>>,
+    client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
@@ -64,7 +63,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
     run_remote_compact_task_inner(
         &sess,
         &turn_context,
-        Some(turn_state),
+        Some(client_session),
         initial_context_injection,
         CompactionTrigger::Auto,
         reason,
@@ -89,7 +88,7 @@ pub(crate) async fn run_remote_compact_task(
     run_remote_compact_task_inner(
         &sess,
         &turn_context,
-        /*turn_state*/ None,
+        None,
         InitialContextInjection::DoNotInject,
         CompactionTrigger::Manual,
         CompactionReason::UserRequested,
@@ -101,7 +100,7 @@ pub(crate) async fn run_remote_compact_task(
 async fn run_remote_compact_task_inner(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    turn_state: Option<Arc<OnceLock<String>>>,
+    client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
     trigger: CompactionTrigger,
     reason: CompactionReason,
@@ -110,7 +109,7 @@ async fn run_remote_compact_task_inner(
     let compaction_metadata = CompactionTurnMetadata::new(
         trigger,
         reason,
-        CompactionImplementation::ResponsesCompact,
+        CompactionImplementation::ResponsesCompactionV2,
         phase,
     );
     let mut analytics_details = CompactionAnalyticsDetails {
@@ -122,7 +121,7 @@ async fn run_remote_compact_task_inner(
         turn_context.as_ref(),
         trigger,
         reason,
-        CompactionImplementation::ResponsesCompact,
+        CompactionImplementation::ResponsesCompactionV2,
         phase,
     )
     .await;
@@ -145,7 +144,7 @@ async fn run_remote_compact_task_inner(
     let result = run_remote_compact_task_inner_impl(
         sess,
         turn_context,
-        turn_state,
+        client_session,
         initial_context_injection,
         trigger,
         compaction_metadata,
@@ -180,7 +179,7 @@ async fn run_remote_compact_task_inner(
 async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    turn_state: Option<Arc<OnceLock<String>>>,
+    client_session: Option<&mut ModelClientSession>,
     initial_context_injection: InitialContextInjection,
     trigger: CompactionTrigger,
     compaction_metadata: CompactionTurnMetadata,
@@ -219,8 +218,7 @@ async fn run_remote_compact_task_inner_impl(
         policy,
         trigger,
         initial_context_injection,
-        estimated_summary_scaffold_overhead_tokens: remote_legacy_summary_scaffold_overhead_tokens(
-        ),
+        estimated_summary_scaffold_overhead_tokens: 0,
         retained_cold_user_message_budget_tokens: retained_budget,
         normalized_tool_output_count,
         implementation: exact_tail_implementation,
@@ -351,8 +349,13 @@ async fn run_remote_compact_task_inner_impl(
         &CancellationToken::new(),
     )
     .await?;
+    let mut input = prompt_input.clone();
+    input.push(ResponseItem::CompactionTrigger {
+        id: None,
+        metadata: None,
+    });
     let prompt = Prompt {
-        input: prompt_input,
+        input,
         tools: tool_router.model_visible_specs(),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
@@ -365,30 +368,45 @@ async fn run_remote_compact_task_inner_impl(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
+    let trace_attempt = compaction_trace.start_attempt(&serde_json::json!({
+        "model": turn_context.model_info.slug.as_str(),
+        "instructions": prompt.base_instructions.text.as_str(),
+        "input": &prompt.input,
+        "parallel_tool_calls": prompt.parallel_tool_calls,
+    }));
 
-    let mut new_history = match sess
+    let mut isolated_client_session = sess
         .services
         .model_client
-        .compact_conversation_history(
-            &prompt,
-            &turn_context.model_info,
-            turn_state,
-            CompactConversationRequestSettings {
-                effort: turn_context.reasoning_effort.clone(),
-                summary: turn_context.reasoning_summary,
-                service_tier: if sess.services.auth_manager.auth_mode() == Some(AuthMode::ApiKey) {
-                    None
-                } else {
-                    turn_context.config.service_tier.clone()
-                },
-            },
-            &turn_context.session_telemetry,
-            &compaction_trace,
-            &responses_metadata,
-        )
-        .await
-    {
-        Ok(new_history) => new_history,
+        .clone()
+        .with_beta_feature_advertised(Feature::RemoteCompactionV2.key())
+        .with_prompt_cache_key_override(Some(format!(
+            "semantic-transcript-v2-compaction:{}",
+            turn_context.sub_id
+        )))
+        .new_ephemeral_session();
+    let turn_state = client_session.as_ref().map(|session| session.turn_state());
+    if let Some(turn_state) = turn_state {
+        isolated_client_session = isolated_client_session.with_turn_state(turn_state);
+    }
+    let compaction_output_result = run_remote_compaction_request_v2(
+        sess,
+        turn_context,
+        &mut isolated_client_session,
+        &prompt,
+        &responses_metadata,
+    )
+    .await;
+    trace_attempt.record_result(
+        compaction_output_result
+            .as_ref()
+            .map(|output| std::slice::from_ref(&output.compaction_output)),
+    );
+    let RemoteCompactionV2Output {
+        compaction_output,
+        token_usage,
+    } = match compaction_output_result {
+        Ok(output) => output,
         Err(error) => {
             if matches!(error, CodexErr::ContextWindowExceeded) {
                 emit_exact_tail_compaction_diagnostic(
@@ -406,9 +424,15 @@ async fn run_remote_compact_task_inner_impl(
             return Err(error);
         }
     };
+    if let Some(token_usage) = token_usage {
+        analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
+        analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
+    }
 
-    new_history.retain(should_keep_compacted_history_item);
-    if let Err(error) = ensure_replacement_has_cold_summary(&exact_tail_plan.plan, &new_history) {
+    if let Err(error) = ensure_replacement_has_cold_summary(
+        &exact_tail_plan.plan,
+        std::slice::from_ref(&compaction_output),
+    ) {
         let failure_reason = error.reason;
         emit_exact_tail_compaction_diagnostic(
             sess.as_ref(),
@@ -422,12 +446,13 @@ async fn run_remote_compact_task_inner_impl(
         .await;
         return Err(error.into_codex_err());
     }
-    let actual_summary_tokens = estimate_response_items_token_count(&new_history);
+    let actual_summary_tokens =
+        estimate_response_items_token_count(std::slice::from_ref(&compaction_output));
     exact_tail_plan.plan.diagnostics.actual_summary_tokens = Some(actual_summary_tokens);
     analytics_details.compaction_summary_tokens = Some(actual_summary_tokens);
 
     let mut compacted_history = retained_messages;
-    compacted_history.extend(new_history);
+    compacted_history.push(compaction_output);
     let attempted_replacement = append_hot_suffix_to_replacement(
         compacted_history.clone(),
         exact_tail_plan.initial_context.clone(),
@@ -483,6 +508,12 @@ async fn run_remote_compact_task_inner_impl(
     )
     .await;
     let new_history = replacement.replacement_history;
+    if let Some(client_session) = client_session {
+        client_session.reset_responses_continuation();
+    }
+    sess.services
+        .model_client
+        .reset_cached_responses_continuation();
     let new_window_id = sess.advance_auto_compact_window_id().await;
 
     let reference_context_item = match initial_context_injection {

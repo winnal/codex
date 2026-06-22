@@ -226,6 +226,7 @@ impl RequestRouteTelemetry {
 pub struct ModelClient {
     state: Arc<ModelClientState>,
     prompt_cache_key_override: Option<String>,
+    beta_features_header_override: Option<String>,
 }
 
 /// A turn-scoped streaming session created from a [`ModelClient`].
@@ -244,6 +245,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    cache_websocket_session_on_drop: bool,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -412,6 +414,7 @@ impl ModelClient {
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
             }),
             prompt_cache_key_override: None,
+            beta_features_header_override: None,
         }
     }
 
@@ -421,6 +424,30 @@ impl ModelClient {
     ) -> Self {
         self.prompt_cache_key_override = prompt_cache_key_override;
         self
+    }
+
+    pub(crate) fn with_beta_feature_advertised(mut self, feature: &'static str) -> Self {
+        let effective = self.beta_features_header();
+        let mut features = effective
+            .as_deref()
+            .map(|header| {
+                header
+                    .split(',')
+                    .filter(|feature| !feature.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !features.contains(&feature) {
+            features.push(feature);
+        }
+        self.beta_features_header_override = Some(features.join(","));
+        self
+    }
+
+    fn beta_features_header(&self) -> Option<String> {
+        self.beta_features_header_override
+            .clone()
+            .or_else(|| self.state.beta_features_header.clone())
     }
 
     fn prompt_cache_key(&self) -> String {
@@ -437,6 +464,18 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            cache_websocket_session_on_drop: true,
+            turn_state: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Creates a fresh session that never reads or writes the shared websocket
+    /// continuation cache.
+    pub(crate) fn new_ephemeral_session(&self) -> ModelClientSession {
+        ModelClientSession {
+            client: self.clone(),
+            websocket_session: WebsocketSession::default(),
+            cache_websocket_session_on_drop: false,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -462,6 +501,10 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
     }
 
+    pub(crate) fn reset_cached_responses_continuation(&self) {
+        self.store_cached_websocket_session(WebsocketSession::default());
+    }
+
     pub(crate) fn force_http_fallback(
         &self,
         session_telemetry: &SessionTelemetry,
@@ -479,7 +522,7 @@ impl ModelClient {
             );
         }
 
-        self.store_cached_websocket_session(WebsocketSession::default());
+        self.reset_cached_responses_continuation();
         activated
     }
 
@@ -554,8 +597,9 @@ impl ModelClient {
         if let Ok(header_value) = HeaderValue::from_str(&responses_metadata.installation_id) {
             extra_headers.insert(X_CODEX_INSTALLATION_ID_HEADER, header_value);
         }
+        let beta_features_header = self.beta_features_header();
         extra_headers.extend(build_responses_headers(
-            self.state.beta_features_header.as_deref(),
+            beta_features_header.as_deref(),
             turn_state.as_ref(),
         ));
         extra_headers.extend(self.build_responses_compatibility_headers(responses_metadata));
@@ -969,10 +1013,9 @@ impl ModelClient {
         &self,
         responses_metadata: &CodexResponsesMetadata,
     ) -> ApiHeaderMap {
-        let mut headers = build_responses_headers(
-            self.state.beta_features_header.as_deref(),
-            /*turn_state*/ None,
-        );
+        let beta_features_header = self.beta_features_header();
+        let mut headers =
+            build_responses_headers(beta_features_header.as_deref(), /*turn_state*/ None);
         if let Ok(header_value) = HeaderValue::from_str(&responses_metadata.thread_id) {
             headers.insert("x-client-request-id", header_value);
         }
@@ -1000,6 +1043,9 @@ impl ModelClient {
 
 impl Drop for ModelClientSession {
     fn drop(&mut self) {
+        if !self.cache_websocket_session_on_drop {
+            return;
+        }
         let websocket_session = std::mem::take(&mut self.websocket_session);
         self.client
             .store_cached_websocket_session(websocket_session);
@@ -1009,6 +1055,11 @@ impl Drop for ModelClientSession {
 impl ModelClientSession {
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
         Arc::clone(&self.turn_state)
+    }
+
+    pub(crate) fn with_turn_state(mut self, turn_state: Arc<OnceLock<String>>) -> Self {
+        self.turn_state = turn_state;
+        self
     }
 
     fn reset_websocket_session(&mut self) {
@@ -1040,8 +1091,9 @@ impl ModelClientSession {
             thread_id: Some(responses_metadata.thread_id.to_string()),
             session_source: Some(self.client.state.session_source.clone()),
             extra_headers: {
+                let beta_features_header = self.client.beta_features_header();
                 let mut headers = build_responses_headers(
-                    self.client.state.beta_features_header.as_deref(),
+                    beta_features_header.as_deref(),
                     Some(&self.turn_state),
                 );
                 headers.extend(
