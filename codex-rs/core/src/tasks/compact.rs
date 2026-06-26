@@ -44,7 +44,7 @@ impl SessionTask for CompactTask {
                         ),
                     )
                     .await;
-                return None;
+                return Ok(None);
             }
         };
         emit_compact_metric(

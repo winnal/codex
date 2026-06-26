@@ -332,7 +332,7 @@ fn bounded_message(
                 ContentItem::InputText { text: truncated }
             }],
             phase: phase.clone(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         };
         let item_tokens = estimate_response_items_token_count(std::slice::from_ref(&item));
         if item_tokens <= max_model_visible_item_tokens {

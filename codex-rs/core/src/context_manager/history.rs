@@ -519,7 +519,7 @@ fn truncate_function_output_item_to_policy(
         return omitted_item;
     }
 
-    omitted_item.clear_metadata();
+    omitted_item.clear_internal_chat_message_metadata_passthrough();
     omitted_item
 }
 

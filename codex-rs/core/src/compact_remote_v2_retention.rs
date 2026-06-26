@@ -136,7 +136,7 @@ fn truncate_message_text_to_token_budget(
         role,
         content,
         phase,
-        metadata,
+        internal_chat_message_metadata_passthrough: metadata,
     } = item
     else {
         return Some(item);
@@ -175,7 +175,7 @@ fn truncate_message_text_to_token_budget(
         role,
         content: truncated_content,
         phase,
-        metadata,
+        internal_chat_message_metadata_passthrough: metadata,
     })
 }
 
