@@ -1191,7 +1191,7 @@ fn record_items_keeps_read_thread_sized_tool_output_within_serialized_item_budge
             body: FunctionCallOutputBody::Text(long_output),
             success: Some(true),
         },
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     history.record_items([&item], policy);
@@ -1229,7 +1229,7 @@ fn normalize_tool_outputs_to_policy_shrinks_legacy_larger_config_items() {
             body: FunctionCallOutputBody::Text(long_output),
             success: Some(true),
         },
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let custom_item = ResponseItem::CustomToolCallOutput {
         id: None,
@@ -1239,7 +1239,7 @@ fn normalize_tool_outputs_to_policy_shrinks_legacy_larger_config_items() {
             body: FunctionCallOutputBody::Text("legacy custom payload ".repeat(25_000)),
             success: Some(true),
         },
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     history.record_items([&item, &custom_item], old_policy);
     let old_item_token_limit = model_visible_tool_output_item_token_limit(
@@ -1286,7 +1286,7 @@ fn normalize_tool_outputs_to_policy_keeps_conforming_items() {
         id: None,
         call_id: "small-call".to_string(),
         output: FunctionCallOutputPayload::from_text("small output".to_string()),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     history.record_items([&item], policy);
     let before = history.raw_items().to_vec();
@@ -1313,7 +1313,7 @@ fn record_items_omits_unshrinkable_function_output_to_enforce_serialized_item_bu
             .take(20)
             .collect(),
         ),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     history.record_items([&item], policy);

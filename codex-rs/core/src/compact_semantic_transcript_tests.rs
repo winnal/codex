@@ -15,7 +15,7 @@ fn message(role: &str, text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
-        metadata: Some(Default::default()),
+        internal_chat_message_metadata_passthrough: Some(Default::default()),
     }
 }
 
@@ -30,7 +30,7 @@ fn semantic_transcript_strips_protocol_ids_and_keeps_tool_observation() {
                 text: "SEM_ASSISTANT_VISIBLE".to_string(),
             }],
             phase: Some(MessagePhase::Commentary),
-            metadata: Some(Default::default()),
+            internal_chat_message_metadata_passthrough: Some(Default::default()),
         },
         ResponseItem::FunctionCall {
             id: Some("fc-id".to_string()),
@@ -38,13 +38,13 @@ fn semantic_transcript_strips_protocol_ids_and_keeps_tool_observation() {
             namespace: Some("functions".to_string()),
             arguments: "{\"command\":\"rg SEM\"}".to_string(),
             call_id: "call_sem".to_string(),
-            metadata: Some(Default::default()),
+            internal_chat_message_metadata_passthrough: Some(Default::default()),
         },
         ResponseItem::FunctionCallOutput {
             id: Some("out-id".to_string()),
             call_id: "call_sem".to_string(),
             output: FunctionCallOutputPayload::from_text("SEM_TOOL_OUTPUT".to_string()),
-            metadata: Some(Default::default()),
+            internal_chat_message_metadata_passthrough: Some(Default::default()),
         },
     ];
 
@@ -68,12 +68,12 @@ fn semantic_transcript_keeps_prior_summaries_as_cold_summary_entries() {
         ResponseItem::Compaction {
             id: Some("summary-id".to_string()),
             encrypted_content: "SEM_PRIOR_SUMMARY".to_string(),
-            metadata: Some(Default::default()),
+            internal_chat_message_metadata_passthrough: Some(Default::default()),
         },
         ResponseItem::ContextCompaction {
             id: Some("context-summary-id".to_string()),
             encrypted_content: Some("SEM_CONTEXT_SUMMARY".to_string()),
-            metadata: Some(Default::default()),
+            internal_chat_message_metadata_passthrough: Some(Default::default()),
         },
     ];
 
@@ -95,13 +95,13 @@ fn semantic_transcript_bounds_large_tool_outputs() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call_large".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
             call_id: "call_large".to_string(),
             output: FunctionCallOutputPayload::from_text("word ".repeat(10_000)),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
 
@@ -126,7 +126,7 @@ fn semantic_transcript_uses_reasoning_summary_not_hidden_content() {
         }],
         content: None,
         encrypted_content: Some("SEM_HIDDEN_REASONING".to_string()),
-        metadata: Some(Default::default()),
+        internal_chat_message_metadata_passthrough: Some(Default::default()),
     }];
 
     let transcript = render_semantic_transcript(&cold_history, 10_000).expect("render transcript");
@@ -146,7 +146,7 @@ fn semantic_transcript_flushes_orphan_tool_calls_in_source_order() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call_first".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCall {
             id: None,
@@ -154,7 +154,7 @@ fn semantic_transcript_flushes_orphan_tool_calls_in_source_order() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call_second".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
 

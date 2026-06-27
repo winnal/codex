@@ -11,7 +11,7 @@ fn message(role: &str, text: &str, phase: Option<MessagePhase>) -> ResponseItem 
             text: text.to_string(),
         }],
         phase,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -45,7 +45,7 @@ fn build_v2_compacted_history_filters_to_installed_retention_shape() {
             namespace: None,
             arguments: "{}".to_string(),
             call_id: "call_1".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::FunctionCallOutput {
             id: None,
@@ -53,18 +53,18 @@ fn build_v2_compacted_history_filters_to_installed_retention_shape() {
             output: codex_protocol::models::FunctionCallOutputPayload::from_text(
                 "output".to_string(),
             ),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Compaction {
             id: None,
             encrypted_content: "old".to_string(),
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         },
     ];
     let output = ResponseItem::Compaction {
         id: None,
         encrypted_content: "new".to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let (history, _) = build_v2_compacted_history(&input, output.clone());
@@ -94,7 +94,7 @@ fn build_v2_compacted_history_discards_messages_before_truncating() {
     let output = ResponseItem::Compaction {
         id: None,
         encrypted_content: "new".to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let (history, _) = build_v2_compacted_history(&input, output.clone());
@@ -121,12 +121,12 @@ fn build_v2_compacted_history_counts_retained_input_images() {
             },
         ],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let output = ResponseItem::Compaction {
         id: None,
         encrypted_content: "new".to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let (_, retained_image_count) = build_v2_compacted_history(&input, output);
@@ -204,7 +204,7 @@ fn retained_history_truncation_preserves_images_and_truncates_later_text_parts()
             },
         ],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
 
     let truncated = truncate_retained_messages_for_remote_compaction(
@@ -231,7 +231,7 @@ fn retained_history_truncation_preserves_images_and_truncates_later_text_parts()
                 },
             ],
             phase: None,
-            metadata: None,
+            internal_chat_message_metadata_passthrough: None,
         }]
     );
 }
@@ -246,7 +246,7 @@ fn retained_history_truncation_charges_image_only_messages() {
             detail: None,
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let newest = message("user", "new", /*phase*/ None);
     let retained = vec![
@@ -274,7 +274,7 @@ fn retained_history_truncation_drops_image_only_messages_after_budget_is_spent()
             detail: None,
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let newest = message("user", "new", /*phase*/ None);
     let retained = vec![image_only_message, newest.clone()];

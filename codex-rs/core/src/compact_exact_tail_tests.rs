@@ -25,7 +25,7 @@ fn user(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -37,7 +37,7 @@ fn assistant(text: &str) -> ResponseItem {
             text: text.to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -49,7 +49,7 @@ fn agent_message(text: &str) -> ResponseItem {
         content: vec![AgentMessageInputContent::InputText {
             text: text.to_string(),
         }],
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -68,7 +68,7 @@ fn inter_agent_assistant_msg(text: &str) -> ResponseItem {
             text: serde_json::to_string(&communication).unwrap(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -76,7 +76,7 @@ fn compaction_summary(text: &str) -> ResponseItem {
     ResponseItem::Compaction {
         id: None,
         encrypted_content: text.to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -86,7 +86,7 @@ fn developer(content: Vec<ContentItem>) -> ResponseItem {
         role: "developer".to_string(),
         content,
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -97,7 +97,7 @@ fn function_call(call_id: &str) -> ResponseItem {
         namespace: None,
         arguments: "{}".to_string(),
         call_id: call_id.to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -106,7 +106,7 @@ fn function_output(call_id: &str, output: &str) -> ResponseItem {
         id: None,
         call_id: call_id.to_string(),
         output: FunctionCallOutputPayload::from_text(output.to_string()),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }
 }
 
@@ -190,7 +190,7 @@ fn exact_tail_normalizes_legacy_tool_outputs_only_for_exact_preserve_policy() {
             body: FunctionCallOutputBody::Text("legacy exact-tail output ".repeat(25_000)),
             success: Some(true),
         },
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     };
     let mut standard_history = ContextManager::new();
     standard_history.record_items([&item], old_policy);

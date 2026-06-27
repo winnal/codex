@@ -40,7 +40,7 @@ async fn exact_tail_remote_legacy_manual_compact_excludes_newest_atomic_hot_suff
     let compacted_history = vec![codex_protocol::models::ResponseItem::Compaction {
         id: None,
         encrypted_content: "REMOTE_EXACT_TAIL_SUMMARY".to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
@@ -172,7 +172,7 @@ async fn exact_tail_remote_legacy_auto_compact_excludes_newest_atomic_hot_suffix
     let compacted_history = vec![codex_protocol::models::ResponseItem::Compaction {
         id: None,
         encrypted_content: "REMOTE_AUTO_EXACT_TAIL_SUMMARY".to_string(),
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
@@ -265,7 +265,7 @@ async fn exact_tail_remote_legacy_user_only_output_fails_without_installing_hist
             text: "REMOTE_USER_ONLY_RETAINED_TEXT".to_string(),
         }],
         phase: None,
-        metadata: None,
+        internal_chat_message_metadata_passthrough: None,
     }];
     let compact_mock =
         mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;

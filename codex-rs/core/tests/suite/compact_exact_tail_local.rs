@@ -40,7 +40,7 @@ async fn exact_tail_local_manual_compact_excludes_newest_atomic_hot_suffix_from_
     });
     builder = builder.with_workspace_setup(|cwd, fs| async move {
         fs.write_file(
-            &codex_utils_path_uri::PathUri::from_path(cwd.join("AGENTS.md"))?,
+            &codex_utils_path_uri::PathUri::from_host_native_path(cwd.join("AGENTS.md"))?,
             b"LOCAL_MANUAL_CONTEXT_MARKER".to_vec(),
             /*sandbox*/ None,
         )
@@ -266,7 +266,7 @@ async fn exact_tail_local_manual_reserves_reinjected_initial_context_before_comp
         })
         .with_workspace_setup(move |cwd, fs| async move {
             fs.write_file(
-                &codex_utils_path_uri::PathUri::from_path(cwd.join("AGENTS.md"))?,
+                &codex_utils_path_uri::PathUri::from_host_native_path(cwd.join("AGENTS.md"))?,
                 large_context.into_bytes(),
                 /*sandbox*/ None,
             )

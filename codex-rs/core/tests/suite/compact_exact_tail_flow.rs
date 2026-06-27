@@ -56,7 +56,7 @@ async fn exact_tail_mid_turn_compaction_preserves_hot_tool_turn_outside_compacto
         })
         .with_workspace_setup(|cwd, fs| async move {
             fs.write_file(
-                &codex_utils_path_uri::PathUri::from_path(cwd.join("AGENTS.md"))?,
+                &codex_utils_path_uri::PathUri::from_host_native_path(cwd.join("AGENTS.md"))?,
                 b"EXACT_TAIL_MID_CONTEXT_MARKER".to_vec(),
                 /*sandbox*/ None,
             )
