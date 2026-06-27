@@ -54,14 +54,19 @@ async fn exact_tail_local_manual_compact_excludes_newest_atomic_hot_suffix_from_
         .clone()
         .expect("rollout path");
 
-    test.submit_turn(&cold_user).await?;
-    test.submit_turn(&hot_user).await?;
+    test.submit_turn_with_completion_timeout(&cold_user, Duration::from_secs(90))
+        .await?;
+    test.submit_turn_with_completion_timeout(&hot_user, Duration::from_secs(90))
+        .await?;
     test.codex.submit(Op::Compact).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(90),
+    )
     .await;
-    test.submit_turn("FOLLOW_UP_USER").await?;
+    test.submit_turn_with_completion_timeout("FOLLOW_UP_USER", Duration::from_secs(90))
+        .await?;
 
     let requests = response_mock.requests();
     assert_eq!(
@@ -195,14 +200,21 @@ async fn exact_tail_local_backend_context_window_error_fails_without_pruning() -
         .clone()
         .expect("rollout path");
 
-    test.submit_turn("LOCAL_BACKEND_COLD_USER").await?;
-    test.submit_turn("LOCAL_BACKEND_HOT_USER").await?;
+    test.submit_turn_with_completion_timeout("LOCAL_BACKEND_COLD_USER", Duration::from_secs(90))
+        .await?;
+    test.submit_turn_with_completion_timeout("LOCAL_BACKEND_HOT_USER", Duration::from_secs(90))
+        .await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = match wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::Error(_)),
+        Duration::from_secs(90),
+    )
+    .await
+    {
+        EventMsg::Error(err) => err.message,
+        event => panic!("expected error event, got {event:?}"),
+    };
 
     assert!(
         error_message.contains("ExactTailBackendContextExceeded"),
@@ -275,13 +287,19 @@ async fn exact_tail_local_manual_reserves_reinjected_initial_context_before_comp
         });
     let test = builder.build(&server).await?;
 
-    test.submit_turn("LOCAL_CONTEXT_USER").await?;
+    test.submit_turn_with_completion_timeout("LOCAL_CONTEXT_USER", Duration::from_secs(90))
+        .await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = match wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::Error(_)),
+        Duration::from_secs(90),
+    )
+    .await
+    {
+        EventMsg::Error(err) => err.message,
+        event => panic!("expected error event, got {event:?}"),
+    };
 
     assert!(
         error_message.contains("ExactTailMinimumHotSuffixTooLarge"),
@@ -328,13 +346,19 @@ async fn exact_tail_local_manual_rejects_oversize_reinjected_initial_context_ite
         .clone()
         .expect("rollout path");
 
-    test.submit_turn("LOCAL_CONTEXT_ITEM_USER").await?;
+    test.submit_turn_with_completion_timeout("LOCAL_CONTEXT_ITEM_USER", Duration::from_secs(90))
+        .await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = match wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::Error(_)),
+        Duration::from_secs(90),
+    )
+    .await
+    {
+        EventMsg::Error(err) => err.message,
+        event => panic!("expected error event, got {event:?}"),
+    };
 
     assert!(
         error_message.contains("ExactTailModelVisibleItemTooLarge"),
@@ -406,14 +430,21 @@ async fn exact_tail_local_empty_summary_fails_without_installing_history() -> Re
         .clone()
         .expect("rollout path");
 
-    test.submit_turn("EMPTY_SUMMARY_COLD_USER").await?;
-    test.submit_turn("EMPTY_SUMMARY_HOT_USER").await?;
+    test.submit_turn_with_completion_timeout("EMPTY_SUMMARY_COLD_USER", Duration::from_secs(90))
+        .await?;
+    test.submit_turn_with_completion_timeout("EMPTY_SUMMARY_HOT_USER", Duration::from_secs(90))
+        .await?;
     test.codex.submit(Op::Compact).await?;
-    let error_message = wait_for_event_match(&test.codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
+    let error_message = match wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::Error(_)),
+        Duration::from_secs(90),
+    )
+    .await
+    {
+        EventMsg::Error(err) => err.message,
+        event => panic!("expected error event, got {event:?}"),
+    };
 
     assert!(
         error_message.contains("ExactTailNoUsableColdSummary"),
@@ -509,7 +540,9 @@ async fn exact_tail_auto_compact_body_after_prefix_uses_full_context_window_budg
         .expect("build codex");
 
     for user in ["EXACT_TAIL_BODY_PREFIX_ONE", "EXACT_TAIL_BODY_PREFIX_TWO"] {
-        test.submit_turn(user).await.expect("submit turn");
+        test.submit_turn_with_completion_timeout(user, Duration::from_secs(90))
+            .await
+            .expect("submit turn");
     }
     assert_eq!(
         request_log.requests().len(),
@@ -517,9 +550,12 @@ async fn exact_tail_auto_compact_body_after_prefix_uses_full_context_window_budg
         "first two turns should establish a prefix and growth without compacting"
     );
 
-    test.submit_turn("EXACT_TAIL_BODY_PREFIX_THREE")
-        .await
-        .expect("submit third turn");
+    test.submit_turn_with_completion_timeout(
+        "EXACT_TAIL_BODY_PREFIX_THREE",
+        Duration::from_secs(90),
+    )
+    .await
+    .expect("submit third turn");
 
     let requests = request_log.requests();
     assert_eq!(

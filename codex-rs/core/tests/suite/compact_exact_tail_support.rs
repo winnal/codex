@@ -28,7 +28,6 @@ pub(super) use core_test_support::skip_if_no_network;
 pub(super) use core_test_support::test_codex::TestCodex;
 pub(super) use core_test_support::test_codex::test_codex;
 pub(super) use core_test_support::wait_for_event;
-pub(super) use core_test_support::wait_for_event_match;
 pub(super) use core_test_support::wait_for_event_with_timeout;
 pub(super) use serde_json::Value;
 pub(super) use serde_json::json;

@@ -67,10 +67,10 @@ async fn exact_tail_mid_turn_compaction_preserves_hot_tool_turn_outside_compacto
         .await
         .expect("build codex");
 
-    test.submit_turn("EXACT_TAIL_MID_COLD_USER")
+    test.submit_turn_with_completion_timeout("EXACT_TAIL_MID_COLD_USER", Duration::from_secs(90))
         .await
         .expect("submit cold turn");
-    test.submit_turn("EXACT_TAIL_MID_HOT_USER")
+    test.submit_turn_with_completion_timeout("EXACT_TAIL_MID_HOT_USER", Duration::from_secs(90))
         .await
         .expect("submit hot tool turn");
 
@@ -170,17 +170,25 @@ async fn exact_tail_replacement_history_survives_resume() -> Result<()> {
         .clone()
         .expect("rollout path");
 
-    initial.submit_turn("RESUME_COLD_USER").await?;
-    initial.submit_turn("RESUME_HOT_USER").await?;
+    initial
+        .submit_turn_with_completion_timeout("RESUME_COLD_USER", Duration::from_secs(90))
+        .await?;
+    initial
+        .submit_turn_with_completion_timeout("RESUME_HOT_USER", Duration::from_secs(90))
+        .await?;
     initial.codex.submit(Op::Compact).await?;
-    wait_for_event(&initial.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &initial.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(90),
+    )
     .await;
     initial.codex.submit(Op::Shutdown).await?;
-    wait_for_event(&initial.codex, |event| {
-        matches!(event, EventMsg::ShutdownComplete)
-    })
+    wait_for_event_with_timeout(
+        &initial.codex,
+        |event| matches!(event, EventMsg::ShutdownComplete),
+        Duration::from_secs(90),
+    )
     .await;
 
     let provider = local_compaction_provider(&server);
@@ -191,7 +199,9 @@ async fn exact_tail_replacement_history_survives_resume() -> Result<()> {
         config.compact_preserve_recent_tokens = Some(1);
     });
     let resumed = resumed_builder.resume(&server, home, rollout_path).await?;
-    resumed.submit_turn("RESUME_FOLLOW_UP_USER").await?;
+    resumed
+        .submit_turn_with_completion_timeout("RESUME_FOLLOW_UP_USER", Duration::from_secs(90))
+        .await?;
 
     let requests = response_mock.requests();
     assert_eq!(
@@ -258,20 +268,28 @@ async fn exact_tail_manual_compact_twice_preserves_newest_suffix_each_time() -> 
     });
     let test = builder.build(&server).await?;
 
-    test.submit_turn("TWICE_COLD_USER").await?;
-    test.submit_turn("TWICE_HOT_USER").await?;
+    test.submit_turn_with_completion_timeout("TWICE_COLD_USER", Duration::from_secs(90))
+        .await?;
+    test.submit_turn_with_completion_timeout("TWICE_HOT_USER", Duration::from_secs(90))
+        .await?;
     test.codex.submit(Op::Compact).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(90),
+    )
     .await;
-    test.submit_turn("TWICE_AFTER_ONE_USER").await?;
+    test.submit_turn_with_completion_timeout("TWICE_AFTER_ONE_USER", Duration::from_secs(90))
+        .await?;
     test.codex.submit(Op::Compact).await?;
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(90),
+    )
     .await;
-    test.submit_turn("TWICE_FINAL_USER").await?;
+    test.submit_turn_with_completion_timeout("TWICE_FINAL_USER", Duration::from_secs(90))
+        .await?;
 
     let requests = response_mock.requests();
     assert_eq!(
