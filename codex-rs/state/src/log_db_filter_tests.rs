@@ -23,6 +23,9 @@ async fn sqlite_sink_drops_low_level_opentelemetry_sdk_logs() {
         )
         .set_default();
 
+    tracing::trace!(target: "log", "dropped-bridged-log");
+    tracing::trace!(target: "codex_otel.log_only", "dropped-otel-log");
+    tracing::trace!(target: "codex_otel.trace_safe", "dropped-otel-trace");
     tracing::trace!(target: "opentelemetry_sdk", "dropped-trace");
     tracing::debug!(target: "opentelemetry_sdk", "dropped-debug");
     tracing::info!(target: "opentelemetry_sdk", "retained-info");
