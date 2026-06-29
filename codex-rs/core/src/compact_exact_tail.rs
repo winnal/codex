@@ -17,6 +17,7 @@ use codex_protocol::protocol::ExactTailCompactionDiagnosticEvent;
 use codex_protocol::protocol::ExactTailCompactionFitResult;
 use codex_protocol::protocol::ExactTailCompactionRoute;
 use codex_protocol::protocol::ExactTailCompactionTrigger;
+use codex_protocol::protocol::ExactTailModelVisibleItemKind;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use tracing::warn;
@@ -445,8 +446,11 @@ pub(crate) async fn emit_exact_tail_compaction_diagnostic(
     event.semantic_transcript_reduction_tokens = diagnostics.semantic_transcript_reduction_tokens;
     event.retained_cold_message_tokens = diagnostics.retained_cold_message_tokens;
     event.retained_cold_message_count = diagnostics.retained_cold_message_count;
-    sess.send_event(turn_context, EventMsg::ExactTailCompactionDiagnostic(event))
-        .await;
+    sess.send_event(
+        turn_context,
+        EventMsg::ExactTailCompactionDiagnostic(Box::new(event)),
+    )
+    .await;
 }
 
 pub(crate) async fn emit_exact_tail_prepare_failure_diagnostic(
@@ -455,19 +459,29 @@ pub(crate) async fn emit_exact_tail_prepare_failure_diagnostic(
     compaction_id: &str,
     trigger: CompactionTrigger,
     implementation: ExactTailImplementation,
-    failure_reason: ExactTailFailReason,
+    error: &ExactTailError,
 ) {
-    let event = exact_tail_diagnostic_event(
+    let mut event = exact_tail_diagnostic_event(
         sess,
         turn_context,
         compaction_id,
         diagnostic_route(implementation),
         trigger,
         ExactTailCompactionFitResult::Failure,
-        Some(failure_reason),
+        Some(error.reason),
     );
-    sess.send_event(turn_context, EventMsg::ExactTailCompactionDiagnostic(event))
-        .await;
+    if let Some(limit) = error.model_visible_item_limit.as_ref() {
+        event.max_model_visible_item_tokens = Some(limit.max_item_tokens);
+        event.largest_hot_item_tokens = Some(limit.item_tokens);
+        event.offending_model_visible_item_kind = Some(limit.item_kind);
+        event.offending_model_visible_item_tokens = Some(limit.item_tokens);
+        event.offending_model_visible_item_cap_tokens = Some(limit.max_item_tokens);
+    }
+    sess.send_event(
+        turn_context,
+        EventMsg::ExactTailCompactionDiagnostic(Box::new(event)),
+    )
+    .await;
 }
 
 fn exact_tail_diagnostic_event(
@@ -502,6 +516,9 @@ fn exact_tail_diagnostic_event(
         max_model_visible_item_tokens: None,
         normalized_tool_output_count: None,
         largest_hot_item_tokens: None,
+        offending_model_visible_item_kind: None,
+        offending_model_visible_item_tokens: None,
+        offending_model_visible_item_cap_tokens: None,
         hot_suffix_exact_match: None,
         planned_hot_suffix_item_count: None,
         installed_hot_suffix_item_count: None,
@@ -645,9 +662,22 @@ pub(super) fn ensure_model_visible_items_within_limit(
         ) {
             continue;
         }
+        // Tool-call request items are model-authored history, not tool outputs.
+        // Exact-tail preserves them when the whole hot suffix and replacement fit.
+        if matches!(
+            item,
+            ResponseItem::FunctionCall { .. }
+                | ResponseItem::CustomToolCall { .. }
+                | ResponseItem::ToolSearchCall { .. }
+                | ResponseItem::LocalShellCall { .. }
+                | ResponseItem::WebSearchCall { .. }
+                | ResponseItem::ImageGenerationCall { .. }
+        ) {
+            continue;
+        }
         let item_tokens = estimate_response_items_token_count(std::slice::from_ref(item));
         if item_tokens > max_model_visible_item_tokens {
-            let item_kind = model_visible_item_kind(item);
+            let (item_kind, diagnostic_item_kind) = model_visible_item_kind(item);
             let item_label = model_visible_item_label(item);
             warn!(
                 exact_tail_enabled = true,
@@ -666,35 +696,76 @@ pub(super) fn ensure_model_visible_items_within_limit(
                     item_tokens,
                     max_model_visible_item_tokens
                 ),
-            ));
+            )
+            .with_model_visible_item_limit(ExactTailModelVisibleItemLimit {
+                item_kind: diagnostic_item_kind,
+                item_tokens,
+                max_item_tokens: max_model_visible_item_tokens,
+            }));
         }
     }
     Ok(())
 }
 
-fn model_visible_item_kind(item: &ResponseItem) -> &'static str {
+fn model_visible_item_kind(item: &ResponseItem) -> (&'static str, ExactTailModelVisibleItemKind) {
     match item {
-        ResponseItem::Message { .. } => "message",
-        ResponseItem::AgentMessage { .. } => "agent_message",
-        ResponseItem::Reasoning { .. } => "reasoning",
-        ResponseItem::LocalShellCall { .. } => "local_shell_call",
-        ResponseItem::FunctionCall { .. } => "function_call",
-        ResponseItem::ToolSearchCall { .. } => "tool_search_call",
-        ResponseItem::FunctionCallOutput { .. } => "function_call_output",
-        ResponseItem::ToolSearchOutput { .. } => "tool_search_output",
-        ResponseItem::CustomToolCall { .. } => "custom_tool_call",
-        ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output",
-        ResponseItem::WebSearchCall { .. } => "web_search_call",
-        ResponseItem::ImageGenerationCall { .. } => "image_generation_call",
-        ResponseItem::Compaction { .. } => "compaction",
-        ResponseItem::CompactionTrigger { .. } => "compaction_trigger",
-        ResponseItem::ContextCompaction { .. } => "context_compaction",
-        ResponseItem::Other => "other",
+        ResponseItem::Message { .. } => ("message", ExactTailModelVisibleItemKind::Message),
+        ResponseItem::AgentMessage { .. } => {
+            ("agent_message", ExactTailModelVisibleItemKind::AgentMessage)
+        }
+        ResponseItem::Reasoning { .. } => ("reasoning", ExactTailModelVisibleItemKind::Reasoning),
+        ResponseItem::LocalShellCall { .. } => (
+            "local_shell_call",
+            ExactTailModelVisibleItemKind::LocalShellCall,
+        ),
+        ResponseItem::FunctionCall { .. } => {
+            ("function_call", ExactTailModelVisibleItemKind::FunctionCall)
+        }
+        ResponseItem::ToolSearchCall { .. } => (
+            "tool_search_call",
+            ExactTailModelVisibleItemKind::ToolSearchCall,
+        ),
+        ResponseItem::FunctionCallOutput { .. } => (
+            "function_call_output",
+            ExactTailModelVisibleItemKind::FunctionCallOutput,
+        ),
+        ResponseItem::ToolSearchOutput { .. } => (
+            "tool_search_output",
+            ExactTailModelVisibleItemKind::ToolSearchOutput,
+        ),
+        ResponseItem::CustomToolCall { .. } => (
+            "custom_tool_call",
+            ExactTailModelVisibleItemKind::CustomToolCall,
+        ),
+        ResponseItem::CustomToolCallOutput { .. } => (
+            "custom_tool_call_output",
+            ExactTailModelVisibleItemKind::CustomToolCallOutput,
+        ),
+        ResponseItem::WebSearchCall { .. } => (
+            "web_search_call",
+            ExactTailModelVisibleItemKind::WebSearchCall,
+        ),
+        ResponseItem::ImageGenerationCall { .. } => (
+            "image_generation_call",
+            ExactTailModelVisibleItemKind::ImageGenerationCall,
+        ),
+        ResponseItem::Compaction { .. } => {
+            ("compaction", ExactTailModelVisibleItemKind::Compaction)
+        }
+        ResponseItem::CompactionTrigger { .. } => (
+            "compaction_trigger",
+            ExactTailModelVisibleItemKind::CompactionTrigger,
+        ),
+        ResponseItem::ContextCompaction { .. } => (
+            "context_compaction",
+            ExactTailModelVisibleItemKind::ContextCompaction,
+        ),
+        ResponseItem::Other => ("other", ExactTailModelVisibleItemKind::Other),
     }
 }
 
 fn model_visible_item_label(item: &ResponseItem) -> String {
-    let kind = model_visible_item_kind(item);
+    let (kind, _) = model_visible_item_kind(item);
     match item {
         ResponseItem::Message { role, .. } => format!("{kind} role={role}"),
         ResponseItem::FunctionCall { call_id, name, .. }

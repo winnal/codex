@@ -11,6 +11,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
+use codex_protocol::protocol::ExactTailModelVisibleItemKind;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -777,6 +778,39 @@ fn oversize_hot_assistant_item_fails_closed() {
 }
 
 #[test]
+fn oversize_hot_function_call_item_is_preserved_exactly() {
+    let arguments = format!("{{\"command\":\"echo ok{}\"}}", "ё".repeat(120_000));
+    let function_call = ResponseItem::FunctionCall {
+        id: None,
+        name: "shell_command".to_string(),
+        namespace: None,
+        arguments,
+        call_id: "call-oversized".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let function_output = function_output("call-oversized", "failed to parse function arguments");
+    let history = [user("old"), user("recent"), function_call, function_output];
+
+    let actual = plan_exact_tail(ExactTailPlanInput {
+        history_items: &history,
+        target_tokens: 1,
+        effective_replacement_budget: Some(200_000),
+        required_current_context_budget: 0,
+        final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
+        estimated_summary_scaffold_overhead_tokens: 0,
+        retained_cold_user_message_budget_tokens: 0,
+        implementation: ExactTailImplementation::Local,
+    })
+    .expect("model-authored tool calls should preserve exactly when total budget fits");
+
+    assert_eq!(
+        actual.hot_suffix,
+        vec![history[2].clone(), history[3].clone()]
+    );
+}
+
+#[test]
 fn oversize_hot_tool_output_item_fails_closed() {
     let history = [
         user("old"),
@@ -798,6 +832,14 @@ fn oversize_hot_tool_output_item_fails_closed() {
     .expect_err("hot tool output should exceed the per-item cap");
 
     assert_eq!(actual.reason, ExactTailFailReason::ModelVisibleItemTooLarge);
+    assert_eq!(
+        actual.model_visible_item_limit,
+        Some(ExactTailModelVisibleItemLimit {
+            item_kind: ExactTailModelVisibleItemKind::FunctionCallOutput,
+            item_tokens: estimate_response_items_token_count(std::slice::from_ref(&history[3])),
+            max_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
+        })
+    );
     assert!(
         actual
             .into_codex_err()

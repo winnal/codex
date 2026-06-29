@@ -229,7 +229,7 @@ pub(super) fn exact_tail_diagnostics_from_rollout(path: &Path) -> Result<Vec<Val
     {
         let entry: RolloutLine = serde_json::from_str(line)?;
         if let RolloutItem::EventMsg(EventMsg::ExactTailCompactionDiagnostic(event)) = entry.item {
-            diagnostics.push(serde_json::to_value(event)?);
+            diagnostics.push(serde_json::to_value(*event)?);
         }
     }
     Ok(diagnostics)

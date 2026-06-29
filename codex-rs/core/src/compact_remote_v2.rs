@@ -237,14 +237,13 @@ async fn run_remote_compact_task_inner_impl(
     {
         Ok(plan) => plan,
         Err(error) => {
-            let failure_reason = error.reason;
             emit_exact_tail_prepare_failure_diagnostic(
                 sess.as_ref(),
                 turn_context.as_ref(),
                 &compaction_id,
                 trigger,
                 exact_tail_implementation,
-                failure_reason,
+                &error,
             )
             .await;
             return Err(error.into_codex_err());

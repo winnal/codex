@@ -309,14 +309,13 @@ async fn run_compact_task_inner_impl(
     {
         Ok(plan) => plan,
         Err(error) => {
-            let failure_reason = error.reason;
             emit_exact_tail_prepare_failure_diagnostic(
                 sess.as_ref(),
                 turn_context.as_ref(),
                 &compaction_id,
                 trigger,
                 ExactTailImplementation::Local,
-                failure_reason,
+                &error,
             )
             .await;
             let error = error.into_codex_err();

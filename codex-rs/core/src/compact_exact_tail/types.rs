@@ -9,6 +9,7 @@ use codex_analytics::CompactionTrigger;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ExactTailModelVisibleItemKind;
 
 pub(crate) const EXACT_TAIL_CONSERVATIVE_SUMMARY_BUDGET_TOKENS: i64 = 16_384;
 pub(crate) const EXACT_TAIL_REPLACEMENT_OVERHEAD_MARGIN_TOKENS: i64 = 1_024;
@@ -99,6 +100,7 @@ impl ExactTailFailReason {
 pub(crate) struct ExactTailError {
     pub(crate) reason: ExactTailFailReason,
     message: String,
+    pub(crate) model_visible_item_limit: Option<ExactTailModelVisibleItemLimit>,
 }
 
 impl ExactTailError {
@@ -106,7 +108,16 @@ impl ExactTailError {
         Self {
             reason,
             message: message.into(),
+            model_visible_item_limit: None,
         }
+    }
+
+    pub(crate) fn with_model_visible_item_limit(
+        mut self,
+        limit: ExactTailModelVisibleItemLimit,
+    ) -> Self {
+        self.model_visible_item_limit = Some(limit);
+        self
     }
 
     pub(crate) fn into_codex_err(self) -> CodexErr {
@@ -116,8 +127,15 @@ impl ExactTailError {
         } else {
             format!("{reason}: {}", self.message)
         };
-        CodexErr::Stream(message, None)
+        CodexErr::ExactTailCompactionFailed(message)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExactTailModelVisibleItemLimit {
+    pub(crate) item_kind: ExactTailModelVisibleItemKind,
+    pub(crate) item_tokens: i64,
+    pub(crate) max_item_tokens: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

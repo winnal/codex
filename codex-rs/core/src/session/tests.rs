@@ -105,6 +105,7 @@ use codex_otel::TelemetryAuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
@@ -9168,6 +9169,75 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
             ..
         }) if turn_id == tc.sub_id
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn task_finish_after_exact_tail_failure_drops_only_non_user_pending_input() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let input = vec![TurnInput::UserInput {
+        content: vec![UserInput::Text {
+            text: "hello".to_string(),
+            text_elements: Vec::new(),
+        }],
+        client_id: None,
+    }];
+    sess.spawn_task(
+        Arc::clone(&tc),
+        input,
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: false,
+        },
+    )
+    .await;
+
+    let non_user_pending = ResponseItem::AgentMessage {
+        id: None,
+        author: "/root/worker".to_string(),
+        recipient: "/root".to_string(),
+        content: vec![AgentMessageInputContent::InputText {
+            text: "goal continuation steering".to_string(),
+        }],
+        internal_chat_message_metadata_passthrough: None,
+    };
+    sess.inject_if_running(vec![non_user_pending.clone()])
+        .await
+        .expect("inject non-user pending input into active turn");
+
+    let pending_user_input = vec![UserInput::Text {
+        text: "late pending input".to_string(),
+        text_elements: Vec::new(),
+    }];
+    sess.steer_input(
+        pending_user_input,
+        /*additional_context*/ Default::default(),
+        Some(&tc.sub_id),
+        /*client_user_message_id*/ None,
+        /*responsesapi_client_metadata*/ None,
+    )
+    .await
+    .expect("steer pending user input into active turn");
+
+    sess.on_task_finished(
+        Arc::clone(&tc),
+        Err(CodexErr::ExactTailCompactionFailed(
+            "ExactTailModelVisibleItemTooLarge: test failure".to_string(),
+        )),
+    )
+    .await;
+
+    let history = strip_metadata_from_items(sess.clone_history().await.raw_items());
+    let expected_user_message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "late pending input".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    assert!(history.contains(&expected_user_message));
+    assert!(!history.contains(&non_user_pending));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

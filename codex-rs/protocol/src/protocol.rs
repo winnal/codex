@@ -1270,7 +1270,7 @@ pub enum EventMsg {
     ContextCompacted(ContextCompactedEvent),
 
     /// Content-free numeric diagnostics for exact-tail compaction.
-    ExactTailCompactionDiagnostic(ExactTailCompactionDiagnosticEvent),
+    ExactTailCompactionDiagnostic(Box<ExactTailCompactionDiagnosticEvent>),
 
     /// Conversation history was rolled back by dropping the last N user turns.
     ThreadRolledBack(ThreadRolledBackEvent),
@@ -1985,6 +1985,28 @@ pub enum ExactTailCompactionFitResult {
     Failure,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ExactTailModelVisibleItemKind {
+    Message,
+    Reasoning,
+    FunctionCall,
+    FunctionCallOutput,
+    CustomToolCall,
+    CustomToolCallOutput,
+    ToolSearchCall,
+    ToolSearchOutput,
+    LocalShellCall,
+    WebSearchCall,
+    ImageGenerationCall,
+    Compaction,
+    ContextCompaction,
+    CompactionTrigger,
+    AgentMessage,
+    Other,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct ExactTailCompactionDiagnosticEvent {
     pub thread_id: String,
@@ -2041,6 +2063,15 @@ pub struct ExactTailCompactionDiagnosticEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub largest_hot_item_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub offending_model_visible_item_kind: Option<ExactTailModelVisibleItemKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub offending_model_visible_item_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub offending_model_visible_item_cap_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub hot_suffix_exact_match: Option<bool>,

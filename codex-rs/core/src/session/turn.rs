@@ -161,6 +161,12 @@ pub(crate) async fn run_turn(
         let error = err.to_codex_protocol_error();
         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
             .await;
+        if err.is_exact_tail_compaction_failure() {
+            sess.track_turn_codex_error(turn_context.as_ref(), &err);
+            let event = EventMsg::Error(err.to_error_event(/*message_prefix*/ None));
+            sess.send_event(&turn_context, event).await;
+            return Err(err);
+        }
         error!("Failed to run pre-sampling compact");
         return Ok(None);
     }
@@ -374,6 +380,13 @@ pub(crate) async fn run_turn(
                         let error = err.to_codex_protocol_error();
                         sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
                             .await;
+                        if err.is_exact_tail_compaction_failure() {
+                            sess.track_turn_codex_error(turn_context.as_ref(), &err);
+                            let event =
+                                EventMsg::Error(err.to_error_event(/*message_prefix*/ None));
+                            sess.send_event(&turn_context, event).await;
+                            return Err(err);
+                        }
                         return Ok(None);
                     }
                     can_drain_pending_input = !model_needs_follow_up;

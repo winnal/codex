@@ -77,6 +77,8 @@ pub enum CodexErr {
     /// Optionally includes the requested delay before retrying the turn.
     #[error("stream disconnected before completion: {0}")]
     Stream(String, Option<Duration>),
+    #[error("{0}")]
+    ExactTailCompactionFailed(String),
     #[error(
         "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
@@ -180,6 +182,7 @@ impl CodexErr {
             | CodexErr::QuotaExceeded
             | CodexErr::InvalidImageRequest()
             | CodexErr::InvalidRequest(_)
+            | CodexErr::ExactTailCompactionFailed(_)
             | CodexErr::RefreshTokenFailed(_)
             | CodexErr::UnsupportedOperation(_)
             | CodexErr::Sandbox(_)
@@ -244,6 +247,10 @@ impl CodexErr {
             CodexErr::Sandbox(_) => CodexErrorInfo::SandboxError,
             _ => CodexErrorInfo::Other,
         }
+    }
+
+    pub fn is_exact_tail_compaction_failure(&self) -> bool {
+        matches!(self, CodexErr::ExactTailCompactionFailed(_))
     }
 
     pub fn to_error_event(&self, message_prefix: Option<String>) -> ErrorEvent {

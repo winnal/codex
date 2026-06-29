@@ -565,6 +565,8 @@ impl Session {
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) {
+        let drop_non_user_pending_input =
+            matches!(&task_result, Err(err) if err.is_exact_tail_compaction_failure());
         let (last_agent_message, abort_reason) = match task_result {
             Ok(last_agent_message) => (last_agent_message, None),
             Err(CodexErr::TurnAborted) => (None, Some(TurnAbortReason::Interrupted)),
@@ -588,10 +590,22 @@ impl Session {
         let Some(turn_state) = turn_state else {
             return;
         };
-        let pending_input = self
+        let mut pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
             .await;
+        if drop_non_user_pending_input {
+            let original_pending_input_count = pending_input.len();
+            pending_input.retain(|input| matches!(input, TurnInput::UserInput { .. }));
+            let dropped_pending_input_count =
+                original_pending_input_count.saturating_sub(pending_input.len());
+            if dropped_pending_input_count > 0 {
+                warn!(
+                    dropped_pending_input_count,
+                    "dropped non-user pending input after exact-tail compaction failure"
+                );
+            }
+        }
         let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
             let ts = turn_state.lock().await;
             (
