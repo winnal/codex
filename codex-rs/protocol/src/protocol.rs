@@ -2176,6 +2176,14 @@ pub struct ExactTailToolSurfaceDiagnosticEvent {
     pub discoverable_hot_tool_count: usize,
     pub missing_notice_emitted_count: usize,
     pub missing_no_path_count: usize,
+    #[serde(default)]
+    pub rehydrated_tool_references: Vec<String>,
+    #[serde(default)]
+    pub missing_tool_references: Vec<String>,
+    #[serde(default)]
+    pub rehydrated_tool_namespaces: Vec<String>,
+    #[serde(default)]
+    pub missing_tool_rejection_reasons: Vec<String>,
     pub hot_tool_reference_overflow_count: usize,
     pub hot_tool_reference_overflow_notice_emitted_count: usize,
     pub out_of_scope_dependency_protocol_count: usize,

@@ -636,6 +636,13 @@ fn notice_text(item: ResponseItem) -> String {
         .join("\n")
 }
 
+fn tool_reference_label(reference: &ToolName) -> String {
+    match &reference.namespace {
+        Some(namespace) => format!("{namespace}.{}", reference.name),
+        None => reference.name.clone(),
+    }
+}
+
 fn expected_exact_tail_outcome(
     hot_tool_reference_count: usize,
     hot_tool_namespace_count: usize,
@@ -1032,6 +1039,8 @@ async fn exact_tail_hint_rehydrates_current_deferred_dynamic_tool() {
     );
     expected.rehydrated_tool_count = 1;
     expected.discoverable_hot_tool_count = 1;
+    expected.rehydrated_tool_references = vec![tool_reference_label(&tool_name)];
+    expected.rehydrated_tool_namespaces = vec!["codex_app".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     let plan = probe_with(
         |turn| {
@@ -1054,6 +1063,63 @@ async fn exact_tail_hint_rehydrates_current_deferred_dynamic_tool() {
         &["restored_tool".to_string()]
     );
     assert_eq!(plan.exposure(&tool_name.to_string()), ToolExposure::Direct);
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_rehydrates_multi_agent_v1_namespace_atomically() {
+    let references = vec![
+        ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "close_agent"),
+        ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "wait_agent"),
+        ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, "spawn_agent"),
+    ];
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ references.len(),
+        /*hot_tool_namespace_count*/ 1,
+    );
+    expected.rehydrated_tool_count = references.len();
+    expected.discoverable_hot_tool_count = references.len();
+    expected.rehydrated_tool_references = references.iter().map(tool_reference_label).collect();
+    expected.rehydrated_tool_namespaces = vec![MULTI_AGENT_V1_NAMESPACE.to_string()];
+    expected.tool_surface_changed_after_compaction = true;
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+            set_feature(turn, Feature::Collab, /*enabled*/ true);
+            set_feature(turn, Feature::MultiAgentV2, /*enabled*/ false);
+        },
+        ToolPlanInputs {
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(references.clone())),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&[MULTI_AGENT_V1_NAMESPACE]);
+    assert_eq!(
+        plan.namespace_function_names(MULTI_AGENT_V1_NAMESPACE),
+        &[
+            "close_agent".to_string(),
+            "resume_agent".to_string(),
+            "send_input".to_string(),
+            "spawn_agent".to_string(),
+            "wait_agent".to_string(),
+        ]
+    );
+    for tool_name in [
+        "close_agent",
+        "resume_agent",
+        "send_input",
+        "spawn_agent",
+        "wait_agent",
+    ] {
+        let namespaced_tool_name = ToolName::namespaced(MULTI_AGENT_V1_NAMESPACE, tool_name);
+        assert_eq!(
+            plan.exposure(&namespaced_tool_name.to_string()),
+            ToolExposure::Direct,
+            "expected {tool_name} to be promoted with its namespace family"
+        );
+    }
     assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
 }
 
@@ -1133,6 +1199,10 @@ async fn exact_tail_hint_notice_avoids_tool_search_instruction() {
     expected.discoverable_hot_tool_count = 1;
     expected.missing_notice_emitted_count = 1;
     expected.missing_no_path_count = 1;
+    expected.rehydrated_tool_references = vec![tool_reference_label(&restored_tool_name)];
+    expected.missing_tool_references = vec![tool_reference_label(&stale_tool_name)];
+    expected.rehydrated_tool_namespaces = vec!["codex_app".to_string()];
+    expected.missing_tool_rejection_reasons = vec!["no_runtime".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());
@@ -1170,6 +1240,7 @@ async fn exact_tail_hint_notice_avoids_tool_search_instruction() {
         .expect("missing reference should emit notice"),
     );
     assert!(notice.contains("Do not assume missing historical tools remain callable."));
+    assert!(notice.contains("Missing direct tool reference(s): codex_app.stale_tool."));
     assert!(!notice.contains("tool_search"));
     assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
 }
@@ -1183,6 +1254,8 @@ async fn exact_tail_hint_reports_stale_reference_without_resurrecting_it() {
     expected.missing_hot_tool_count = 1;
     expected.missing_notice_emitted_count = 1;
     expected.missing_no_path_count = 1;
+    expected.missing_tool_references = vec![tool_reference_label(&stale_tool_name)];
+    expected.missing_tool_rejection_reasons = vec!["no_runtime".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());
@@ -1268,6 +1341,8 @@ async fn exact_tail_hint_does_not_rehydrate_non_searchable_deferred_tool() {
     expected.missing_hot_tool_count = 1;
     expected.missing_notice_emitted_count = 1;
     expected.missing_no_path_count = 1;
+    expected.missing_tool_references = vec![tool_reference_label(&tool_name)];
+    expected.missing_tool_rejection_reasons = vec!["not_model_visible".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());
@@ -1321,6 +1396,8 @@ async fn exact_tail_hint_already_direct_tool_respects_final_namespace_filter() {
     expected.missing_hot_tool_count = 1;
     expected.missing_notice_emitted_count = 1;
     expected.missing_no_path_count = 1;
+    expected.missing_tool_references = vec![tool_reference_label(&tool_name)];
+    expected.missing_tool_rejection_reasons = vec!["not_model_visible".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());
@@ -1360,6 +1437,8 @@ async fn exact_tail_hint_does_not_rehydrate_namespace_filtered_tool() {
     expected.missing_hot_tool_count = 1;
     expected.missing_notice_emitted_count = 1;
     expected.missing_no_path_count = 1;
+    expected.missing_tool_references = vec![tool_reference_label(&tool_name)];
+    expected.missing_tool_rejection_reasons = vec!["not_model_visible".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());
@@ -1405,6 +1484,8 @@ async fn exact_tail_hint_does_not_promote_when_final_namespace_merge_exceeds_cap
     expected.missing_hot_tool_count = 1;
     expected.discoverable_hot_tool_count = 1;
     expected.missing_notice_emitted_count = 1;
+    expected.missing_tool_references = vec![tool_reference_label(&deferred_tool_name)];
+    expected.missing_tool_rejection_reasons = vec!["spec_budget".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());
@@ -1455,6 +1536,8 @@ async fn exact_tail_hint_does_not_rehydrate_oversized_tool_spec() {
     expected.missing_hot_tool_count = 1;
     expected.discoverable_hot_tool_count = 1;
     expected.missing_notice_emitted_count = 1;
+    expected.missing_tool_references = vec![tool_reference_label(&tool_name)];
+    expected.missing_tool_rejection_reasons = vec!["spec_budget".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());
@@ -1493,6 +1576,8 @@ async fn exact_tail_hint_oversized_tool_has_no_discovery_path_without_tool_searc
     expected.missing_hot_tool_count = 1;
     expected.missing_notice_emitted_count = 1;
     expected.missing_no_path_count = 1;
+    expected.missing_tool_references = vec![tool_reference_label(&tool_name)];
+    expected.missing_tool_rejection_reasons = vec!["not_model_visible".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());
@@ -1548,6 +1633,17 @@ async fn exact_tail_hint_caps_aggregate_promoted_tool_specs() {
     expected.missing_hot_tool_count = tool_count - expected_rehydrated;
     expected.discoverable_hot_tool_count = tool_count;
     expected.missing_notice_emitted_count = 1;
+    expected.rehydrated_tool_references = references
+        .iter()
+        .take(expected_rehydrated)
+        .map(tool_reference_label)
+        .collect();
+    expected.missing_tool_references = references
+        .iter()
+        .skip(expected_rehydrated)
+        .map(tool_reference_label)
+        .collect();
+    expected.missing_tool_rejection_reasons = vec!["spec_budget".to_string()];
     expected.tool_surface_changed_after_compaction = true;
     expected.tool_surface_rehydration_failure_reason =
         Some("hot_tool_references_not_model_visible".to_string());

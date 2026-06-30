@@ -53,6 +53,10 @@ pub(crate) struct ExactTailToolSurfaceOutcome {
     pub(crate) discoverable_hot_tool_count: usize,
     pub(crate) missing_notice_emitted_count: usize,
     pub(crate) missing_no_path_count: usize,
+    pub(crate) rehydrated_tool_references: Vec<String>,
+    pub(crate) missing_tool_references: Vec<String>,
+    pub(crate) rehydrated_tool_namespaces: Vec<String>,
+    pub(crate) missing_tool_rejection_reasons: Vec<String>,
     pub(crate) hot_tool_reference_overflow_count: usize,
     pub(crate) hot_tool_reference_overflow_notice_emitted_count: usize,
     pub(crate) out_of_scope_dependency_protocol_count: usize,
@@ -80,6 +84,10 @@ impl ExactTailToolSurfaceOutcome {
             discoverable_hot_tool_count: self.discoverable_hot_tool_count,
             missing_notice_emitted_count: self.missing_notice_emitted_count,
             missing_no_path_count: self.missing_no_path_count,
+            rehydrated_tool_references: self.rehydrated_tool_references.clone(),
+            missing_tool_references: self.missing_tool_references.clone(),
+            rehydrated_tool_namespaces: self.rehydrated_tool_namespaces.clone(),
+            missing_tool_rejection_reasons: self.missing_tool_rejection_reasons.clone(),
             hot_tool_reference_overflow_count: self.hot_tool_reference_overflow_count,
             hot_tool_reference_overflow_notice_emitted_count: self
                 .hot_tool_reference_overflow_notice_emitted_count,
@@ -112,7 +120,12 @@ pub(crate) fn exact_tail_tool_surface_notice_item(
     }
 
     Some(ContextualUserFragment::into(
-        ExactTailToolSurfaceNotice::new(missing, overflow, outcome.missing_no_path_count),
+        ExactTailToolSurfaceNotice::new(
+            missing,
+            overflow,
+            outcome.missing_no_path_count,
+            outcome.missing_tool_references.clone(),
+        ),
     ))
 }
 

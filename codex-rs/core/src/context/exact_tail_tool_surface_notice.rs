@@ -5,6 +5,7 @@ pub(crate) struct ExactTailToolSurfaceNotice {
     missing_hot_tool_count: usize,
     hot_tool_reference_overflow_count: usize,
     missing_no_path_count: usize,
+    missing_tool_references: Vec<String>,
 }
 
 impl ExactTailToolSurfaceNotice {
@@ -12,11 +13,13 @@ impl ExactTailToolSurfaceNotice {
         missing_hot_tool_count: usize,
         hot_tool_reference_overflow_count: usize,
         missing_no_path_count: usize,
+        missing_tool_references: Vec<String>,
     ) -> Self {
         Self {
             missing_hot_tool_count,
             hot_tool_reference_overflow_count,
             missing_no_path_count,
+            missing_tool_references,
         }
     }
 }
@@ -43,6 +46,12 @@ impl ContextualUserFragment for ExactTailToolSurfaceNotice {
             let missing = self.missing_hot_tool_count;
             lines.push(format!(
                 "{missing} tool reference(s) from the preserved exact-tail history are not currently available as direct callable tools."
+            ));
+        }
+        if !self.missing_tool_references.is_empty() {
+            lines.push(format!(
+                "Missing direct tool reference(s): {}.",
+                self.missing_tool_references.join(", ")
             ));
         }
         if self.hot_tool_reference_overflow_count > 0 {
