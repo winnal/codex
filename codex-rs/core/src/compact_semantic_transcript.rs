@@ -541,7 +541,7 @@ async fn run_remote_compact_task_inner_impl(
         compacted_item,
     )
     .await;
-    sess.set_pending_exact_tail_tool_surface_hint(exact_tail_tool_surface_hint)
+    sess.set_active_exact_tail_tool_surface_hint(exact_tail_tool_surface_hint)
         .await;
     sess.recompute_token_usage(turn_context).await;
 

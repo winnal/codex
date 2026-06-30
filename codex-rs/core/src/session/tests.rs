@@ -239,7 +239,7 @@ fn assistant_message(text: &str) -> ResponseItem {
 
 #[tokio::test]
 async fn exact_tail_tool_surface_hint_lifecycle() -> anyhow::Result<()> {
-    fn pending_hint() -> crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint {
+    fn active_hint() -> crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint {
         crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint::new(
             "compact-test",
             "local",
@@ -257,7 +257,7 @@ async fn exact_tail_tool_surface_hint_lifecycle() -> anyhow::Result<()> {
     let (session, turn_context) = make_session_and_context().await;
     let cancellation_token = CancellationToken::new();
     session
-        .set_pending_exact_tail_tool_surface_hint(pending_hint())
+        .set_active_exact_tail_tool_surface_hint(active_hint())
         .await;
 
     let ignored = crate::session::turn::built_tools_without_exact_tail_tool_surface_hint(
@@ -268,11 +268,11 @@ async fn exact_tail_tool_surface_hint_lifecycle() -> anyhow::Result<()> {
     .await?;
     assert!(ignored.exact_tail_tool_surface_outcome().is_none());
 
-    let consumed =
+    let applied =
         crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
-    let outcome = consumed
+    let outcome = applied
         .exact_tail_tool_surface_outcome()
-        .expect("first normal tool build should consume pending exact-tail hint");
+        .expect("normal tool build should apply active exact-tail hint");
     assert_eq!(outcome.compaction_id, "compact-test");
     assert_eq!(outcome.route, "local");
     assert_eq!(outcome.missing_hot_tool_count, 1);
@@ -280,7 +280,12 @@ async fn exact_tail_tool_surface_hint_lifecycle() -> anyhow::Result<()> {
 
     let repeated =
         crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
-    assert!(repeated.exact_tail_tool_surface_outcome().is_none());
+    let repeated_outcome = repeated
+        .exact_tail_tool_surface_outcome()
+        .expect("active exact-tail hint should survive later normal tool builds");
+    assert_eq!(repeated_outcome.compaction_id, "compact-test");
+    assert_eq!(repeated_outcome.route, "local");
+    assert_eq!(repeated_outcome.missing_hot_tool_count, 1);
 
     Ok(())
 }
@@ -293,7 +298,7 @@ async fn exact_tail_tool_surface_hint_survives_startup_prewarm_tool_build() -> a
         .await;
     let cancellation_token = CancellationToken::new();
     session
-        .set_pending_exact_tail_tool_surface_hint(
+        .set_active_exact_tail_tool_surface_hint(
             crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint::new(
                 "compact-test",
                 "remote_v2",
@@ -321,11 +326,15 @@ async fn exact_tail_tool_surface_hint_survives_startup_prewarm_tool_build() -> a
         crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
     let outcome = normal_router
         .exact_tail_tool_surface_outcome()
-        .expect("first normal tool build should consume hint after prewarm ignored it");
+        .expect("normal tool build should apply hint after prewarm ignored it");
     assert_eq!(outcome.compaction_id, "compact-test");
     assert_eq!(outcome.route, "remote_v2");
     assert_eq!(outcome.missing_hot_tool_count, 1);
     assert_eq!(outcome.missing_notice_emitted_count, 1);
+
+    let repeated_router =
+        crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
+    assert!(repeated_router.exact_tail_tool_surface_outcome().is_some());
 
     Ok(())
 }
@@ -420,7 +429,7 @@ async fn resumed_exact_tail_compaction_reconstructs_tool_surface_hint() -> anyho
         crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
     let outcome = router
         .exact_tail_tool_surface_outcome()
-        .expect("resumed exact-tail hint should be consumed");
+        .expect("resumed exact-tail hint should be active");
     assert_eq!(outcome.compaction_id, "compact-resume");
     assert_eq!(outcome.route, "remote_v2");
     assert_eq!(outcome.rehydrated_tool_count, 1);
@@ -438,7 +447,12 @@ async fn resumed_exact_tail_compaction_reconstructs_tool_surface_hint() -> anyho
 
     let repeated =
         crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
-    assert!(repeated.exact_tail_tool_surface_outcome().is_none());
+    let repeated_outcome = repeated
+        .exact_tail_tool_surface_outcome()
+        .expect("resumed exact-tail hint should remain active");
+    assert_eq!(repeated_outcome.compaction_id, "compact-resume");
+    assert_eq!(repeated_outcome.route, "remote_v2");
+    assert_eq!(repeated_outcome.rehydrated_tool_count, 1);
 
     Ok(())
 }
@@ -481,7 +495,7 @@ async fn resumed_exact_tail_compaction_recovers_tool_surface_hint_without_compac
                 .await?;
         let outcome = router
             .exact_tail_tool_surface_outcome()
-            .expect("unconsumed exact-tail compaction should reconstruct a hint");
+            .expect("exact-tail compaction should reconstruct an active hint");
         assert_eq!(outcome.compaction_id, format!("compact-{route}"));
         assert_eq!(outcome.route, route);
         assert_eq!(outcome.missing_hot_tool_count, 1);
@@ -491,7 +505,7 @@ async fn resumed_exact_tail_compaction_recovers_tool_surface_hint_without_compac
 }
 
 #[tokio::test]
-async fn resumed_exact_tail_compaction_does_not_reconstruct_consumed_tool_surface_hint()
+async fn resumed_exact_tail_compaction_reconstructs_active_tool_surface_hint_after_diagnostic()
 -> anyhow::Result<()> {
     let completion_cases = [
         RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
@@ -520,14 +534,14 @@ async fn resumed_exact_tail_compaction_does_not_reconstruct_consumed_tool_surfac
                     RolloutItem::Compacted(CompactedItem {
                         message: String::new(),
                         replacement_history: Some(exact_tail_resume_replacement_history(
-                            "already_consumed_tool",
+                            "diagnosed_active_tool",
                         )),
                         window_number: None,
                         first_window_id: None,
                         previous_window_id: None,
                         window_id: None,
                     }),
-                    consumed_hint_tool_surface_diagnostic("compact"),
+                    tool_surface_diagnostic("compact"),
                     completion_item,
                 ],
                 rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
@@ -537,15 +551,19 @@ async fn resumed_exact_tail_compaction_does_not_reconstruct_consumed_tool_surfac
         let router =
             crate::session::turn::built_tools(&session, &turn_context, &CancellationToken::new())
                 .await?;
-        assert!(router.exact_tail_tool_surface_outcome().is_none());
+        let outcome = router
+            .exact_tail_tool_surface_outcome()
+            .expect("surviving compacted window should recover active exact-tail hint");
+        assert_eq!(outcome.compaction_id, "compact");
+        assert_eq!(outcome.missing_hot_tool_count, 1);
     }
 
     Ok(())
 }
 
 #[tokio::test]
-async fn resumed_exact_tail_compaction_ignores_older_consumed_tool_surface_hint()
--> anyhow::Result<()> {
+async fn resumed_exact_tail_compaction_uses_newest_active_tool_surface_hint() -> anyhow::Result<()>
+{
     let (session, turn_context, _rx) =
         make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
     session
@@ -556,14 +574,14 @@ async fn resumed_exact_tail_compaction_ignores_older_consumed_tool_surface_hint(
                 RolloutItem::Compacted(CompactedItem {
                     message: String::new(),
                     replacement_history: Some(exact_tail_resume_replacement_history(
-                        "already_consumed_tool",
+                        "diagnosed_active_tool",
                     )),
                     window_number: None,
                     first_window_id: None,
                     previous_window_id: None,
                     window_id: None,
                 }),
-                consumed_hint_tool_surface_diagnostic("compact-a"),
+                tool_surface_diagnostic("compact-a"),
                 RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
                     turn_id: "turn-a".to_string(),
                     last_agent_message: None,
@@ -575,7 +593,7 @@ async fn resumed_exact_tail_compaction_ignores_older_consumed_tool_surface_hint(
                 RolloutItem::Compacted(CompactedItem {
                     message: String::new(),
                     replacement_history: Some(exact_tail_resume_replacement_history(
-                        "newer_unconsumed_tool",
+                        "newer_active_tool",
                     )),
                     window_number: None,
                     first_window_id: None,
@@ -592,7 +610,7 @@ async fn resumed_exact_tail_compaction_ignores_older_consumed_tool_surface_hint(
             .await?;
     let outcome = router
         .exact_tail_tool_surface_outcome()
-        .expect("newer unconsumed exact-tail compaction should reconstruct a hint");
+        .expect("newer exact-tail compaction should reconstruct a hint");
     assert_eq!(outcome.compaction_id, "compact-b");
     assert_eq!(outcome.missing_hot_tool_count, 1);
 
@@ -671,7 +689,7 @@ fn resume_compaction_diagnostic_with_route(
     ))
 }
 
-fn consumed_hint_tool_surface_diagnostic(compaction_id: &str) -> RolloutItem {
+fn tool_surface_diagnostic(compaction_id: &str) -> RolloutItem {
     RolloutItem::EventMsg(EventMsg::ExactTailToolSurfaceDiagnostic(
         codex_protocol::protocol::ExactTailToolSurfaceDiagnosticEvent {
             thread_id: "thread".to_string(),

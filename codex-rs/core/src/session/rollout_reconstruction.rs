@@ -6,7 +6,6 @@ use crate::tools::exact_tail_continuity::derive_exact_tail_tool_surface_hint;
 use codex_protocol::protocol::ExactTailCompactionDiagnosticEvent;
 use codex_protocol::protocol::ExactTailCompactionFitResult;
 use codex_protocol::protocol::ExactTailCompactionRoute;
-use codex_protocol::protocol::ExactTailToolSurfaceDiagnosticEvent;
 use uuid::Uuid;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -55,7 +54,6 @@ struct ActiveReplaySegment<'a> {
     reference_context_item: TurnReferenceContextItem,
     base_replacement_history: Option<&'a [ResponseItem]>,
     exact_tail_compaction_source: Option<RecoveredExactTailCompactionSource>,
-    exact_tail_tool_surface_diagnostic_sources: Vec<RecoveredExactTailCompactionSource>,
     window: Option<ReconstructedWindow>,
 }
 
@@ -66,7 +64,6 @@ struct RolloutReconstructionState<'a> {
     reference_context_item: TurnReferenceContextItem,
     window: Option<ReconstructedWindow>,
     exact_tail_compaction_source: Option<RecoveredExactTailCompactionSource>,
-    exact_tail_tool_surface_diagnostic_sources: Vec<RecoveredExactTailCompactionSource>,
     pending_rollback_turns: usize,
 }
 
@@ -90,22 +87,6 @@ impl RecoveredExactTailCompactionSource {
             .to_string(),
             installed_hot_suffix_item_count: event.installed_hot_suffix_item_count,
         })
-    }
-
-    fn from_tool_surface_diagnostic(event: &ExactTailToolSurfaceDiagnosticEvent) -> Self {
-        Self {
-            compaction_id: event.compaction_id.clone(),
-            route: event.route.clone(),
-            installed_hot_suffix_item_count: None,
-        }
-    }
-
-    fn matches_tool_surface_diagnostic(
-        &self,
-        diagnostic_source: &RecoveredExactTailCompactionSource,
-    ) -> bool {
-        self.compaction_id == diagnostic_source.compaction_id
-            && self.route == diagnostic_source.route
     }
 
     fn hot_suffix_from_replacement_history<'a>(
@@ -142,10 +123,6 @@ fn finalize_active_segment<'a>(
         }
         return;
     }
-
-    state
-        .exact_tail_tool_surface_diagnostic_sources
-        .extend(active_segment.exact_tail_tool_surface_diagnostic_sources);
 
     // A surviving replacement-history checkpoint is a complete history base. Once we
     // know the newest surviving one, older rollout items do not affect rebuilt history.
@@ -247,15 +224,7 @@ impl Session {
                             );
                     }
                 }
-                RolloutItem::EventMsg(EventMsg::ExactTailToolSurfaceDiagnostic(event)) => {
-                    let active_segment =
-                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
-                    active_segment
-                        .exact_tail_tool_surface_diagnostic_sources
-                        .push(
-                            RecoveredExactTailCompactionSource::from_tool_surface_diagnostic(event),
-                        );
-                }
+                RolloutItem::EventMsg(EventMsg::ExactTailToolSurfaceDiagnostic(_)) => {}
                 RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
@@ -364,27 +333,15 @@ impl Session {
         let mut history = ContextManager::new();
         let mut saw_legacy_compaction_without_replacement_history = false;
         let recovered_exact_tail_compaction_source = state.exact_tail_compaction_source.as_ref();
-        let selected_exact_tail_hint_was_consumed = recovered_exact_tail_compaction_source
-            .is_some_and(|source| {
-                state
-                    .exact_tail_tool_surface_diagnostic_sources
-                    .iter()
-                    .any(|diagnostic_source| {
-                        source.matches_tool_surface_diagnostic(diagnostic_source)
-                    })
-            });
-        let pending_exact_tail_tool_surface_hint = (!selected_exact_tail_hint_was_consumed)
-            .then(|| {
-                state
-                    .base_replacement_history
-                    .and_then(|base_replacement_history| {
-                        recover_pending_exact_tail_tool_surface_hint(
-                            base_replacement_history,
-                            recovered_exact_tail_compaction_source?,
-                        )
-                    })
-            })
-            .flatten();
+        let pending_exact_tail_tool_surface_hint =
+            state
+                .base_replacement_history
+                .and_then(|base_replacement_history| {
+                    recover_pending_exact_tail_tool_surface_hint(
+                        base_replacement_history,
+                        recovered_exact_tail_compaction_source?,
+                    )
+                });
         if let Some(base_replacement_history) = state.base_replacement_history {
             history.replace(base_replacement_history.to_vec());
         }

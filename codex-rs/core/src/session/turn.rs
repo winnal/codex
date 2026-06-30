@@ -1256,7 +1256,7 @@ pub(crate) async fn built_tools(
         sess,
         turn_context,
         cancellation_token,
-        ExactTailToolSurfaceHintUse::Consume,
+        ExactTailToolSurfaceHintUse::Apply,
     )
     .await
 }
@@ -1277,7 +1277,7 @@ pub(crate) async fn built_tools_without_exact_tail_tool_surface_hint(
 
 #[derive(Clone, Copy)]
 enum ExactTailToolSurfaceHintUse {
-    Consume,
+    Apply,
     Ignore,
 }
 
@@ -1403,9 +1403,7 @@ async fn built_tools_with_exact_tail_tool_surface_hint(
     let mcp_tools = has_mcp_servers.then_some(mcp_tool_exposure.direct_tools);
     let deferred_mcp_tools = mcp_tool_exposure.deferred_tools;
     let exact_tail_tool_surface_hint = match exact_tail_tool_surface_hint_use {
-        ExactTailToolSurfaceHintUse::Consume => {
-            sess.take_pending_exact_tail_tool_surface_hint().await
-        }
+        ExactTailToolSurfaceHintUse::Apply => sess.active_exact_tail_tool_surface_hint().await,
         ExactTailToolSurfaceHintUse::Ignore => None,
     };
     let router = ToolRouter::from_turn_context(

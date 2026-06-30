@@ -594,7 +594,7 @@ async fn run_compact_task_inner_impl(
     )
     .await;
     if let Some(hint) = exact_tail_tool_surface_hint {
-        sess.set_pending_exact_tail_tool_surface_hint(hint).await;
+        sess.set_active_exact_tail_tool_surface_hint(hint).await;
     }
     sess.recompute_token_usage(&turn_context).await;
 
