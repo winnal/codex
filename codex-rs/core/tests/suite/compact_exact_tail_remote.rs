@@ -107,6 +107,106 @@ async fn exact_tail_remote_legacy_manual_compact_excludes_newest_atomic_hot_suff
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_legacy_rehydrates_tool_surface_after_compact() -> Result<()> {
+    let server = start_mock_server().await;
+    let tool_name = "remote_legacy_continuity_probe";
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message(
+                    "remote-legacy-continuity-cold",
+                    "REMOTE_LEGACY_CONTINUITY_COLD",
+                ),
+                ev_completed("remote-legacy-continuity-cold-response"),
+            ]),
+            sse(vec![
+                ev_response_created("remote-legacy-continuity-search-response"),
+                ev_tool_search_call(
+                    "remote-legacy-continuity-search-call",
+                    &serde_json::json!({
+                        "query": "remote legacy continuity probe",
+                        "limit": 4,
+                    }),
+                ),
+                ev_completed("remote-legacy-continuity-search-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "remote-legacy-continuity-hot",
+                    "REMOTE_LEGACY_CONTINUITY_HOT",
+                ),
+                ev_completed("remote-legacy-continuity-hot-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "remote-legacy-continuity-follow",
+                    "REMOTE_LEGACY_CONTINUITY_FOLLOW",
+                ),
+                ev_completed("remote-legacy-continuity-follow-response"),
+            ]),
+        ],
+    )
+    .await;
+    let compacted_history = vec![codex_protocol::models::ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "REMOTE_LEGACY_CONTINUITY_SUMMARY".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let _compact_mock =
+        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+    let tool_description = "Remote legacy continuity probe. ".repeat(80);
+    let dynamic_tool = deferred_dynamic_namespace_tool("codex_app", tool_name, &tool_description);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            configure_search_capable_model(config);
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(100);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+        });
+    let base_test = builder.build(&server).await?;
+    let new_thread = base_test
+        .thread_manager
+        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
+        .await?;
+    let rollout_path = new_thread
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    let mut test = base_test;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+
+    submit_turn(&test, "REMOTE_LEGACY_CONTINUITY_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_LEGACY_CONTINUITY_HOT_USER").await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_compact_turn_complete(&test).await;
+    submit_turn(&test, "REMOTE_LEGACY_CONTINUITY_FOLLOW_USER").await?;
+
+    let follow_body = response_mock
+        .requests()
+        .last()
+        .expect("follow-up request")
+        .body_json();
+    assert!(
+        namespace_child_tool(&follow_body, "codex_app", tool_name).is_some(),
+        "remote legacy follow-up should rehydrate current dynamic tool spec: {follow_body}"
+    );
+    let diagnostics = exact_tail_tool_surface_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic["route"], serde_json::json!("remote_legacy"));
+    assert_eq!(diagnostic["rehydrated_tool_count"], serde_json::json!(1));
+    assert_eq!(diagnostic["missing_hot_tool_count"], serde_json::json!(0));
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
 async fn submit_turn(test: &TestCodex, prompt: &str) -> Result<()> {
     test.submit_turn_with_completion_timeout(prompt, Duration::from_secs(90))
         .await
@@ -563,6 +663,94 @@ async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Resu
             .and_then(Value::as_u64),
         Some(1)
     );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_v2_rehydrates_tool_surface_after_compact() -> Result<()> {
+    let server = start_mock_server().await;
+    let tool_name = "remote_v2_continuity_probe";
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("remote-v2-continuity-cold", "REMOTE_V2_CONTINUITY_COLD"),
+                ev_completed("remote-v2-continuity-cold-response"),
+            ]),
+            sse(vec![
+                ev_response_created("remote-v2-continuity-search-response"),
+                ev_tool_search_call(
+                    "remote-v2-continuity-search-call",
+                    &serde_json::json!({
+                        "query": "remote v2 continuity probe",
+                        "limit": 4,
+                    }),
+                ),
+                ev_completed("remote-v2-continuity-search-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("remote-v2-continuity-hot", "REMOTE_V2_CONTINUITY_HOT"),
+                ev_completed("remote-v2-continuity-hot-response"),
+            ]),
+            sse(vec![
+                ev_compaction_item("REMOTE_V2_CONTINUITY_SUMMARY"),
+                ev_completed("remote-v2-continuity-compact-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("remote-v2-continuity-follow", "REMOTE_V2_CONTINUITY_FOLLOW"),
+                ev_completed("remote-v2-continuity-follow-response"),
+            ]),
+        ],
+    )
+    .await;
+    let tool_description = "Remote v2 continuity probe. ".repeat(80);
+    let dynamic_tool = deferred_dynamic_namespace_tool("codex_app", tool_name, &tool_description);
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            configure_search_capable_model(config);
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(100);
+            explicitly_enable_remote_compaction_v2(config);
+        });
+    let base_test = builder.build(&server).await?;
+    let new_thread = base_test
+        .thread_manager
+        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
+        .await?;
+    let rollout_path = new_thread
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    let mut test = base_test;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+
+    submit_turn(&test, "REMOTE_V2_CONTINUITY_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_V2_CONTINUITY_HOT_USER").await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_compact_turn_complete(&test).await;
+    submit_turn(&test, "REMOTE_V2_CONTINUITY_FOLLOW_USER").await?;
+
+    let follow_body = response_mock
+        .requests()
+        .last()
+        .expect("follow-up request")
+        .body_json();
+    assert!(
+        namespace_child_tool(&follow_body, "codex_app", tool_name).is_some(),
+        "remote v2 follow-up should rehydrate current dynamic tool spec: {follow_body}"
+    );
+    let diagnostics = exact_tail_tool_surface_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic["route"], serde_json::json!("remote_v2"));
+    assert_eq!(diagnostic["rehydrated_tool_count"], serde_json::json!(1));
+    assert_eq!(diagnostic["missing_hot_tool_count"], serde_json::json!(0));
 
     shutdown_codex(&test).await?;
     Ok(())

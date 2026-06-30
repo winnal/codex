@@ -371,6 +371,7 @@ impl ThreadHistoryBuilder {
             EventMsg::Error(payload) => self.handle_error(payload),
             EventMsg::TokenCount(_) => {}
             EventMsg::ExactTailCompactionDiagnostic(_) => {}
+            EventMsg::ExactTailToolSurfaceDiagnostic(_) => {}
             EventMsg::ThreadRolledBack(payload) => self.handle_thread_rollback(payload),
             EventMsg::TurnAborted(payload) => self.handle_turn_aborted(payload),
             EventMsg::TurnStarted(payload) => self.handle_turn_started(payload),
@@ -1583,6 +1584,7 @@ mod tests {
     use codex_protocol::protocol::CodexErrorInfo;
     use codex_protocol::protocol::CompactedItem;
     use codex_protocol::protocol::DynamicToolCallResponseEvent;
+    use codex_protocol::protocol::ExactTailToolSurfaceDiagnosticEvent;
     use codex_protocol::protocol::ExecCommandEndEvent;
     use codex_protocol::protocol::ExecCommandSource;
     use codex_protocol::protocol::ItemStartedEvent;
@@ -1603,6 +1605,40 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn exact_tail_tool_surface_diagnostic_event() -> EventMsg {
+        EventMsg::ExactTailToolSurfaceDiagnostic(ExactTailToolSurfaceDiagnosticEvent {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            compaction_id: "compact".into(),
+            route: "remote_v2".into(),
+            hot_tool_call_count: 1,
+            hot_tool_namespace_count: 1,
+            hot_tool_reference_count: 1,
+            rehydrated_tool_count: 1,
+            missing_hot_tool_count: 0,
+            already_direct_tool_count: 0,
+            discoverable_hot_tool_count: 1,
+            missing_notice_emitted_count: 0,
+            missing_no_path_count: 0,
+            hot_tool_reference_overflow_count: 0,
+            hot_tool_reference_overflow_notice_emitted_count: 0,
+            out_of_scope_dependency_protocol_count: 0,
+            tool_surface_changed_after_compaction: true,
+            tool_surface_rehydration_failure_reason: None,
+        })
+    }
+
+    #[test]
+    fn exact_tail_tool_surface_diagnostic_does_not_surface_in_thread_history() {
+        let mut builder = ThreadHistoryBuilder::new();
+        let changes = builder.handle_rollout_items_with_changes(&[RolloutItem::EventMsg(
+            exact_tail_tool_surface_diagnostic_event(),
+        )]);
+
+        assert_eq!(changes, ThreadHistoryChangeSet::default());
+        assert!(builder.finish().is_empty());
+    }
 
     #[test]
     fn builds_multiple_turns_with_reasoning_items() {

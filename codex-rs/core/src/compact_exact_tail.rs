@@ -7,6 +7,7 @@ use crate::context_manager::estimate_response_items_token_count;
 use crate::context_manager::is_user_turn_boundary;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint;
 use codex_analytics::CompactionTrigger;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ContentItem;
@@ -340,8 +341,21 @@ pub(crate) fn build_exact_tail_replacement(
             planned_hot_suffix_item_count: hot_suffix_proof.planned_item_count,
             installed_hot_suffix_item_count: hot_suffix_proof.installed_item_count,
         },
+        tool_surface_hint: prepared.plan.tool_surface_hint.clone(),
         replacement_history,
     })
+}
+
+pub(crate) fn pending_exact_tail_tool_surface_hint(
+    compaction_id: &str,
+    replacement: &ExactTailReplacement,
+    implementation: ExactTailImplementation,
+) -> PendingExactTailToolSurfaceHint {
+    PendingExactTailToolSurfaceHint::new(
+        compaction_id.to_string(),
+        implementation.as_str(),
+        replacement.tool_surface_hint.clone(),
+    )
 }
 
 pub(crate) fn verify_exact_hot_suffix_preserved(
@@ -446,6 +460,12 @@ pub(crate) async fn emit_exact_tail_compaction_diagnostic(
     event.semantic_transcript_reduction_tokens = diagnostics.semantic_transcript_reduction_tokens;
     event.retained_cold_message_tokens = diagnostics.retained_cold_message_tokens;
     event.retained_cold_message_count = diagnostics.retained_cold_message_count;
+    event.hot_tool_call_count = Some(diagnostics.hot_tool_call_count);
+    event.hot_tool_namespace_count = Some(diagnostics.hot_tool_namespace_count);
+    event.hot_tool_reference_count = Some(diagnostics.hot_tool_reference_count);
+    event.hot_tool_reference_overflow_count = Some(diagnostics.hot_tool_reference_overflow_count);
+    event.out_of_scope_dependency_protocol_count =
+        Some(diagnostics.out_of_scope_dependency_protocol_count);
     sess.send_event(
         turn_context,
         EventMsg::ExactTailCompactionDiagnostic(Box::new(event)),
@@ -542,6 +562,11 @@ fn exact_tail_diagnostic_event(
         semantic_transcript_reduction_tokens: None,
         retained_cold_message_tokens: None,
         retained_cold_message_count: None,
+        hot_tool_call_count: None,
+        hot_tool_namespace_count: None,
+        hot_tool_reference_count: None,
+        hot_tool_reference_overflow_count: None,
+        out_of_scope_dependency_protocol_count: None,
     }
 }
 

@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::resolve_installation_id;
 use crate::session::session::Session;
 use crate::session::turn::build_prompt;
-use crate::session::turn::built_tools;
+use crate::session::turn::built_tools_without_exact_tail_tool_surface_hint;
 use crate::state_db_bridge::StateDbHandle;
 use crate::thread_manager::ThreadManager;
 use crate::thread_manager::thread_store_from_config;
@@ -90,7 +90,12 @@ pub(crate) async fn build_prompt_input_from_session(
         .clone_history()
         .await
         .for_prompt(&turn_context.model_info.input_modalities);
-    let router = built_tools(sess, turn_context.as_ref(), &CancellationToken::new()).await?;
+    let router = built_tools_without_exact_tail_tool_surface_hint(
+        sess,
+        turn_context.as_ref(),
+        &CancellationToken::new(),
+    )
+    .await?;
     let base_instructions = sess.get_base_instructions().await;
     let prompt = build_prompt(
         prompt_input,

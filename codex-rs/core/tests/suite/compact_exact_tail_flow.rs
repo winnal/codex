@@ -1,5 +1,168 @@
 use super::compact_exact_tail_support::*;
+use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
+use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use pretty_assertions::assert_eq;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_rehydrates_deferred_tool_surface_after_tool_search_output() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let search_call_id = "exact-tail-search-call";
+    let dynamic_tool_name = "continuity_probe";
+    let input_schema = json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+    });
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("exact-tail-continuity-cold", "EXACT_TAIL_CONTINUITY_COLD"),
+                ev_completed("exact-tail-continuity-cold-response"),
+            ]),
+            sse(vec![
+                ev_response_created("exact-tail-continuity-search-response"),
+                ev_tool_search_call(
+                    search_call_id,
+                    &json!({
+                        "query": "continuity probe",
+                        "limit": 4,
+                    }),
+                ),
+                ev_completed("exact-tail-continuity-search-response"),
+            ]),
+            sse(vec![
+                ev_response_created("exact-tail-continuity-hot-response"),
+                ev_completed("exact-tail-continuity-hot-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "exact-tail-continuity-summary",
+                    "EXACT_TAIL_CONTINUITY_SUMMARY",
+                ),
+                ev_completed("exact-tail-continuity-compact-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "exact-tail-continuity-follow",
+                    "EXACT_TAIL_CONTINUITY_FOLLOW",
+                ),
+                ev_completed("exact-tail-continuity-follow-response"),
+            ]),
+        ],
+    )
+    .await;
+    let provider = local_compaction_provider(&server);
+    let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        name: "codex_app".to_string(),
+        description: "Continuity tools.".to_string(),
+        tools: vec![DynamicToolNamespaceTool::Function(
+            DynamicToolFunctionSpec {
+                name: dynamic_tool_name.to_string(),
+                description: "Continuity probe tool.".to_string(),
+                input_schema: input_schema.clone(),
+                defer_loading: true,
+            },
+        )],
+    });
+    let mut builder = test_codex().with_config(move |config| {
+        configure_search_capable_model(config);
+        config.model_provider = provider;
+        set_test_compact_prompt(config);
+        config.model_context_window = Some(200_000);
+        config.compact_preserve_recent_tokens = Some(1);
+    });
+    let base_test = builder.build(&server).await?;
+    let new_thread = base_test
+        .thread_manager
+        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
+        .await?;
+    let rollout_path = new_thread
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    let mut test = base_test;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+
+    test.submit_turn_with_completion_timeout(
+        "EXACT_TAIL_CONTINUITY_COLD_USER",
+        Duration::from_secs(90),
+    )
+    .await?;
+    test.submit_turn_with_completion_timeout(
+        "EXACT_TAIL_CONTINUITY_HOT_USER",
+        Duration::from_secs(90),
+    )
+    .await?;
+    test.codex.submit(Op::Compact).await?;
+    let compact_event = wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::ExactTailCompactionDiagnostic(_)),
+        Duration::from_secs(90),
+    )
+    .await;
+    let EventMsg::ExactTailCompactionDiagnostic(compact_event) = compact_event else {
+        unreachable!("event guard guarantees exact-tail diagnostic");
+    };
+    assert_eq!(compact_event.failure_reason, None);
+    assert_eq!(compact_event.hot_suffix_exact_match, Some(true));
+    wait_for_event_with_timeout(
+        &test.codex,
+        |event| matches!(event, EventMsg::TurnComplete(_)),
+        Duration::from_secs(90),
+    )
+    .await;
+    test.submit_turn_with_completion_timeout(
+        "EXACT_TAIL_CONTINUITY_FOLLOW_USER",
+        Duration::from_secs(90),
+    )
+    .await?;
+
+    let requests = request_log.requests();
+    assert!(
+        requests.len() >= 4,
+        "expected cold, hot/tool-search, compaction, and follow-up requests"
+    );
+    let follow_body = requests.last().expect("follow-up request").body_json();
+    assert!(
+        namespace_child_tool(&follow_body, "codex_app", dynamic_tool_name).is_some(),
+        "post-compaction follow-up should rehydrate current dynamic tool spec: {follow_body}"
+    );
+    let diagnostics = exact_tail_tool_surface_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic["rehydrated_tool_count"], json!(1));
+    assert_eq!(diagnostic["missing_hot_tool_count"], json!(0));
+    assert_eq!(diagnostic["discoverable_hot_tool_count"], json!(1));
+    assert_eq!(
+        diagnostic["tool_surface_changed_after_compaction"],
+        json!(true)
+    );
+
+    let exact_tail_diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    let compact_diagnostic = exact_tail_diagnostics
+        .last()
+        .expect("exact-tail compaction diagnostic");
+    assert_eq!(
+        compact_diagnostic["hot_tool_reference_overflow_count"],
+        json!(0)
+    );
+    assert!(
+        compact_diagnostic["hot_tool_reference_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "expected hot suffix to include returned tool references: {compact_diagnostic}"
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_tail_mid_turn_compaction_preserves_hot_tool_turn_outside_compactor() -> Result<()> {

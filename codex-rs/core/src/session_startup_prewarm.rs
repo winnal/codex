@@ -15,7 +15,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
 use crate::session::session::Session;
 use crate::session::turn::build_prompt;
-use crate::session::turn::built_tools;
+use crate::session::turn::built_tools_without_exact_tail_tool_surface_hint;
 use codex_otel::STARTUP_PREWARM_AGE_AT_FIRST_TURN_METRIC;
 use codex_otel::STARTUP_PREWARM_DURATION_METRIC;
 use codex_otel::SessionTelemetry;
@@ -258,7 +258,7 @@ async fn schedule_startup_prewarm_inner(
     }
     let startup_cancellation_token = CancellationToken::new();
     let built_tools_started_at = Instant::now();
-    let startup_router = built_tools(
+    let startup_router = built_tools_without_exact_tail_tool_surface_hint(
         session.as_ref(),
         startup_turn_context.as_ref(),
         &startup_cancellation_token,

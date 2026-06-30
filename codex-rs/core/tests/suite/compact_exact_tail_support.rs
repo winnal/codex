@@ -12,14 +12,17 @@ pub(super) use codex_protocol::protocol::EventMsg;
 pub(super) use codex_protocol::protocol::Op;
 pub(super) use codex_protocol::protocol::RolloutItem;
 pub(super) use codex_protocol::protocol::RolloutLine;
+pub(super) use core_test_support::apps_test_server::configure_search_capable_model;
 pub(super) use core_test_support::responses::ev_assistant_message;
 pub(super) use core_test_support::responses::ev_completed;
 pub(super) use core_test_support::responses::ev_completed_with_tokens;
 pub(super) use core_test_support::responses::ev_function_call;
 pub(super) use core_test_support::responses::ev_response_created;
+pub(super) use core_test_support::responses::ev_tool_search_call;
 pub(super) use core_test_support::responses::mount_compact_json_once;
 pub(super) use core_test_support::responses::mount_compact_response_once;
 pub(super) use core_test_support::responses::mount_sse_sequence;
+pub(super) use core_test_support::responses::namespace_child_tool;
 pub(super) use core_test_support::responses::sse;
 pub(super) use core_test_support::responses::sse_failed;
 pub(super) use core_test_support::responses::start_mock_server;
@@ -131,6 +134,33 @@ pub(super) fn ev_compaction_item(encrypted_content: &str) -> Value {
     })
 }
 
+pub(super) fn deferred_dynamic_namespace_tool(
+    namespace: &str,
+    tool_name: &str,
+    description: &str,
+) -> codex_protocol::dynamic_tools::DynamicToolSpec {
+    codex_protocol::dynamic_tools::DynamicToolSpec::Namespace(
+        codex_protocol::dynamic_tools::DynamicToolNamespaceSpec {
+            name: namespace.to_string(),
+            description: format!("{namespace} continuity tools."),
+            tools: vec![
+                codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Function(
+                    codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
+                        name: tool_name.to_string(),
+                        description: description.to_string(),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false,
+                        }),
+                        defer_loading: true,
+                    },
+                ),
+            ],
+        },
+    )
+}
+
 pub(super) fn body_contains_text(body: &str, text: &str) -> bool {
     body.contains(&json_fragment(text))
 }
@@ -230,6 +260,22 @@ pub(super) fn exact_tail_diagnostics_from_rollout(path: &Path) -> Result<Vec<Val
         let entry: RolloutLine = serde_json::from_str(line)?;
         if let RolloutItem::EventMsg(EventMsg::ExactTailCompactionDiagnostic(event)) = entry.item {
             diagnostics.push(serde_json::to_value(*event)?);
+        }
+    }
+    Ok(diagnostics)
+}
+
+pub(super) fn exact_tail_tool_surface_diagnostics_from_rollout(path: &Path) -> Result<Vec<Value>> {
+    let rollout_text = fs::read_to_string(path)?;
+    let mut diagnostics = Vec::new();
+    for line in rollout_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let entry: RolloutLine = serde_json::from_str(line)?;
+        if let RolloutItem::EventMsg(EventMsg::ExactTailToolSurfaceDiagnostic(event)) = entry.item {
+            diagnostics.push(serde_json::to_value(event)?);
         }
     }
     Ok(diagnostics)

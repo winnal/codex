@@ -924,7 +924,8 @@ pub(crate) async fn apply_bespoke_event_handling(
             // Core still fans out this deprecated event for legacy clients;
             // v2 clients receive the canonical ContextCompaction item instead.
         }
-        EventMsg::ExactTailCompactionDiagnostic(..) => {
+        EventMsg::ExactTailCompactionDiagnostic(..)
+        | EventMsg::ExactTailToolSurfaceDiagnostic(..) => {
             // Persisted rollout diagnostics are intentionally not surfaced as UI notifications.
         }
         EventMsg::DeprecationNotice(event) => {
@@ -2208,6 +2209,7 @@ mod tests {
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::CreditsSnapshot;
     use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::ExactTailToolSurfaceDiagnosticEvent;
     use codex_protocol::protocol::GuardianAssessmentEvent;
     use codex_protocol::protocol::GuardianAssessmentStatus;
     use codex_protocol::protocol::RateLimitSnapshot;
@@ -2230,6 +2232,29 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::sync::mpsc;
 
+    fn exact_tail_tool_surface_diagnostic_event() -> EventMsg {
+        EventMsg::ExactTailToolSurfaceDiagnostic(ExactTailToolSurfaceDiagnosticEvent {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            compaction_id: "compact".into(),
+            route: "remote_v2".into(),
+            hot_tool_call_count: 1,
+            hot_tool_namespace_count: 1,
+            hot_tool_reference_count: 1,
+            rehydrated_tool_count: 1,
+            missing_hot_tool_count: 0,
+            already_direct_tool_count: 0,
+            discoverable_hot_tool_count: 1,
+            missing_notice_emitted_count: 0,
+            missing_no_path_count: 0,
+            hot_tool_reference_overflow_count: 0,
+            hot_tool_reference_overflow_notice_emitted_count: 0,
+            out_of_scope_dependency_protocol_count: 0,
+            tool_surface_changed_after_compaction: true,
+            tool_surface_rehydration_failure_reason: None,
+        })
+    }
+
     fn new_thread_state() -> Arc<Mutex<ThreadState>> {
         Arc::new(Mutex::new(ThreadState::default()))
     }
@@ -2248,6 +2273,58 @@ mod tests {
             OutgoingEnvelope::Broadcast { message } => Ok(message),
             OutgoingEnvelope::ToConnection { message, .. } => Ok(message),
         }
+    }
+
+    #[tokio::test]
+    async fn exact_tail_tool_surface_diagnostic_does_not_emit_app_server_notifications()
+    -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![ConnectionId(1)],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-1".to_string(),
+                msg: exact_tail_tool_surface_diagnostic_event(),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            new_thread_state(),
+            ThreadWatchManager::new(),
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+            "test-provider".to_string(),
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "exact-tail diagnostic events must not surface as UI notifications"
+        );
+        Ok(())
     }
 
     #[test]

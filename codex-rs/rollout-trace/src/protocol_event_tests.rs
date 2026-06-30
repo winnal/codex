@@ -1,6 +1,7 @@
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExactTailToolSurfaceDiagnosticEvent;
 use codex_protocol::protocol::ExecCommandBeginEvent;
 use codex_protocol::protocol::ExecCommandEndEvent;
 use codex_protocol::protocol::ExecCommandSource;
@@ -13,7 +14,42 @@ use std::time::Duration;
 
 use super::ToolRuntimeTraceEvent;
 use super::tool_runtime_trace_event;
+use super::wrapped_protocol_event_type;
 use crate::ExecutionStatus;
+
+fn exact_tail_tool_surface_diagnostic_event() -> EventMsg {
+    EventMsg::ExactTailToolSurfaceDiagnostic(ExactTailToolSurfaceDiagnosticEvent {
+        thread_id: "thread".into(),
+        turn_id: "turn".into(),
+        compaction_id: "compact".into(),
+        route: "remote_v2".into(),
+        hot_tool_call_count: 1,
+        hot_tool_namespace_count: 1,
+        hot_tool_reference_count: 1,
+        rehydrated_tool_count: 1,
+        missing_hot_tool_count: 0,
+        already_direct_tool_count: 0,
+        discoverable_hot_tool_count: 1,
+        missing_notice_emitted_count: 0,
+        missing_no_path_count: 0,
+        hot_tool_reference_overflow_count: 0,
+        hot_tool_reference_overflow_notice_emitted_count: 0,
+        out_of_scope_dependency_protocol_count: 0,
+        tool_surface_changed_after_compaction: true,
+        tool_surface_rehydration_failure_reason: None,
+    })
+}
+
+#[test]
+fn exact_tail_tool_surface_diagnostic_is_protocol_event_not_tool_runtime_event() {
+    let tool_surface = exact_tail_tool_surface_diagnostic_event();
+
+    assert_eq!(
+        wrapped_protocol_event_type(&tool_surface),
+        Some("exact_tail_tool_surface_diagnostic")
+    );
+    assert!(tool_runtime_trace_event(&tool_surface).is_none());
+}
 
 #[test]
 fn sub_agent_activity_is_a_terminal_tool_runtime_event() -> anyhow::Result<()> {

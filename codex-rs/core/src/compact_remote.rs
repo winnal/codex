@@ -19,6 +19,7 @@ use crate::compact_exact_tail::ensure_replacement_has_cold_summary;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
+use crate::compact_exact_tail::pending_exact_tail_tool_surface_hint;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::compact_exact_tail::remote_legacy_summary_scaffold_overhead_tokens;
 use crate::context_manager::ContextManager;
@@ -30,7 +31,7 @@ use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
-use crate::session::turn::built_tools;
+use crate::session::turn::built_tools_without_exact_tail_tool_surface_hint;
 use crate::session::turn_context::TurnContext;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
@@ -316,7 +317,7 @@ async fn run_remote_compact_task_inner_impl(
     // request, whose prompt will repeat current developer/context prefix items.
     let trace_input_history = history.raw_items().to_vec();
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
-    let tool_router = built_tools(
+    let tool_router = built_tools_without_exact_tail_tool_surface_hint(
         sess.as_ref(),
         turn_context.as_ref(),
         &CancellationToken::new(),
@@ -378,6 +379,7 @@ async fn run_remote_compact_task_inner_impl(
             return Err(error);
         }
     };
+    let mut exact_tail_tool_surface_hint = None;
     new_history = if let Some(prepared) = &exact_tail_plan {
         new_history.retain(should_keep_compacted_history_item);
         if let Err(error) = ensure_replacement_has_cold_summary(&prepared.plan, &new_history) {
@@ -427,6 +429,11 @@ async fn run_remote_compact_task_inner_impl(
             None,
         )
         .await;
+        exact_tail_tool_surface_hint = Some(pending_exact_tail_tool_surface_hint(
+            &compaction_id,
+            &replacement,
+            prepared.plan.diagnostics.implementation,
+        ));
         replacement.replacement_history
     } else {
         process_compacted_history(
@@ -465,6 +472,9 @@ async fn run_remote_compact_task_inner_impl(
         compacted_item,
     )
     .await;
+    if let Some(hint) = exact_tail_tool_surface_hint {
+        sess.set_pending_exact_tail_tool_surface_hint(hint).await;
+    }
     sess.recompute_token_usage(turn_context).await;
 
     sess.emit_turn_item_completed(turn_context, compaction_item)

@@ -17,6 +17,7 @@ use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::local_summary_scaffold_overhead_tokens;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
+use crate::compact_exact_tail::pending_exact_tail_tool_surface_hint;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 pub(crate) use crate::compact_route::CompactRoute;
 pub(crate) use crate::compact_route::compact_route;
@@ -518,6 +519,7 @@ async fn run_compact_task_inner_impl(
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
     }
+    let mut exact_tail_tool_surface_hint = None;
     if let Some(prepared) = &exact_tail_plan {
         match build_exact_tail_replacement(
             prepared,
@@ -536,6 +538,11 @@ async fn run_compact_task_inner_impl(
                     None,
                 )
                 .await;
+                exact_tail_tool_surface_hint = Some(pending_exact_tail_tool_surface_hint(
+                    &compaction_id,
+                    &replacement,
+                    prepared.plan.diagnostics.implementation,
+                ));
                 new_history = replacement.replacement_history;
             }
             Err(error) => {
@@ -586,6 +593,9 @@ async fn run_compact_task_inner_impl(
         compacted_item,
     )
     .await;
+    if let Some(hint) = exact_tail_tool_surface_hint {
+        sess.set_pending_exact_tail_tool_surface_hint(hint).await;
+    }
     sess.recompute_token_usage(&turn_context).await;
 
     sess.emit_turn_item_completed(&turn_context, compaction_item)

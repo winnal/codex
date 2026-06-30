@@ -205,7 +205,7 @@ async fn run_codex_tool_session_inner(
     loop {
         match thread.next_event().await {
             Ok(event) => {
-                if matches!(event.msg, EventMsg::ExactTailCompactionDiagnostic(_)) {
+                if suppress_event_from_codex_tool_forwarding(&event.msg) {
                     continue;
                 }
 
@@ -272,7 +272,8 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::ModelVerification(_)
                     | EventMsg::SafetyBuffering(_)
                     | EventMsg::TurnModerationMetadata(_)
-                    | EventMsg::ExactTailCompactionDiagnostic(_) => {
+                    | EventMsg::ExactTailCompactionDiagnostic(_)
+                    | EventMsg::ExactTailToolSurfaceDiagnostic(_) => {
                         continue;
                     }
                     EventMsg::GuardianAssessment(_) => {
@@ -417,6 +418,13 @@ async fn run_codex_tool_session_inner(
     }
 }
 
+fn suppress_event_from_codex_tool_forwarding(event: &EventMsg) -> bool {
+    matches!(
+        event,
+        EventMsg::ExactTailCompactionDiagnostic(_) | EventMsg::ExactTailToolSurfaceDiagnostic(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +445,38 @@ mod tests {
                 "content": "done",
             }))
         );
+    }
+
+    #[test]
+    fn exact_tail_tool_surface_diagnostic_is_not_forwarded_as_mcp_notification() {
+        let event = EventMsg::ExactTailToolSurfaceDiagnostic(
+            codex_protocol::protocol::ExactTailToolSurfaceDiagnosticEvent {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                compaction_id: "compact".into(),
+                route: "remote_v2".into(),
+                hot_tool_call_count: 1,
+                hot_tool_namespace_count: 1,
+                hot_tool_reference_count: 1,
+                rehydrated_tool_count: 1,
+                missing_hot_tool_count: 0,
+                already_direct_tool_count: 0,
+                discoverable_hot_tool_count: 1,
+                missing_notice_emitted_count: 0,
+                missing_no_path_count: 0,
+                hot_tool_reference_overflow_count: 0,
+                hot_tool_reference_overflow_notice_emitted_count: 0,
+                out_of_scope_dependency_protocol_count: 0,
+                tool_surface_changed_after_compaction: true,
+                tool_surface_rehydration_failure_reason: None,
+            },
+        );
+
+        assert!(suppress_event_from_codex_tool_forwarding(&event));
+        assert!(!suppress_event_from_codex_tool_forwarding(
+            &EventMsg::Warning(codex_protocol::protocol::WarningEvent {
+                message: "visible warning".into(),
+            }),
+        ));
     }
 }

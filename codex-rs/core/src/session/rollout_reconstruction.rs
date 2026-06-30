@@ -1,5 +1,12 @@
 use super::*;
 use crate::context_manager::is_user_turn_boundary;
+use crate::tools::exact_tail_continuity::ExactTailToolSurfaceHint;
+use crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint;
+use crate::tools::exact_tail_continuity::derive_exact_tail_tool_surface_hint;
+use codex_protocol::protocol::ExactTailCompactionDiagnosticEvent;
+use codex_protocol::protocol::ExactTailCompactionFitResult;
+use codex_protocol::protocol::ExactTailCompactionRoute;
+use codex_protocol::protocol::ExactTailToolSurfaceDiagnosticEvent;
 use uuid::Uuid;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -13,6 +20,7 @@ pub(super) struct RolloutReconstruction {
     pub(super) first_window_id: Option<Uuid>,
     pub(super) previous_window_id: Option<Uuid>,
     pub(super) window_id: Option<Uuid>,
+    pub(super) pending_exact_tail_tool_surface_hint: Option<PendingExactTailToolSurfaceHint>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -46,7 +54,74 @@ struct ActiveReplaySegment<'a> {
     previous_turn_settings: Option<PreviousTurnSettings>,
     reference_context_item: TurnReferenceContextItem,
     base_replacement_history: Option<&'a [ResponseItem]>,
+    exact_tail_compaction_source: Option<RecoveredExactTailCompactionSource>,
+    exact_tail_tool_surface_diagnostic_sources: Vec<RecoveredExactTailCompactionSource>,
     window: Option<ReconstructedWindow>,
+}
+
+#[derive(Debug, Default)]
+struct RolloutReconstructionState<'a> {
+    base_replacement_history: Option<&'a [ResponseItem]>,
+    previous_turn_settings: Option<PreviousTurnSettings>,
+    reference_context_item: TurnReferenceContextItem,
+    window: Option<ReconstructedWindow>,
+    exact_tail_compaction_source: Option<RecoveredExactTailCompactionSource>,
+    exact_tail_tool_surface_diagnostic_sources: Vec<RecoveredExactTailCompactionSource>,
+    pending_rollback_turns: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveredExactTailCompactionSource {
+    compaction_id: String,
+    route: String,
+    installed_hot_suffix_item_count: Option<usize>,
+}
+
+impl RecoveredExactTailCompactionSource {
+    fn from_success_diagnostic(event: &ExactTailCompactionDiagnosticEvent) -> Option<Self> {
+        (event.fit_result == ExactTailCompactionFitResult::Success).then(|| Self {
+            compaction_id: event.compaction_id.clone(),
+            route: match event.route {
+                ExactTailCompactionRoute::Local => "local",
+                ExactTailCompactionRoute::RemoteLegacy => "remote_legacy",
+                ExactTailCompactionRoute::RemoteV2 => "remote_v2",
+                ExactTailCompactionRoute::SemanticTranscript => "semantic_transcript",
+            }
+            .to_string(),
+            installed_hot_suffix_item_count: event.installed_hot_suffix_item_count,
+        })
+    }
+
+    fn from_tool_surface_diagnostic(event: &ExactTailToolSurfaceDiagnosticEvent) -> Self {
+        Self {
+            compaction_id: event.compaction_id.clone(),
+            route: event.route.clone(),
+            installed_hot_suffix_item_count: None,
+        }
+    }
+
+    fn matches_tool_surface_diagnostic(
+        &self,
+        diagnostic_source: &RecoveredExactTailCompactionSource,
+    ) -> bool {
+        self.compaction_id == diagnostic_source.compaction_id
+            && self.route == diagnostic_source.route
+    }
+
+    fn hot_suffix_from_replacement_history<'a>(
+        &self,
+        replacement_history: &'a [ResponseItem],
+    ) -> Option<&'a [ResponseItem]> {
+        if let Some(item_count) = self.installed_hot_suffix_item_count {
+            let start = replacement_history.len().checked_sub(item_count)?;
+            return replacement_history.get(start..);
+        }
+
+        let compaction_index = replacement_history
+            .iter()
+            .rposition(|item| matches!(item, ResponseItem::Compaction { .. }))?;
+        replacement_history.get(compaction_index + 1..)
+    }
 }
 
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
@@ -56,49 +131,52 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
 
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
-    base_replacement_history: &mut Option<&'a [ResponseItem]>,
-    previous_turn_settings: &mut Option<PreviousTurnSettings>,
-    reference_context_item: &mut TurnReferenceContextItem,
-    window: &mut Option<ReconstructedWindow>,
-    pending_rollback_turns: &mut usize,
+    state: &mut RolloutReconstructionState<'a>,
 ) {
     // Thread rollback drops the newest surviving real user-message boundaries. In replay, that
     // means skipping the next finalized segments that contain a non-contextual
     // `EventMsg::UserMessage`.
-    if *pending_rollback_turns > 0 {
+    if state.pending_rollback_turns > 0 {
         if active_segment.counts_as_user_turn {
-            *pending_rollback_turns -= 1;
+            state.pending_rollback_turns -= 1;
         }
         return;
     }
 
+    state
+        .exact_tail_tool_surface_diagnostic_sources
+        .extend(active_segment.exact_tail_tool_surface_diagnostic_sources);
+
     // A surviving replacement-history checkpoint is a complete history base. Once we
     // know the newest surviving one, older rollout items do not affect rebuilt history.
-    if base_replacement_history.is_none()
+    if state.base_replacement_history.is_none()
         && let Some(segment_base_replacement_history) = active_segment.base_replacement_history
     {
-        *base_replacement_history = Some(segment_base_replacement_history);
+        state.base_replacement_history = Some(segment_base_replacement_history);
+        state.exact_tail_compaction_source = active_segment.exact_tail_compaction_source;
     }
 
-    if window.is_none() {
-        *window = active_segment.window;
+    if state.window.is_none() {
+        state.window = active_segment.window;
     }
 
     // `previous_turn_settings` come from the newest surviving user turn that established them.
-    if previous_turn_settings.is_none() && active_segment.counts_as_user_turn {
-        *previous_turn_settings = active_segment.previous_turn_settings;
+    if state.previous_turn_settings.is_none() && active_segment.counts_as_user_turn {
+        state.previous_turn_settings = active_segment.previous_turn_settings;
     }
 
     // `reference_context_item` comes from the newest surviving user turn baseline, or
     // from a surviving compaction that explicitly cleared that baseline.
-    if matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
-        && (active_segment.counts_as_user_turn
-            || matches!(
-                active_segment.reference_context_item,
-                TurnReferenceContextItem::Cleared
-            ))
+    if matches!(
+        state.reference_context_item,
+        TurnReferenceContextItem::NeverSet
+    ) && (active_segment.counts_as_user_turn
+        || matches!(
+            active_segment.reference_context_item,
+            TurnReferenceContextItem::Cleared
+        ))
     {
-        *reference_context_item = active_segment.reference_context_item;
+        state.reference_context_item = active_segment.reference_context_item;
     }
 }
 
@@ -113,13 +191,7 @@ impl Session {
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
         // are both known; then replay only the buffered surviving tail forward to preserve exact
         // history semantics.
-        let mut base_replacement_history: Option<&[ResponseItem]> = None;
-        let mut previous_turn_settings = None;
-        let mut reference_context_item = TurnReferenceContextItem::NeverSet;
-        let mut window = None;
-        // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
-        // "skip the next N user-turn segments we finalize".
-        let mut pending_rollback_turns = 0usize;
+        let mut state = RolloutReconstructionState::default();
         // Borrowed suffix of rollout items newer than the newest surviving replacement-history
         // checkpoint. If no such checkpoint exists, this remains the full rollout.
         let mut rollout_suffix = rollout_items;
@@ -161,8 +233,28 @@ impl Session {
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
-                    pending_rollback_turns = pending_rollback_turns
+                    state.pending_rollback_turns = state
+                        .pending_rollback_turns
                         .saturating_add(usize::try_from(rollback.num_turns).unwrap_or(usize::MAX));
+                }
+                RolloutItem::EventMsg(EventMsg::ExactTailCompactionDiagnostic(event)) => {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    if active_segment.exact_tail_compaction_source.is_none() {
+                        active_segment.exact_tail_compaction_source =
+                            RecoveredExactTailCompactionSource::from_success_diagnostic(
+                                event.as_ref(),
+                            );
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::ExactTailToolSurfaceDiagnostic(event)) => {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment
+                        .exact_tail_tool_surface_diagnostic_sources
+                        .push(
+                            RecoveredExactTailCompactionSource::from_tool_surface_diagnostic(event),
+                        );
                 }
                 RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
                     let active_segment =
@@ -227,14 +319,7 @@ impl Session {
                         )
                     }) && let Some(active_segment) = active_segment.take()
                     {
-                        finalize_active_segment(
-                            active_segment,
-                            &mut base_replacement_history,
-                            &mut previous_turn_settings,
-                            &mut reference_context_item,
-                            &mut window,
-                            &mut pending_rollback_turns,
-                        );
+                        finalize_active_segment(active_segment, &mut state);
                     }
                 }
                 RolloutItem::ResponseItem(response_item) => {
@@ -250,9 +335,12 @@ impl Session {
                 RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => {}
             }
 
-            if base_replacement_history.is_some()
-                && previous_turn_settings.is_some()
-                && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
+            if state.base_replacement_history.is_some()
+                && state.previous_turn_settings.is_some()
+                && !matches!(
+                    state.reference_context_item,
+                    TurnReferenceContextItem::NeverSet
+                )
             {
                 // At this point we have both eager resume metadata values and the replacement-
                 // history base for the surviving tail, so older rollout items cannot affect this
@@ -262,14 +350,7 @@ impl Session {
         }
 
         if let Some(active_segment) = active_segment.take() {
-            finalize_active_segment(
-                active_segment,
-                &mut base_replacement_history,
-                &mut previous_turn_settings,
-                &mut reference_context_item,
-                &mut window,
-                &mut pending_rollback_turns,
-            );
+            finalize_active_segment(active_segment, &mut state);
         }
 
         let fallback_window_number = u64::try_from(
@@ -282,7 +363,29 @@ impl Session {
 
         let mut history = ContextManager::new();
         let mut saw_legacy_compaction_without_replacement_history = false;
-        if let Some(base_replacement_history) = base_replacement_history {
+        let recovered_exact_tail_compaction_source = state.exact_tail_compaction_source.as_ref();
+        let selected_exact_tail_hint_was_consumed = recovered_exact_tail_compaction_source
+            .is_some_and(|source| {
+                state
+                    .exact_tail_tool_surface_diagnostic_sources
+                    .iter()
+                    .any(|diagnostic_source| {
+                        source.matches_tool_surface_diagnostic(diagnostic_source)
+                    })
+            });
+        let pending_exact_tail_tool_surface_hint = (!selected_exact_tail_hint_was_consumed)
+            .then(|| {
+                state
+                    .base_replacement_history
+                    .and_then(|base_replacement_history| {
+                        recover_pending_exact_tail_tool_surface_hint(
+                            base_replacement_history,
+                            recovered_exact_tail_compaction_source?,
+                        )
+                    })
+            })
+            .flatten();
+        if let Some(base_replacement_history) = state.base_replacement_history {
             history.replace(base_replacement_history.to_vec());
         }
         // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
@@ -336,7 +439,7 @@ impl Session {
             }
         }
 
-        let reference_context_item = match reference_context_item {
+        let reference_context_item = match state.reference_context_item {
             TurnReferenceContextItem::NeverSet | TurnReferenceContextItem::Cleared => None,
             TurnReferenceContextItem::Latest(turn_reference_context_item) => {
                 Some(*turn_reference_context_item)
@@ -348,7 +451,7 @@ impl Session {
             reference_context_item
         };
 
-        let window = window.unwrap_or(ReconstructedWindow {
+        let window = state.window.unwrap_or(ReconstructedWindow {
             number: fallback_window_number,
             first_id: None,
             previous_id: None,
@@ -356,14 +459,32 @@ impl Session {
         });
         RolloutReconstruction {
             history: history.raw_items().to_vec(),
-            previous_turn_settings,
+            previous_turn_settings: state.previous_turn_settings,
             reference_context_item,
             window_number: window.number,
             first_window_id: window.first_id,
             previous_window_id: window.previous_id,
             window_id: window.id,
+            pending_exact_tail_tool_surface_hint,
         }
     }
+}
+
+fn recover_pending_exact_tail_tool_surface_hint(
+    replacement_history: &[ResponseItem],
+    source: &RecoveredExactTailCompactionSource,
+) -> Option<PendingExactTailToolSurfaceHint> {
+    let hot_suffix = source.hot_suffix_from_replacement_history(replacement_history)?;
+    let hint = derive_exact_tail_tool_surface_hint(hot_suffix);
+    exact_tail_tool_surface_hint_has_signal(&hint)
+        .then(|| PendingExactTailToolSurfaceHint::new(&source.compaction_id, &source.route, hint))
+}
+
+fn exact_tail_tool_surface_hint_has_signal(hint: &ExactTailToolSurfaceHint) -> bool {
+    !hint.references.is_empty()
+        || hint.hot_tool_call_count > 0
+        || hint.hot_tool_reference_overflow_count > 0
+        || hint.out_of_scope_dependency_protocol_count > 0
 }
 
 fn parse_uuid_v7(value: &str) -> Option<Uuid> {

@@ -79,7 +79,9 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::ShellCommandHandler;
+use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolCallSource;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_app_server_protocol::AppInfo;
@@ -233,6 +235,511 @@ fn assistant_message(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[tokio::test]
+async fn exact_tail_tool_surface_hint_lifecycle() -> anyhow::Result<()> {
+    fn pending_hint() -> crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint {
+        crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint::new(
+            "compact-test",
+            "local",
+            crate::tools::exact_tail_continuity::ExactTailToolSurfaceHint {
+                references: vec![codex_tools::ToolName::plain("missing_tool")],
+                hot_tool_call_count: 1,
+                hot_tool_namespace_count: 0,
+                hot_tool_reference_count: 1,
+                hot_tool_reference_overflow_count: 0,
+                out_of_scope_dependency_protocol_count: 0,
+            },
+        )
+    }
+
+    let (session, turn_context) = make_session_and_context().await;
+    let cancellation_token = CancellationToken::new();
+    session
+        .set_pending_exact_tail_tool_surface_hint(pending_hint())
+        .await;
+
+    let ignored = crate::session::turn::built_tools_without_exact_tail_tool_surface_hint(
+        &session,
+        &turn_context,
+        &cancellation_token,
+    )
+    .await?;
+    assert!(ignored.exact_tail_tool_surface_outcome().is_none());
+
+    let consumed =
+        crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
+    let outcome = consumed
+        .exact_tail_tool_surface_outcome()
+        .expect("first normal tool build should consume pending exact-tail hint");
+    assert_eq!(outcome.compaction_id, "compact-test");
+    assert_eq!(outcome.route, "local");
+    assert_eq!(outcome.missing_hot_tool_count, 1);
+    assert_eq!(outcome.missing_notice_emitted_count, 1);
+
+    let repeated =
+        crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
+    assert!(repeated.exact_tail_tool_surface_outcome().is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn exact_tail_tool_surface_hint_survives_startup_prewarm_tool_build() -> anyhow::Result<()> {
+    let (session, turn_context) = make_session_and_context().await;
+    let startup_turn_context = session
+        .new_startup_prewarm_turn_with_sub_id(INITIAL_SUBMIT_ID.to_string())
+        .await;
+    let cancellation_token = CancellationToken::new();
+    session
+        .set_pending_exact_tail_tool_surface_hint(
+            crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint::new(
+                "compact-test",
+                "remote_v2",
+                crate::tools::exact_tail_continuity::ExactTailToolSurfaceHint {
+                    references: vec![codex_tools::ToolName::plain("missing_tool")],
+                    hot_tool_call_count: 1,
+                    hot_tool_namespace_count: 0,
+                    hot_tool_reference_count: 1,
+                    hot_tool_reference_overflow_count: 0,
+                    out_of_scope_dependency_protocol_count: 0,
+                },
+            ),
+        )
+        .await;
+
+    let prewarm_router = crate::session::turn::built_tools_without_exact_tail_tool_surface_hint(
+        &session,
+        &startup_turn_context,
+        &cancellation_token,
+    )
+    .await?;
+    assert!(prewarm_router.exact_tail_tool_surface_outcome().is_none());
+
+    let normal_router =
+        crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
+    let outcome = normal_router
+        .exact_tail_tool_surface_outcome()
+        .expect("first normal tool build should consume hint after prewarm ignored it");
+    assert_eq!(outcome.compaction_id, "compact-test");
+    assert_eq!(outcome.route, "remote_v2");
+    assert_eq!(outcome.missing_hot_tool_count, 1);
+    assert_eq!(outcome.missing_notice_emitted_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_exact_tail_compaction_reconstructs_tool_surface_hint() -> anyhow::Result<()> {
+    let dynamic_tool_name = "resumed_continuity_probe";
+    let dynamic_tool =
+        DynamicToolSpec::Namespace(codex_protocol::dynamic_tools::DynamicToolNamespaceSpec {
+            name: "codex_app".to_string(),
+            description: "Resume continuity tools.".to_string(),
+            tools: vec![
+                codex_protocol::dynamic_tools::DynamicToolNamespaceTool::Function(
+                    codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
+                        name: dynamic_tool_name.to_string(),
+                        description: "Resume continuity probe.".to_string(),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false,
+                        }),
+                        defer_loading: true,
+                    },
+                ),
+            ],
+        });
+    let (session, mut turn_context, _rx) =
+        make_session_and_context_with_dynamic_tools_and_rx(vec![dynamic_tool]).await;
+    Arc::get_mut(&mut turn_context)
+        .expect("turn context fixture should be unique")
+        .model_info
+        .supports_search_tool = true;
+    let replacement_history = vec![
+        ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "EXACT_TAIL_RESUME_SUMMARY".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::ToolSearchOutput {
+            id: None,
+            call_id: Some("resume-search".to_string()),
+            status: "completed".to_string(),
+            execution: "search".to_string(),
+            tools: vec![serde_json::json!({
+                "type": "namespace",
+                "name": "codex_app",
+                "tools": [{
+                    "type": "function",
+                    "name": dynamic_tool_name,
+                    "description": "historical description ignored"
+                }]
+            })],
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: vec![
+                RolloutItem::EventMsg(EventMsg::ExactTailCompactionDiagnostic(Box::new(
+                    serde_json::from_value(serde_json::json!({
+                        "thread_id": "thread",
+                        "turn_id": "turn",
+                        "compaction_id": "compact-resume",
+                        "route": "remote_v2",
+                        "trigger": "manual",
+                        "fit_result": "success",
+                        "hot_suffix_exact_match": true,
+                        "planned_hot_suffix_item_count": 1,
+                        "installed_hot_suffix_item_count": 1
+                    }))?,
+                ))),
+                RolloutItem::Compacted(CompactedItem {
+                    message: String::new(),
+                    replacement_history: Some(replacement_history.clone()),
+                    window_number: None,
+                    first_window_id: None,
+                    previous_window_id: None,
+                    window_id: None,
+                }),
+            ],
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+        }))
+        .await;
+    assert_eq!(
+        session.clone_history().await.raw_items(),
+        replacement_history
+    );
+
+    let cancellation_token = CancellationToken::new();
+    let router =
+        crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
+    let outcome = router
+        .exact_tail_tool_surface_outcome()
+        .expect("resumed exact-tail hint should be consumed");
+    assert_eq!(outcome.compaction_id, "compact-resume");
+    assert_eq!(outcome.route, "remote_v2");
+    assert_eq!(outcome.rehydrated_tool_count, 1);
+    assert_eq!(outcome.missing_hot_tool_count, 0);
+    assert!(router.model_visible_specs().iter().any(|spec| matches!(
+        spec,
+        codex_tools::ToolSpec::Namespace(namespace)
+            if namespace.name == "codex_app"
+                && namespace.tools.iter().any(|tool| matches!(
+                    tool,
+                    codex_tools::ResponsesApiNamespaceTool::Function(function)
+                        if function.name == dynamic_tool_name
+                ))
+    )));
+
+    let repeated =
+        crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
+    assert!(repeated.exact_tail_tool_surface_outcome().is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_exact_tail_compaction_recovers_tool_surface_hint_without_compaction_boundary()
+-> anyhow::Result<()> {
+    for (route, replacement_history) in [
+        (
+            "local",
+            exact_tail_summary_resume_replacement_history("local_resume_tool"),
+        ),
+        (
+            "remote_legacy",
+            exact_tail_summary_resume_replacement_history("legacy_resume_tool"),
+        ),
+    ] {
+        let (session, turn_context, _rx) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: vec![
+                    resume_compaction_diagnostic_with_route(&format!("compact-{route}"), route, 1)?,
+                    RolloutItem::Compacted(CompactedItem {
+                        message: String::new(),
+                        replacement_history: Some(replacement_history),
+                        window_number: None,
+                        first_window_id: None,
+                        previous_window_id: None,
+                        window_id: None,
+                    }),
+                ],
+                rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            }))
+            .await;
+
+        let router =
+            crate::session::turn::built_tools(&session, &turn_context, &CancellationToken::new())
+                .await?;
+        let outcome = router
+            .exact_tail_tool_surface_outcome()
+            .expect("unconsumed exact-tail compaction should reconstruct a hint");
+        assert_eq!(outcome.compaction_id, format!("compact-{route}"));
+        assert_eq!(outcome.route, route);
+        assert_eq!(outcome.missing_hot_tool_count, 1);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_exact_tail_compaction_does_not_reconstruct_consumed_tool_surface_hint()
+-> anyhow::Result<()> {
+    let completion_cases = [
+        RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn".to_string(),
+            last_agent_message: None,
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        })),
+        RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+            turn_id: Some("turn".to_string()),
+            reason: TurnAbortReason::Interrupted,
+            completed_at: None,
+            duration_ms: None,
+        })),
+    ];
+
+    for completion_item in completion_cases {
+        let (session, turn_context, _rx) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        session
+            .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+                conversation_id: ThreadId::default(),
+                history: vec![
+                    resume_compaction_diagnostic("compact")?,
+                    RolloutItem::Compacted(CompactedItem {
+                        message: String::new(),
+                        replacement_history: Some(exact_tail_resume_replacement_history(
+                            "already_consumed_tool",
+                        )),
+                        window_number: None,
+                        first_window_id: None,
+                        previous_window_id: None,
+                        window_id: None,
+                    }),
+                    consumed_hint_tool_surface_diagnostic("compact"),
+                    completion_item,
+                ],
+                rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+            }))
+            .await;
+
+        let router =
+            crate::session::turn::built_tools(&session, &turn_context, &CancellationToken::new())
+                .await?;
+        assert!(router.exact_tail_tool_surface_outcome().is_none());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_exact_tail_compaction_ignores_older_consumed_tool_surface_hint()
+-> anyhow::Result<()> {
+    let (session, turn_context, _rx) =
+        make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: vec![
+                resume_compaction_diagnostic("compact-a")?,
+                RolloutItem::Compacted(CompactedItem {
+                    message: String::new(),
+                    replacement_history: Some(exact_tail_resume_replacement_history(
+                        "already_consumed_tool",
+                    )),
+                    window_number: None,
+                    first_window_id: None,
+                    previous_window_id: None,
+                    window_id: None,
+                }),
+                consumed_hint_tool_surface_diagnostic("compact-a"),
+                RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: "turn-a".to_string(),
+                    last_agent_message: None,
+                    completed_at: None,
+                    duration_ms: None,
+                    time_to_first_token_ms: None,
+                })),
+                resume_compaction_diagnostic("compact-b")?,
+                RolloutItem::Compacted(CompactedItem {
+                    message: String::new(),
+                    replacement_history: Some(exact_tail_resume_replacement_history(
+                        "newer_unconsumed_tool",
+                    )),
+                    window_number: None,
+                    first_window_id: None,
+                    previous_window_id: None,
+                    window_id: None,
+                }),
+            ],
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+        }))
+        .await;
+
+    let router =
+        crate::session::turn::built_tools(&session, &turn_context, &CancellationToken::new())
+            .await?;
+    let outcome = router
+        .exact_tail_tool_surface_outcome()
+        .expect("newer unconsumed exact-tail compaction should reconstruct a hint");
+    assert_eq!(outcome.compaction_id, "compact-b");
+    assert_eq!(outcome.missing_hot_tool_count, 1);
+
+    Ok(())
+}
+
+fn exact_tail_resume_replacement_history(tool_name: &str) -> Vec<ResponseItem> {
+    vec![
+        ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "EXACT_TAIL_RESUME_SUMMARY".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::ToolSearchOutput {
+            id: None,
+            call_id: Some("resume-search".to_string()),
+            status: "completed".to_string(),
+            execution: "search".to_string(),
+            tools: vec![serde_json::json!({
+                "type": "function",
+                "name": tool_name
+            })],
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]
+}
+
+fn exact_tail_summary_resume_replacement_history(tool_name: &str) -> Vec<ResponseItem> {
+    vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!("{}\nEXACT_TAIL_RESUME_SUMMARY", compact::SUMMARY_PREFIX),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::ToolSearchOutput {
+            id: None,
+            call_id: Some("resume-search".to_string()),
+            status: "completed".to_string(),
+            execution: "search".to_string(),
+            tools: vec![serde_json::json!({
+                "type": "function",
+                "name": tool_name
+            })],
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]
+}
+
+fn resume_compaction_diagnostic(compaction_id: &str) -> anyhow::Result<RolloutItem> {
+    resume_compaction_diagnostic_with_route(compaction_id, "remote_v2", 1)
+}
+
+fn resume_compaction_diagnostic_with_route(
+    compaction_id: &str,
+    route: &str,
+    installed_hot_suffix_item_count: usize,
+) -> anyhow::Result<RolloutItem> {
+    Ok(RolloutItem::EventMsg(
+        EventMsg::ExactTailCompactionDiagnostic(Box::new(serde_json::from_value(
+            serde_json::json!({
+                "thread_id": "thread",
+                "turn_id": "turn",
+                "compaction_id": compaction_id,
+                "route": route,
+                "trigger": "manual",
+                "fit_result": "success",
+                "hot_suffix_exact_match": true,
+                "planned_hot_suffix_item_count": installed_hot_suffix_item_count,
+                "installed_hot_suffix_item_count": installed_hot_suffix_item_count
+            }),
+        )?)),
+    ))
+}
+
+fn consumed_hint_tool_surface_diagnostic(compaction_id: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::ExactTailToolSurfaceDiagnostic(
+        codex_protocol::protocol::ExactTailToolSurfaceDiagnosticEvent {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            compaction_id: compaction_id.to_string(),
+            route: "remote_v2".to_string(),
+            hot_tool_call_count: 1,
+            hot_tool_namespace_count: 0,
+            hot_tool_reference_count: 1,
+            rehydrated_tool_count: 0,
+            missing_hot_tool_count: 1,
+            already_direct_tool_count: 0,
+            discoverable_hot_tool_count: 0,
+            missing_notice_emitted_count: 1,
+            missing_no_path_count: 1,
+            hot_tool_reference_overflow_count: 0,
+            hot_tool_reference_overflow_notice_emitted_count: 0,
+            out_of_scope_dependency_protocol_count: 0,
+            tool_surface_changed_after_compaction: true,
+            tool_surface_rehydration_failure_reason: Some(
+                "hot_tool_references_not_model_visible".to_string(),
+            ),
+        },
+    ))
+}
+
+#[tokio::test]
+async fn exact_tail_tool_surface_notice_is_added_to_prompt_input() {
+    let (_session, turn_context) = make_session_and_context().await;
+    let router = ToolRouter::from_parts_with_exact_tail_tool_surface_outcome(
+        ToolRegistry::from_tools(Vec::<Arc<dyn CoreToolRuntime>>::new()),
+        Vec::new(),
+        Some(
+            crate::tools::exact_tail_continuity::ExactTailToolSurfaceOutcome {
+                missing_hot_tool_count: 1,
+                missing_notice_emitted_count: 1,
+                discoverable_hot_tool_count: 1,
+                ..Default::default()
+            },
+        ),
+    );
+
+    let prompt = crate::session::turn::build_prompt(
+        vec![user_message("hello")],
+        &router,
+        &turn_context,
+        BaseInstructions::default(),
+    );
+    let ResponseItem::Message { content, .. } = prompt
+        .input
+        .last()
+        .expect("prompt should include exact-tail notice")
+    else {
+        panic!("expected exact-tail notice message");
+    };
+    let notice = content
+        .iter()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text),
+            ContentItem::InputImage { .. } => None,
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(prompt.input.len(), 2);
+    assert!(notice.contains("1 tool reference(s)"));
+    assert!(notice.contains("Rediscover still-available deferred tools"));
 }
 
 fn test_session_telemetry_without_metadata() -> SessionTelemetry {
@@ -604,6 +1111,7 @@ fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> T
             deferred_mcp_tools: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            exact_tail_tool_surface_hint: None,
         },
         &Default::default(),
     ));
@@ -9980,6 +10488,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
             mcp_tools: Some(tools),
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            exact_tail_tool_surface_hint: None,
         },
         &Default::default(),
     );

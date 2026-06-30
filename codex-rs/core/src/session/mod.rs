@@ -1378,6 +1378,7 @@ impl Session {
             first_window_id,
             previous_window_id,
             window_id,
+            pending_exact_tail_tool_surface_hint,
         } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
@@ -1392,6 +1393,9 @@ impl Session {
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);
+            if let Some(hint) = pending_exact_tail_tool_surface_hint {
+                state.set_pending_exact_tail_tool_surface_hint(hint);
+            }
             if let Some(world_state) = world_state_baseline {
                 state.history.set_world_state_baseline(world_state);
             }
@@ -3423,6 +3427,21 @@ impl Session {
     pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
         state.clone_history()
+    }
+
+    pub(crate) async fn set_pending_exact_tail_tool_surface_hint(
+        &self,
+        hint: crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint,
+    ) {
+        let mut state = self.state.lock().await;
+        state.set_pending_exact_tail_tool_surface_hint(hint);
+    }
+
+    pub(crate) async fn take_pending_exact_tail_tool_surface_hint(
+        &self,
+    ) -> Option<crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint> {
+        let mut state = self.state.lock().await;
+        state.take_pending_exact_tail_tool_surface_hint()
     }
 
     pub(crate) async fn current_window_id(&self) -> String {

@@ -17,6 +17,7 @@ use crate::compact_exact_tail::ensure_replacement_has_cold_summary;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
 use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
+use crate::compact_exact_tail::pending_exact_tail_tool_surface_hint;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::compact_remote_v2::RemoteCompactionV2Output;
 use crate::compact_remote_v2::run_remote_compaction_request_v2;
@@ -30,7 +31,7 @@ use crate::hook_runtime::run_pre_compact_hooks;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
-use crate::session::turn::built_tools;
+use crate::session::turn::built_tools_without_exact_tail_tool_surface_hint;
 use crate::session::turn_context::TurnContext;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
@@ -342,7 +343,7 @@ async fn run_remote_compact_task_inner_impl(
 
     let trace_input_history = history.raw_items().to_vec();
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
-    let tool_router = built_tools(
+    let tool_router = built_tools_without_exact_tail_tool_surface_hint(
         sess.as_ref(),
         turn_context.as_ref(),
         &CancellationToken::new(),
@@ -503,6 +504,11 @@ async fn run_remote_compact_task_inner_impl(
         None,
     )
     .await;
+    let exact_tail_tool_surface_hint = pending_exact_tail_tool_surface_hint(
+        &compaction_id,
+        &replacement,
+        exact_tail_plan.plan.diagnostics.implementation,
+    );
     let new_history = replacement.replacement_history;
     if let Some(client_session) = client_session {
         client_session.reset_responses_continuation();
@@ -535,6 +541,8 @@ async fn run_remote_compact_task_inner_impl(
         compacted_item,
     )
     .await;
+    sess.set_pending_exact_tail_tool_surface_hint(exact_tail_tool_surface_hint)
+        .await;
     sess.recompute_token_usage(turn_context).await;
 
     sess.emit_turn_item_completed(turn_context, compaction_item)

@@ -1,6 +1,7 @@
 use super::*;
 use crate::context_manager::ContextManager;
 use crate::context_manager::model_visible_tool_output_item_token_limit;
+use crate::tools::exact_tail_continuity::derive_exact_tail_tool_surface_hint;
 use codex_analytics::CompactionTrigger;
 use codex_protocol::AgentPath;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
@@ -141,6 +142,7 @@ fn prepared_for_hot_suffix(
 ) -> PreparedExactTailPlan {
     let mut plan = plan(vec![user("old"), user("placeholder hot")], 1);
     plan.hot_suffix = hot_suffix;
+    plan.tool_surface_hint = derive_exact_tail_tool_surface_hint(&plan.hot_suffix);
     PreparedExactTailPlan {
         plan,
         initial_context,

@@ -354,6 +354,7 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::ContextCompacted(_)
         | EventMsg::ExactTailCompactionDiagnostic(_)
+        | EventMsg::ExactTailToolSurfaceDiagnostic(_)
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::TurnStarted(_)
@@ -420,6 +421,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         EventMsg::Warning(_) => Some("warning"),
         EventMsg::ShutdownComplete => Some("shutdown_complete"),
         EventMsg::ExactTailCompactionDiagnostic(_) => Some("exact_tail_compaction_diagnostic"),
+        EventMsg::ExactTailToolSurfaceDiagnostic(_) => Some("exact_tail_tool_surface_diagnostic"),
         EventMsg::GuardianWarning(_)
         | EventMsg::SafetyBuffering(_)
         | EventMsg::RealtimeConversationStarted(_)

@@ -1,24 +1,38 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_mcp::ToolInfo;
+use codex_model_provider::ModelProvider;
+use codex_model_provider::ModelProviderFuture;
+use codex_model_provider::ProviderAccountResult;
+use codex_model_provider::ProviderAccountState;
+use codex_model_provider::ProviderCapabilities;
+use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_models_manager::manager::SharedModelsManager;
+use codex_models_manager::manager::StaticModelsManager;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ApplyPatchToolType;
 use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::openai_models::WebSearchToolType;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_tools::DiscoverablePluginInfo;
 use codex_tools::DiscoverableTool;
+use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolCall as ExtensionToolCall;
@@ -26,18 +40,27 @@ use codex_tools::ToolExecutor;
 use codex_tools::ToolExposure;
 use codex_tools::ToolName;
 use codex_tools::ToolOutput;
+use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
+use crate::tools::exact_tail_continuity::ExactTailToolSurfaceHint;
+use crate::tools::exact_tail_continuity::ExactTailToolSurfaceOutcome;
+use crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint;
+use crate::tools::exact_tail_continuity::derive_exact_tail_tool_surface_hint;
+use crate::tools::exact_tail_continuity::exact_tail_tool_surface_notice_item;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
+
+use super::EXACT_TAIL_PROMOTED_TOOL_SPEC_TOKEN_LIMIT;
+use super::EXACT_TAIL_PROMOTED_TOOL_SPECS_TOTAL_TOKEN_LIMIT;
 
 #[derive(Default)]
 struct ToolPlanInputs {
@@ -46,6 +69,7 @@ struct ToolPlanInputs {
     tool_suggest_candidates: Option<ToolSuggestCandidates>,
     extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     dynamic_tools: Vec<DynamicToolSpec>,
+    exact_tail_tool_surface_hint: Option<PendingExactTailToolSurfaceHint>,
 }
 
 struct ToolPlanProbe {
@@ -54,6 +78,49 @@ struct ToolPlanProbe {
     namespace_functions: BTreeMap<String, Vec<String>>,
     registered_names: Vec<String>,
     exposures: BTreeMap<String, ToolExposure>,
+    exact_tail_tool_surface_outcome: Option<ExactTailToolSurfaceOutcome>,
+}
+
+#[derive(Debug)]
+struct CapabilityProvider {
+    info: ModelProviderInfo,
+    capabilities: ProviderCapabilities,
+}
+
+impl ModelProvider for CapabilityProvider {
+    fn info(&self) -> &ModelProviderInfo {
+        &self.info
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities
+    }
+
+    fn auth_manager(&self) -> Option<Arc<AuthManager>> {
+        None
+    }
+
+    fn auth(&self) -> ModelProviderFuture<'_, Option<CodexAuth>> {
+        Box::pin(async { None })
+    }
+
+    fn account_state(&self) -> ProviderAccountResult {
+        Ok(ProviderAccountState {
+            account: None,
+            requires_openai_auth: false,
+        })
+    }
+
+    fn models_manager(
+        &self,
+        _codex_home: PathBuf,
+        config_model_catalog: Option<ModelsResponse>,
+    ) -> SharedModelsManager {
+        Arc::new(StaticModelsManager::new(
+            None,
+            config_model_catalog.unwrap_or_default(),
+        ))
+    }
 }
 
 impl ToolPlanProbe {
@@ -103,6 +170,7 @@ impl ToolPlanProbe {
             namespace_functions,
             registered_names,
             exposures,
+            exact_tail_tool_surface_outcome: router.exact_tail_tool_surface_outcome().cloned(),
         }
     }
 
@@ -186,6 +254,7 @@ async fn probe_with(
             deferred_mcp_tools: inputs.deferred_mcp_tools,
             extension_tool_executors: inputs.extension_tool_executors,
             dynamic_tools: inputs.dynamic_tools.as_slice(),
+            exact_tail_tool_surface_hint: inputs.exact_tail_tool_surface_hint,
         },
         &Default::default(),
     );
@@ -331,6 +400,30 @@ impl ToolExecutor<ExtensionToolCall> for DeferredExtensionTool {
     }
 }
 
+struct NonSearchableDeferredExtensionTool;
+
+impl ToolExecutor<ExtensionToolCall> for NonSearchableDeferredExtensionTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain("extension_echo")
+    }
+
+    fn spec(&self) -> ToolSpec {
+        DeferredExtensionTool.spec()
+    }
+
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::Deferred
+    }
+
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        None
+    }
+
+    fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async { panic!("spec planning should not execute extension tools") })
+    }
+}
+
 fn duplicate_primary_environment(turn: &mut TurnContext) {
     let mut second_environment = turn.environments.turn_environments[0].clone();
     second_environment.environment_id = "secondary".to_string();
@@ -369,9 +462,23 @@ fn invalid_mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {
 }
 
 fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> DynamicToolSpec {
+    dynamic_tool_with_description(
+        namespace,
+        name,
+        defer_loading,
+        format!("{name} dynamic tool"),
+    )
+}
+
+fn dynamic_tool_with_description(
+    namespace: Option<&str>,
+    name: &str,
+    defer_loading: bool,
+    description: String,
+) -> DynamicToolSpec {
     let function = codex_protocol::dynamic_tools::DynamicToolFunctionSpec {
         name: name.to_string(),
-        description: format!("{name} dynamic tool"),
+        description,
         input_schema: json!({
             "type": "object",
             "properties": {},
@@ -390,6 +497,156 @@ fn dynamic_tool(namespace: Option<&str>, name: &str, defer_loading: bool) -> Dyn
             })
         }
         None => DynamicToolSpec::Function(function),
+    }
+}
+
+fn sized_dynamic_tool_description_for_namespace_merge_cap() -> String {
+    for repeat_count in 1..2_000 {
+        let description = "merge cap ".repeat(repeat_count);
+        let one_tool_tokens = super::serialized_tool_spec_token_count(&namespace_tool_spec(
+            "codex_app",
+            "tool_one",
+            &description,
+            &[],
+        ));
+        let two_tool_tokens = super::serialized_tool_spec_token_count(&namespace_tool_spec(
+            "codex_app",
+            "tool_one",
+            &description,
+            &["tool_two"],
+        ));
+        if one_tool_tokens <= EXACT_TAIL_PROMOTED_TOOL_SPEC_TOKEN_LIMIT
+            && two_tool_tokens > EXACT_TAIL_PROMOTED_TOOL_SPEC_TOKEN_LIMIT
+        {
+            return description;
+        }
+    }
+    panic!("failed to find deterministic namespace merge cap fixture size");
+}
+
+fn sized_dynamic_tool_description_for_aggregate_cap() -> (String, usize) {
+    for repeat_count in 1..2_000 {
+        let description = "aggregate cap ".repeat(repeat_count);
+        let tokens = super::serialized_tool_spec_token_count(&function_tool_spec(
+            "aggregate_probe",
+            &description,
+        ));
+        if tokens > EXACT_TAIL_PROMOTED_TOOL_SPEC_TOKEN_LIMIT / 2
+            && tokens <= EXACT_TAIL_PROMOTED_TOOL_SPEC_TOKEN_LIMIT
+        {
+            return (description, tokens);
+        }
+    }
+    panic!("failed to find deterministic aggregate cap fixture size");
+}
+
+fn namespace_tool_spec(
+    namespace: &str,
+    first_tool_name: &str,
+    description: &str,
+    additional_tool_names: &[&str],
+) -> ToolSpec {
+    let mut tools = vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+        name: first_tool_name.to_string(),
+        description: description.to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: codex_tools::JsonSchema::object(
+            BTreeMap::new(),
+            None,
+            Some(codex_tools::AdditionalProperties::Boolean(false)),
+        ),
+        output_schema: None,
+    })];
+    tools.extend(additional_tool_names.iter().map(|tool_name| {
+        ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+            name: (*tool_name).to_string(),
+            description: description.to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::object(
+                BTreeMap::new(),
+                None,
+                Some(codex_tools::AdditionalProperties::Boolean(false)),
+            ),
+            output_schema: None,
+        })
+    }));
+    ToolSpec::Namespace(ResponsesApiNamespace {
+        name: namespace.to_string(),
+        description: format!("{namespace} dynamic tools"),
+        tools,
+    })
+}
+
+fn function_tool_spec(name: &str, description: &str) -> ToolSpec {
+    ToolSpec::Function(ResponsesApiTool {
+        name: name.to_string(),
+        description: description.to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: codex_tools::JsonSchema::object(
+            BTreeMap::new(),
+            None,
+            Some(codex_tools::AdditionalProperties::Boolean(false)),
+        ),
+        output_schema: None,
+    })
+}
+
+fn provider_with_capabilities(
+    info: ModelProviderInfo,
+    capabilities: ProviderCapabilities,
+) -> SharedModelProvider {
+    Arc::new(CapabilityProvider { info, capabilities })
+}
+
+fn pending_exact_tail_hint(references: Vec<ToolName>) -> PendingExactTailToolSurfaceHint {
+    let namespaces = references
+        .iter()
+        .filter_map(|reference| reference.namespace.clone())
+        .collect::<BTreeSet<_>>();
+    pending_exact_tail_hint_from_hint(ExactTailToolSurfaceHint {
+        hot_tool_reference_count: references.len(),
+        references,
+        hot_tool_call_count: 1,
+        hot_tool_namespace_count: namespaces.len(),
+        hot_tool_reference_overflow_count: 0,
+        out_of_scope_dependency_protocol_count: 0,
+    })
+}
+
+fn pending_exact_tail_hint_from_hint(
+    hint: ExactTailToolSurfaceHint,
+) -> PendingExactTailToolSurfaceHint {
+    PendingExactTailToolSurfaceHint::new("compact-test", "remote_v2", hint)
+}
+
+fn notice_text(item: ResponseItem) -> String {
+    let ResponseItem::Message { content, .. } = item else {
+        panic!("expected exact-tail notice message");
+    };
+    content
+        .into_iter()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => Some(text),
+            ContentItem::InputImage { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn expected_exact_tail_outcome(
+    hot_tool_reference_count: usize,
+    hot_tool_namespace_count: usize,
+) -> ExactTailToolSurfaceOutcome {
+    ExactTailToolSurfaceOutcome {
+        compaction_id: "compact-test".to_string(),
+        route: "remote_v2".to_string(),
+        hot_tool_call_count: 1,
+        hot_tool_namespace_count,
+        hot_tool_reference_count,
+        ..ExactTailToolSurfaceOutcome::default()
     }
 }
 
@@ -768,6 +1025,570 @@ async fn deferred_extension_tools_are_discoverable_with_tool_search() {
 }
 
 #[tokio::test]
+async fn exact_tail_hint_rehydrates_current_deferred_dynamic_tool() {
+    let tool_name = ToolName::namespaced("codex_app", "restored_tool");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.rehydrated_tool_count = 1;
+    expected.discoverable_hot_tool_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_app"),
+                "restored_tool",
+                /*defer_loading*/ true,
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![tool_name.clone()])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        plan.namespace_function_names("codex_app"),
+        &["restored_tool".to_string()]
+    );
+    assert_eq!(plan.exposure(&tool_name.to_string()), ToolExposure::Direct);
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_preserves_current_schema_authority_over_historical_reference() {
+    let tool_name = ToolName::namespaced("codex_app", "current_tool");
+    let historical_hint = derive_exact_tail_tool_surface_hint(&[ResponseItem::ToolSearchOutput {
+        id: None,
+        call_id: Some("historical-search".to_string()),
+        status: "completed".to_string(),
+        execution: "search".to_string(),
+        tools: vec![json!({
+            "type": "namespace",
+            "name": "codex_app",
+            "description": "stale historical namespace description",
+            "tools": [{
+                "type": "function",
+                "name": "current_tool",
+                "description": "stale historical tool description",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"stale": {"type": "string"}},
+                    "required": ["stale"],
+                    "additionalProperties": true
+                }
+            }]
+        })],
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+    assert_eq!(historical_hint.references, vec![tool_name.clone()]);
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_app"),
+                "current_tool",
+                /*defer_loading*/ true,
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint_from_hint(historical_hint)),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let ToolSpec::Namespace(namespace) = plan.visible_spec("codex_app") else {
+        panic!("expected current dynamic namespace");
+    };
+    assert_eq!(namespace.description, "codex_app dynamic tools");
+    assert_eq!(
+        namespace.tools,
+        vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+            name: "current_tool".to_string(),
+            description: "current_tool dynamic tool".to_string(),
+            strict: false,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::object(
+                BTreeMap::new(),
+                None,
+                Some(codex_tools::AdditionalProperties::Boolean(false)),
+            ),
+            output_schema: None,
+        })]
+    );
+}
+
+#[tokio::test]
+async fn exact_tail_hint_notice_avoids_tool_search_instruction() {
+    let restored_tool_name = ToolName::namespaced("codex_app", "restored_tool");
+    let stale_tool_name = ToolName::namespaced("codex_app", "stale_tool");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 2, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.rehydrated_tool_count = 1;
+    expected.missing_hot_tool_count = 1;
+    expected.discoverable_hot_tool_count = 1;
+    expected.missing_notice_emitted_count = 1;
+    expected.missing_no_path_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_app"),
+                "restored_tool",
+                /*defer_loading*/ true,
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![
+                restored_tool_name.clone(),
+                stale_tool_name.clone(),
+            ])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["codex_app"]);
+    assert_eq!(
+        plan.exposure(&restored_tool_name.to_string()),
+        ToolExposure::Direct
+    );
+    assert!(!plan.registered_names.contains(&stale_tool_name.to_string()));
+    let notice = notice_text(
+        exact_tail_tool_surface_notice_item(
+            plan.exact_tail_tool_surface_outcome
+                .as_ref()
+                .expect("exact-tail outcome"),
+        )
+        .expect("missing reference should emit notice"),
+    );
+    assert!(notice.contains("Do not assume missing historical tools remain callable."));
+    assert!(!notice.contains("tool_search"));
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_reports_stale_reference_without_resurrecting_it() {
+    let stale_tool_name = ToolName::namespaced("codex_app", "stale_tool");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.missing_hot_tool_count = 1;
+    expected.missing_notice_emitted_count = 1;
+    expected.missing_no_path_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_app"),
+                "current_tool",
+                /*defer_loading*/ true,
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![
+                stale_tool_name.clone(),
+            ])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    assert_eq!(plan.namespace_function_names("codex_app"), &[] as &[String]);
+    assert!(
+        exact_tail_tool_surface_notice_item(
+            plan.exact_tail_tool_surface_outcome
+                .as_ref()
+                .expect("exact-tail outcome")
+        )
+        .is_some()
+    );
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+    assert!(!plan.registered_names.contains(&stale_tool_name.to_string()));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_overflow_emits_bounded_notice() {
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 2, /*hot_tool_namespace_count*/ 0,
+    );
+    expected.missing_notice_emitted_count = 1;
+    expected.hot_tool_reference_overflow_count = 2;
+    expected.hot_tool_reference_overflow_notice_emitted_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint_from_hint(
+                ExactTailToolSurfaceHint {
+                    hot_tool_reference_count: 2,
+                    references: Vec::new(),
+                    hot_tool_call_count: 1,
+                    hot_tool_namespace_count: 0,
+                    hot_tool_reference_overflow_count: 2,
+                    out_of_scope_dependency_protocol_count: 0,
+                },
+            )),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let notice = notice_text(
+        exact_tail_tool_surface_notice_item(
+            plan.exact_tail_tool_surface_outcome
+                .as_ref()
+                .expect("exact-tail outcome"),
+        )
+        .expect("overflow should emit notice"),
+    );
+    assert!(notice.contains("2 older exact-tail tool reference(s)"));
+    assert!(!notice.contains("tool_search"));
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_does_not_rehydrate_non_searchable_deferred_tool() {
+    let tool_name = ToolName::plain("extension_echo");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 0,
+    );
+    expected.missing_hot_tool_count = 1;
+    expected.missing_notice_emitted_count = 1;
+    expected.missing_no_path_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![Arc::new(NonSearchableDeferredExtensionTool)],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![tool_name.clone()])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_lacks(&["extension_echo"]);
+    assert_eq!(plan.exposure("extension_echo"), ToolExposure::Deferred);
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_already_direct_tool_does_not_change_surface() {
+    let tool_name = ToolName::namespaced("codex_app", "visible_tool");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.already_direct_tool_count = 1;
+    let plan = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_app"),
+                "visible_tool",
+                /*defer_loading*/ false,
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![tool_name.clone()])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_already_direct_tool_respects_final_namespace_filter() {
+    let tool_name = ToolName::namespaced("codex_app", "filtered_direct_tool");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.missing_hot_tool_count = 1;
+    expected.missing_notice_emitted_count = 1;
+    expected.missing_no_path_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let plan = probe_with(
+        |turn| {
+            turn.provider = provider_with_capabilities(
+                turn.provider.info().clone(),
+                ProviderCapabilities {
+                    namespace_tools: false,
+                    ..ProviderCapabilities::default()
+                },
+            );
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_app"),
+                "filtered_direct_tool",
+                /*defer_loading*/ false,
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![tool_name.clone()])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_lacks(&["codex_app"]);
+    assert_eq!(plan.exposure(&tool_name.to_string()), ToolExposure::Direct);
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_does_not_rehydrate_namespace_filtered_tool() {
+    let tool_name = ToolName::namespaced("codex_app", "filtered_tool");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.missing_hot_tool_count = 1;
+    expected.missing_notice_emitted_count = 1;
+    expected.missing_no_path_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let plan = probe_with(
+        |turn| {
+            turn.provider = provider_with_capabilities(
+                turn.provider.info().clone(),
+                ProviderCapabilities {
+                    namespace_tools: false,
+                    ..ProviderCapabilities::default()
+                },
+            );
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool(
+                Some("codex_app"),
+                "filtered_tool",
+                /*defer_loading*/ true,
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![tool_name.clone()])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_lacks(&["codex_app", "tool_search"]);
+    assert_eq!(
+        plan.exposure(&tool_name.to_string()),
+        ToolExposure::Deferred
+    );
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_does_not_promote_when_final_namespace_merge_exceeds_cap() {
+    let description = sized_dynamic_tool_description_for_namespace_merge_cap();
+    let direct_tool_name = ToolName::namespaced("codex_app", "direct_merge_probe");
+    let deferred_tool_name = ToolName::namespaced("codex_app", "deferred_merge_probe");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.missing_hot_tool_count = 1;
+    expected.discoverable_hot_tool_count = 1;
+    expected.missing_notice_emitted_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![
+                dynamic_tool_with_description(
+                    Some("codex_app"),
+                    "direct_merge_probe",
+                    /*defer_loading*/ false,
+                    description.clone(),
+                ),
+                dynamic_tool_with_description(
+                    Some("codex_app"),
+                    "deferred_merge_probe",
+                    /*defer_loading*/ true,
+                    description,
+                ),
+            ],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![
+                deferred_tool_name.clone(),
+            ])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    assert_eq!(
+        plan.namespace_function_names("codex_app"),
+        &[direct_tool_name.name]
+    );
+    assert_eq!(
+        plan.exposure(&deferred_tool_name.to_string()),
+        ToolExposure::Deferred
+    );
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_does_not_rehydrate_oversized_tool_spec() {
+    let tool_name = ToolName::namespaced("codex_app", "large_tool");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.missing_hot_tool_count = 1;
+    expected.discoverable_hot_tool_count = 1;
+    expected.missing_notice_emitted_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool_with_description(
+                Some("codex_app"),
+                "large_tool",
+                /*defer_loading*/ true,
+                "large spec ".repeat(5_000),
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![tool_name.clone()])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["tool_search"]);
+    plan.assert_visible_lacks(&["codex_app"]);
+    assert_eq!(
+        plan.exposure(&tool_name.to_string()),
+        ToolExposure::Deferred
+    );
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_oversized_tool_has_no_discovery_path_without_tool_search() {
+    let tool_name = ToolName::namespaced("codex_app", "large_tool_without_search");
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ 1, /*hot_tool_namespace_count*/ 1,
+    );
+    expected.missing_hot_tool_count = 1;
+    expected.missing_notice_emitted_count = 1;
+    expected.missing_no_path_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = false;
+        },
+        ToolPlanInputs {
+            dynamic_tools: vec![dynamic_tool_with_description(
+                Some("codex_app"),
+                "large_tool_without_search",
+                /*defer_loading*/ true,
+                "large spec ".repeat(5_000),
+            )],
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(vec![tool_name.clone()])),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    let notice = notice_text(
+        exact_tail_tool_surface_notice_item(
+            plan.exact_tail_tool_surface_outcome
+                .as_ref()
+                .expect("exact-tail outcome"),
+        )
+        .expect("missing reference should emit notice"),
+    );
+    assert!(notice.contains("Do not assume missing historical tools remain callable."));
+    assert!(!notice.contains("Rediscover"));
+    plan.assert_visible_lacks(&["codex_app", "tool_search"]);
+    assert_eq!(
+        plan.exposure(&tool_name.to_string()),
+        ToolExposure::Deferred
+    );
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
+async fn exact_tail_hint_caps_aggregate_promoted_tool_specs() {
+    let (description, per_tool_tokens) = sized_dynamic_tool_description_for_aggregate_cap();
+    let tool_count = (EXACT_TAIL_PROMOTED_TOOL_SPECS_TOTAL_TOKEN_LIMIT / per_tool_tokens) + 2;
+    let references = (0..tool_count)
+        .map(|index| ToolName::plain(format!("aggregate_probe_{index}")))
+        .collect::<Vec<_>>();
+    let expected_rehydrated = EXACT_TAIL_PROMOTED_TOOL_SPECS_TOTAL_TOKEN_LIMIT / per_tool_tokens;
+    assert!(expected_rehydrated < tool_count);
+
+    let mut expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ tool_count, /*hot_tool_namespace_count*/ 0,
+    );
+    expected.rehydrated_tool_count = expected_rehydrated;
+    expected.missing_hot_tool_count = tool_count - expected_rehydrated;
+    expected.discoverable_hot_tool_count = tool_count;
+    expected.missing_notice_emitted_count = 1;
+    expected.tool_surface_changed_after_compaction = true;
+    expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+
+    let dynamic_tools = (0..tool_count)
+        .map(|index| {
+            dynamic_tool_with_description(
+                None,
+                &format!("aggregate_probe_{index}"),
+                /*defer_loading*/ true,
+                description.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let plan = probe_with(
+        |turn| {
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            dynamic_tools,
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(references.clone())),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    for tool_name in references.iter().take(expected_rehydrated) {
+        plan.assert_visible_contains(&[&tool_name.name]);
+        assert_eq!(plan.exposure(&tool_name.to_string()), ToolExposure::Direct);
+    }
+    for tool_name in references.iter().skip(expected_rehydrated) {
+        plan.assert_visible_lacks(&[&tool_name.name]);
+        assert_eq!(
+            plan.exposure(&tool_name.to_string()),
+            ToolExposure::Deferred
+        );
+    }
+    assert_eq!(plan.exact_tail_tool_surface_outcome, Some(expected));
+}
+
+#[tokio::test]
 async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     let cache = ToolSearchHandlerCache::default();
 
@@ -781,6 +1602,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            exact_tail_tool_surface_hint: None,
         },
         &cache,
     );
@@ -796,6 +1618,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            exact_tail_tool_surface_hint: None,
         },
         &cache,
     );

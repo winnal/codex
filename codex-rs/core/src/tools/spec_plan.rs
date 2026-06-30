@@ -4,6 +4,8 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
+use crate::tools::exact_tail_continuity::ExactTailToolSurfaceOutcome;
+use crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint;
 use crate::tools::handlers::ApplyPatchHandler;
 use crate::tools::handlers::CodeModeExecuteHandler;
 use crate::tools::handlers::CodeModeWaitHandler;
@@ -87,6 +89,7 @@ use codex_tools::default_namespace_description;
 use codex_tools::request_user_input_available_modes;
 use codex_tools::shell_command_backend_for_features;
 use codex_tools::shell_type_for_model_and_features;
+use codex_utils_string::approx_token_count;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -96,6 +99,8 @@ use tracing::warn;
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 const IMAGE_GEN_NAMESPACE: &str = "image_gen";
 const IMAGEGEN_TOOL_NAME: &str = "imagegen";
+const EXACT_TAIL_PROMOTED_TOOL_SPEC_TOKEN_LIMIT: usize = 1_000;
+const EXACT_TAIL_PROMOTED_TOOL_SPECS_TOTAL_TOKEN_LIMIT: usize = 8_000;
 
 type PlannedRuntime = Arc<dyn CoreToolRuntime>;
 
@@ -149,6 +154,7 @@ struct CoreToolPlanContext<'a> {
     tool_suggest_candidates: Option<&'a crate::tools::router::ToolSuggestCandidates>,
     extension_tool_executors: &'a [Arc<dyn ToolExecutor<ExtensionToolCall>>],
     dynamic_tools: &'a [DynamicToolSpec],
+    exact_tail_tool_surface_hint: Option<&'a PendingExactTailToolSurfaceHint>,
     tool_search_handler_cache: &'a ToolSearchHandlerCache,
     default_agent_type_description: &'a str,
     wait_agent_timeouts: WaitAgentTimeoutOptions,
@@ -160,9 +166,13 @@ pub(crate) fn build_tool_router(
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
 ) -> ToolRouter {
-    let (model_visible_specs, registry) =
+    let (model_visible_specs, registry, exact_tail_tool_surface_outcome) =
         build_tool_specs_and_registry(turn_context, params, tool_search_handler_cache);
-    ToolRouter::from_parts(registry, model_visible_specs)
+    ToolRouter::from_parts_with_exact_tail_tool_surface_outcome(
+        registry,
+        model_visible_specs,
+        exact_tail_tool_surface_outcome,
+    )
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -170,13 +180,18 @@ fn build_tool_specs_and_registry(
     turn_context: &TurnContext,
     params: ToolRouterParams<'_>,
     tool_search_handler_cache: &ToolSearchHandlerCache,
-) -> (Vec<ToolSpec>, ToolRegistry) {
+) -> (
+    Vec<ToolSpec>,
+    ToolRegistry,
+    Option<ExactTailToolSurfaceOutcome>,
+) {
     let ToolRouterParams {
         mcp_tools,
         deferred_mcp_tools,
         tool_suggest_candidates,
         extension_tool_executors,
         dynamic_tools,
+        exact_tail_tool_surface_hint,
     } = params;
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
@@ -187,6 +202,7 @@ fn build_tool_specs_and_registry(
         tool_suggest_candidates: tool_suggest_candidates.as_ref(),
         extension_tool_executors: &extension_tool_executors,
         dynamic_tools,
+        exact_tail_tool_surface_hint: exact_tail_tool_surface_hint.as_ref(),
         tool_search_handler_cache,
         default_agent_type_description: &default_agent_type_description,
         wait_agent_timeouts: wait_agent_timeout_options(turn_context),
@@ -194,9 +210,310 @@ fn build_tool_specs_and_registry(
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
+    let exact_tail_tool_surface_outcome =
+        apply_exact_tail_tool_surface_continuity(&context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
     prepend_code_mode_executors(&context, &mut planned_tools);
-    build_model_visible_specs_and_registry(turn_context, planned_tools)
+    let (model_visible_specs, registry) =
+        build_model_visible_specs_and_registry(turn_context, planned_tools);
+    (
+        model_visible_specs,
+        registry,
+        exact_tail_tool_surface_outcome,
+    )
+}
+
+fn apply_exact_tail_tool_surface_continuity(
+    context: &CoreToolPlanContext<'_>,
+    planned_tools: &mut PlannedTools,
+) -> Option<ExactTailToolSurfaceOutcome> {
+    let pending = context.exact_tail_tool_surface_hint?;
+    let mut rehydrated_tool_count = 0usize;
+    let mut missing_hot_tool_count = 0usize;
+    let mut already_direct_tool_count = 0usize;
+    let mut discoverable_hot_tool_count = 0usize;
+    let mut missing_no_path_count = 0usize;
+    let mut rehydrated_tool_spec_tokens = 0usize;
+    let tool_search_visible = search_tool_enabled(context.turn_context);
+
+    for reference in &pending.hint.references {
+        let Some(index) = planned_tools
+            .runtimes
+            .iter()
+            .position(|runtime| runtime.tool_name() == *reference)
+        else {
+            missing_hot_tool_count += 1;
+            missing_no_path_count += 1;
+            continue;
+        };
+
+        let exposure = planned_tools.runtimes[index].exposure();
+        match exposure {
+            ToolExposure::Direct | ToolExposure::DirectModelOnly
+                if !is_hidden_by_code_mode_only(context.turn_context, reference, exposure) =>
+            {
+                if exact_tail_runtime_is_model_visible(
+                    context.turn_context,
+                    planned_tools,
+                    index,
+                    exposure,
+                ) {
+                    already_direct_tool_count += 1;
+                } else {
+                    missing_hot_tool_count += 1;
+                    missing_no_path_count += 1;
+                }
+            }
+            ToolExposure::Deferred => {
+                let runtime = Arc::clone(&planned_tools.runtimes[index]);
+                if runtime.search_info().is_none() || !tool_search_visible {
+                    missing_hot_tool_count += 1;
+                    missing_no_path_count += 1;
+                    continue;
+                }
+
+                discoverable_hot_tool_count += 1;
+                match exact_tail_promotion_eligibility(
+                    context.turn_context,
+                    planned_tools,
+                    index,
+                    reference,
+                    rehydrated_tool_spec_tokens,
+                ) {
+                    ExactTailPromotionEligibility::Eligible { spec_tokens } => {
+                        planned_tools.runtimes[index] =
+                            override_tool_exposure(runtime, ToolExposure::Direct);
+                        rehydrated_tool_count += 1;
+                        rehydrated_tool_spec_tokens =
+                            rehydrated_tool_spec_tokens.saturating_add(spec_tokens);
+                    }
+                    ExactTailPromotionEligibility::NotModelVisible => {
+                        missing_hot_tool_count += 1;
+                        missing_no_path_count += 1;
+                    }
+                    ExactTailPromotionEligibility::ExceedsSpecBudget => {
+                        missing_hot_tool_count += 1;
+                    }
+                }
+            }
+            ToolExposure::Direct | ToolExposure::DirectModelOnly | ToolExposure::Hidden => {
+                missing_hot_tool_count += 1;
+                missing_no_path_count += 1;
+            }
+        }
+    }
+
+    let missing_notice_emitted_count = usize::from(
+        missing_hot_tool_count > 0 || pending.hint.hot_tool_reference_overflow_count > 0,
+    );
+    let hot_tool_reference_overflow_notice_emitted_count =
+        usize::from(pending.hint.hot_tool_reference_overflow_count > 0);
+    let tool_surface_changed_after_compaction =
+        rehydrated_tool_count > 0 || missing_notice_emitted_count > 0;
+    Some(ExactTailToolSurfaceOutcome {
+        compaction_id: pending.compaction_id.clone(),
+        route: pending.route.clone(),
+        hot_tool_call_count: pending.hint.hot_tool_call_count,
+        hot_tool_namespace_count: pending.hint.hot_tool_namespace_count,
+        hot_tool_reference_count: pending.hint.hot_tool_reference_count,
+        rehydrated_tool_count,
+        missing_hot_tool_count,
+        already_direct_tool_count,
+        discoverable_hot_tool_count,
+        missing_notice_emitted_count,
+        missing_no_path_count,
+        hot_tool_reference_overflow_count: pending.hint.hot_tool_reference_overflow_count,
+        hot_tool_reference_overflow_notice_emitted_count,
+        out_of_scope_dependency_protocol_count: pending.hint.out_of_scope_dependency_protocol_count,
+        tool_surface_changed_after_compaction,
+        tool_surface_rehydration_failure_reason: (missing_hot_tool_count > 0)
+            .then(|| "hot_tool_references_not_model_visible".to_string()),
+    })
+}
+
+enum ExactTailPromotionEligibility {
+    Eligible { spec_tokens: usize },
+    NotModelVisible,
+    ExceedsSpecBudget,
+}
+
+fn exact_tail_promotion_eligibility(
+    turn_context: &TurnContext,
+    planned_tools: &PlannedTools,
+    runtime_index: usize,
+    tool_name: &ToolName,
+    rehydrated_tool_spec_tokens: usize,
+) -> ExactTailPromotionEligibility {
+    if is_hidden_by_code_mode_only(turn_context, tool_name, ToolExposure::Direct) {
+        return ExactTailPromotionEligibility::NotModelVisible;
+    }
+
+    let specs = exact_tail_model_visible_specs_with_runtime_exposure(
+        turn_context,
+        planned_tools,
+        runtime_index,
+        ToolExposure::Direct,
+        tool_name,
+    );
+    if specs.is_empty() {
+        return ExactTailPromotionEligibility::NotModelVisible;
+    }
+
+    let spec_tokens = specs
+        .iter()
+        .map(serialized_tool_spec_token_count)
+        .try_fold(0usize, usize::checked_add)
+        .unwrap_or(usize::MAX);
+    if specs
+        .iter()
+        .map(serialized_tool_spec_token_count)
+        .any(|tokens| tokens > EXACT_TAIL_PROMOTED_TOOL_SPEC_TOKEN_LIMIT)
+        || rehydrated_tool_spec_tokens.saturating_add(spec_tokens)
+            > EXACT_TAIL_PROMOTED_TOOL_SPECS_TOTAL_TOKEN_LIMIT
+    {
+        return ExactTailPromotionEligibility::ExceedsSpecBudget;
+    }
+
+    ExactTailPromotionEligibility::Eligible { spec_tokens }
+}
+
+fn exact_tail_runtime_is_model_visible(
+    turn_context: &TurnContext,
+    planned_tools: &PlannedTools,
+    runtime_index: usize,
+    exposure: ToolExposure,
+) -> bool {
+    let tool_name = planned_tools.runtimes[runtime_index].tool_name();
+    !exact_tail_model_visible_specs_with_runtime_exposure(
+        turn_context,
+        planned_tools,
+        runtime_index,
+        exposure,
+        &tool_name,
+    )
+    .is_empty()
+}
+
+fn exact_tail_model_visible_specs_with_runtime_exposure(
+    turn_context: &TurnContext,
+    planned_tools: &PlannedTools,
+    runtime_index: usize,
+    runtime_exposure: ToolExposure,
+    tool_name: &ToolName,
+) -> Vec<ToolSpec> {
+    let runtimes = planned_tools
+        .runtimes
+        .iter()
+        .enumerate()
+        .map(|(index, runtime)| {
+            if index == runtime_index {
+                override_tool_exposure(Arc::clone(runtime), runtime_exposure)
+            } else {
+                Arc::clone(runtime)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut final_runtimes = runtimes.clone();
+    let affects_code_mode_execute =
+        exact_tail_tool_affects_code_mode_executor(turn_context, tool_name, runtime_exposure);
+    final_runtimes.splice(0..0, build_code_mode_executors(turn_context, &runtimes));
+    model_visible_specs_for_runtimes(
+        turn_context,
+        &final_runtimes,
+        planned_tools.hosted_specs.iter().cloned(),
+    )
+    .into_iter()
+    .filter(|spec| {
+        exact_tail_spec_contains_tool(spec, tool_name)
+            || (affects_code_mode_execute && spec.name() == codex_code_mode::PUBLIC_TOOL_NAME)
+    })
+    .collect()
+}
+
+fn exact_tail_tool_affects_code_mode_executor(
+    turn_context: &TurnContext,
+    tool_name: &ToolName,
+    exposure: ToolExposure,
+) -> bool {
+    matches!(
+        effective_tool_mode(turn_context),
+        ToolMode::CodeMode | ToolMode::CodeModeOnly
+    ) && !matches!(
+        exposure,
+        ToolExposure::DirectModelOnly | ToolExposure::Hidden
+    ) && !is_hidden_by_code_mode_only(turn_context, tool_name, exposure)
+        && !is_excluded_from_code_mode(turn_context, tool_name)
+}
+
+fn model_visible_specs_for_runtimes(
+    turn_context: &TurnContext,
+    runtimes: &[Arc<dyn CoreToolRuntime>],
+    hosted_specs: impl IntoIterator<Item = ToolSpec>,
+) -> Vec<ToolSpec> {
+    let mut specs = Vec::new();
+    let mut seen_tool_names = HashSet::new();
+    for runtime in runtimes {
+        let tool_name = runtime.tool_name();
+        if !seen_tool_names.insert(tool_name.clone()) {
+            continue;
+        }
+
+        let exposure = runtime.exposure();
+        if exposure.is_direct() && !is_hidden_by_code_mode_only(turn_context, &tool_name, exposure)
+        {
+            specs.push(spec_for_model_request(
+                turn_context,
+                exposure,
+                &tool_name,
+                runtime.spec(),
+            ));
+        }
+    }
+    specs.extend(hosted_specs);
+
+    merge_into_namespaces(specs)
+        .into_iter()
+        .filter(|spec| model_visible_spec_enabled(turn_context, spec))
+        .collect()
+}
+
+fn exact_tail_spec_contains_tool(spec: &ToolSpec, tool_name: &ToolName) -> bool {
+    match (spec, &tool_name.namespace) {
+        (ToolSpec::Function(tool), None) => tool.name == tool_name.name,
+        (ToolSpec::Freeform(tool), None) => tool.name == tool_name.name,
+        (ToolSpec::Namespace(namespace), Some(expected_namespace))
+            if namespace.name == *expected_namespace =>
+        {
+            namespace
+                .tools
+                .iter()
+                .any(|namespace_tool| match namespace_tool {
+                    ResponsesApiNamespaceTool::Function(tool) => tool.name == tool_name.name,
+                })
+        }
+        (
+            ToolSpec::ToolSearch { .. }
+            | ToolSpec::ImageGeneration { .. }
+            | ToolSpec::WebSearch { .. },
+            None,
+        ) => spec.name() == tool_name.name,
+        (
+            ToolSpec::Function(_)
+            | ToolSpec::Freeform(_)
+            | ToolSpec::Namespace(_)
+            | ToolSpec::ToolSearch { .. }
+            | ToolSpec::ImageGeneration { .. }
+            | ToolSpec::WebSearch { .. },
+            _,
+        ) => false,
+    }
+}
+
+fn serialized_tool_spec_token_count(spec: &ToolSpec) -> usize {
+    let Ok(serialized) = serde_json::to_string(spec) else {
+        return usize::MAX;
+    };
+    approx_token_count(&serialized)
 }
 
 fn apply_direct_model_only_namespace_overrides(
@@ -261,12 +578,14 @@ fn build_model_visible_specs_and_registry(
     let registry = ToolRegistry::from_tools(runtimes);
     let model_visible_specs = merge_into_namespaces(specs)
         .into_iter()
-        .filter(|spec| {
-            namespace_tools_enabled(turn_context) || !matches!(spec, ToolSpec::Namespace(_))
-        })
+        .filter(|spec| model_visible_spec_enabled(turn_context, spec))
         .collect();
 
     (model_visible_specs, registry)
+}
+
+fn model_visible_spec_enabled(turn_context: &TurnContext, spec: &ToolSpec) -> bool {
+    namespace_tools_enabled(turn_context) || !matches!(spec, ToolSpec::Namespace(_))
 }
 
 fn spec_for_model_request(

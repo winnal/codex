@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::context_manager::model_visible_tool_output_item_token_limit;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::exact_tail_continuity::ExactTailToolSurfaceHint;
 use codex_analytics::CompactionTrigger;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
@@ -60,7 +61,7 @@ impl ExactTailImplementation {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::RemoteLegacy => "remote",
+            Self::RemoteLegacy => "remote_legacy",
             Self::RemoteV2 => "remote_v2",
             Self::SemanticTranscript => "semantic_transcript",
         }
@@ -191,6 +192,11 @@ pub(crate) struct ExactTailDiagnostics {
     pub(crate) semantic_transcript_reduction_tokens: Option<i64>,
     pub(crate) retained_cold_message_tokens: Option<i64>,
     pub(crate) retained_cold_message_count: Option<usize>,
+    pub(crate) hot_tool_call_count: usize,
+    pub(crate) hot_tool_namespace_count: usize,
+    pub(crate) hot_tool_reference_count: usize,
+    pub(crate) hot_tool_reference_overflow_count: usize,
+    pub(crate) out_of_scope_dependency_protocol_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -207,6 +213,7 @@ pub(crate) struct ExactTailPlan {
     pub(crate) cold_user_messages: Vec<CompactedUserMessage>,
     pub(crate) diagnostics: ExactTailDiagnostics,
     pub(crate) coverage: ExactTailCoverage,
+    pub(crate) tool_surface_hint: ExactTailToolSurfaceHint,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +226,7 @@ pub(crate) struct PreparedExactTailPlan {
 pub(crate) struct ExactTailReplacement {
     pub(crate) replacement_history: Vec<ResponseItem>,
     pub(crate) diagnostics: ExactTailReplacementDiagnostics,
+    pub(crate) tool_surface_hint: ExactTailToolSurfaceHint,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

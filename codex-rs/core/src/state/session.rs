@@ -16,6 +16,7 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -41,6 +42,7 @@ pub(crate) struct SessionState {
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
+    pending_exact_tail_tool_surface_hint: Option<PendingExactTailToolSurfaceHint>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
 }
@@ -62,6 +64,7 @@ impl SessionState {
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
+            pending_exact_tail_tool_surface_hint: None,
             granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
         }
@@ -109,6 +112,7 @@ impl SessionState {
         self.history
             .set_reference_context_item(reference_context_item);
         self.auto_compact_window.clear_prefill();
+        self.pending_exact_tail_tool_surface_hint = None;
     }
 
     pub(crate) fn set_token_info(&mut self, info: Option<TokenUsageInfo>) {
@@ -274,6 +278,19 @@ impl SessionState {
         &mut self,
     ) -> Option<codex_hooks::SessionStartSource> {
         self.pending_session_start_sources.pop_front()
+    }
+
+    pub(crate) fn set_pending_exact_tail_tool_surface_hint(
+        &mut self,
+        hint: PendingExactTailToolSurfaceHint,
+    ) {
+        self.pending_exact_tail_tool_surface_hint = Some(hint);
+    }
+
+    pub(crate) fn take_pending_exact_tail_tool_surface_hint(
+        &mut self,
+    ) -> Option<PendingExactTailToolSurfaceHint> {
+        self.pending_exact_tail_tool_surface_hint.take()
     }
 
     pub(crate) fn record_granted_permissions(

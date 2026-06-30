@@ -160,6 +160,91 @@ async fn exact_tail_semantic_transcript_manual_uses_v2_summary_only_when_default
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_semantic_transcript_rehydrates_tool_surface_after_compact() -> Result<()> {
+    let server = start_mock_server().await;
+    let tool_name = "semantic_continuity_probe";
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("semantic-continuity-cold", "SEM_CONTINUITY_COLD"),
+                ev_completed("semantic-continuity-cold-response"),
+            ]),
+            sse(vec![
+                ev_response_created("semantic-continuity-search-response"),
+                ev_tool_search_call(
+                    "semantic-continuity-search-call",
+                    &serde_json::json!({
+                        "query": "semantic continuity probe",
+                        "limit": 4,
+                    }),
+                ),
+                ev_completed("semantic-continuity-search-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("semantic-continuity-hot", "SEM_CONTINUITY_HOT"),
+                ev_completed("semantic-continuity-hot-response"),
+            ]),
+            sse(vec![
+                ev_compaction_item("SEM_CONTINUITY_SUMMARY"),
+                ev_completed("semantic-continuity-compact-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("semantic-continuity-follow", "SEM_CONTINUITY_FOLLOW"),
+                ev_completed("semantic-continuity-follow-response"),
+            ]),
+        ],
+    )
+    .await;
+    let tool_description = "Semantic continuity probe. ".repeat(80);
+    let dynamic_tool = deferred_dynamic_namespace_tool("codex_app", tool_name, &tool_description);
+    let mut builder = semantic_builder().with_config(|config| {
+        configure_search_capable_model(config);
+        config.compact_preserve_recent_tokens = Some(100);
+    });
+    let base_test = builder.build(&server).await?;
+    let new_thread = base_test
+        .thread_manager
+        .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
+        .await?;
+    let rollout_path = new_thread
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+    let mut test = base_test;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+
+    submit_turn(&test, "SEM_CONTINUITY_COLD_USER").await?;
+    submit_turn(&test, "SEM_CONTINUITY_HOT_USER").await?;
+    manual_compact_and_wait(&test).await?;
+    submit_turn(&test, "SEM_CONTINUITY_FOLLOW_USER").await?;
+
+    let follow_body = response_mock
+        .requests()
+        .last()
+        .expect("follow-up request")
+        .body_json();
+    assert!(
+        namespace_child_tool(&follow_body, "codex_app", tool_name).is_some(),
+        "semantic transcript follow-up should rehydrate current dynamic tool spec: {follow_body}"
+    );
+    let diagnostics = exact_tail_tool_surface_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(
+        diagnostic["route"],
+        serde_json::json!("semantic_transcript")
+    );
+    assert_eq!(diagnostic["rehydrated_tool_count"], serde_json::json!(1));
+    assert_eq!(diagnostic["missing_hot_tool_count"], serde_json::json!(0));
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_tail_semantic_transcript_auto_uses_v2_summary_only_request() -> Result<()> {
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(

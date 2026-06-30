@@ -57,6 +57,7 @@ use crate::stream_events_utils::record_completed_response_item_with_finalized_fa
 use crate::tasks::emit_compact_metric;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::exact_tail_continuity::exact_tail_tool_surface_notice_item;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::router::ToolRouterParams;
@@ -1110,11 +1111,16 @@ pub(super) fn collect_explicit_app_ids_from_skill_items(
 
 #[instrument(level = "trace", skip_all)]
 pub(crate) fn build_prompt(
-    input: Vec<ResponseItem>,
+    mut input: Vec<ResponseItem>,
     router: &ToolRouter,
     turn_context: &TurnContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
+    if let Some(outcome) = router.exact_tail_tool_surface_outcome()
+        && let Some(notice) = exact_tail_tool_surface_notice_item(outcome)
+    {
+        input.push(notice);
+    }
     Prompt {
         input,
         tools: router.model_visible_specs(),
@@ -1246,6 +1252,41 @@ pub(crate) async fn built_tools(
     turn_context: &TurnContext,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Arc<ToolRouter>> {
+    built_tools_with_exact_tail_tool_surface_hint(
+        sess,
+        turn_context,
+        cancellation_token,
+        ExactTailToolSurfaceHintUse::Consume,
+    )
+    .await
+}
+
+pub(crate) async fn built_tools_without_exact_tail_tool_surface_hint(
+    sess: &Session,
+    turn_context: &TurnContext,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<Arc<ToolRouter>> {
+    built_tools_with_exact_tail_tool_surface_hint(
+        sess,
+        turn_context,
+        cancellation_token,
+        ExactTailToolSurfaceHintUse::Ignore,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ExactTailToolSurfaceHintUse {
+    Consume,
+    Ignore,
+}
+
+async fn built_tools_with_exact_tail_tool_surface_hint(
+    sess: &Session,
+    turn_context: &TurnContext,
+    cancellation_token: &CancellationToken,
+    exact_tail_tool_surface_hint_use: ExactTailToolSurfaceHintUse,
+) -> CodexResult<Arc<ToolRouter>> {
     let mcp_connection_manager = sess.services.mcp_connection_manager.load_full();
     let has_mcp_servers = mcp_connection_manager.has_servers();
     let all_mcp_tools = mcp_connection_manager
@@ -1361,7 +1402,13 @@ pub(crate) async fn built_tools(
     );
     let mcp_tools = has_mcp_servers.then_some(mcp_tool_exposure.direct_tools);
     let deferred_mcp_tools = mcp_tool_exposure.deferred_tools;
-    Ok(Arc::new(ToolRouter::from_turn_context(
+    let exact_tail_tool_surface_hint = match exact_tail_tool_surface_hint_use {
+        ExactTailToolSurfaceHintUse::Consume => {
+            sess.take_pending_exact_tail_tool_surface_hint().await
+        }
+        ExactTailToolSurfaceHintUse::Ignore => None,
+    };
+    let router = ToolRouter::from_turn_context(
         turn_context,
         ToolRouterParams {
             mcp_tools,
@@ -1369,9 +1416,20 @@ pub(crate) async fn built_tools(
             tool_suggest_candidates,
             extension_tool_executors: extension_tool_executors(sess),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            exact_tail_tool_surface_hint,
         },
         &sess.services.tool_search_handler_cache,
-    )))
+    );
+    if let Some(outcome) = router.exact_tail_tool_surface_outcome() {
+        sess.send_event(
+            turn_context,
+            EventMsg::ExactTailToolSurfaceDiagnostic(
+                outcome.event(sess.thread_id().to_string(), turn_context.sub_id.clone()),
+            ),
+        )
+        .await;
+    }
+    Ok(Arc::new(router))
 }
 
 #[derive(Debug)]
@@ -1571,6 +1629,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::SafetyBuffering(_)
         | EventMsg::ContextCompacted(_)
         | EventMsg::ExactTailCompactionDiagnostic(_)
+        | EventMsg::ExactTailToolSurfaceDiagnostic(_)
         | EventMsg::ThreadRolledBack(_)
         | EventMsg::TurnStarted(_)
         | EventMsg::ThreadSettingsApplied(_)

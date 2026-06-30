@@ -4,6 +4,8 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::exact_tail_continuity::ExactTailToolSurfaceOutcome;
+use crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
@@ -35,6 +37,7 @@ pub struct ToolCall {
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Vec<ToolSpec>,
+    exact_tail_tool_surface_outcome: Option<ExactTailToolSurfaceOutcome>,
 }
 
 pub(crate) struct ToolRouterParams<'a> {
@@ -43,6 +46,7 @@ pub(crate) struct ToolRouterParams<'a> {
     pub(crate) tool_suggest_candidates: Option<ToolSuggestCandidates>,
     pub(crate) extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     pub(crate) dynamic_tools: &'a [DynamicToolSpec],
+    pub(crate) exact_tail_tool_surface_hint: Option<PendingExactTailToolSurfaceHint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,15 +70,29 @@ impl ToolRouter {
         build_tool_router(turn_context, params, tool_search_handler_cache)
     }
 
-    pub(crate) fn from_parts(registry: ToolRegistry, model_visible_specs: Vec<ToolSpec>) -> Self {
+    pub(crate) fn from_parts_with_exact_tail_tool_surface_outcome(
+        registry: ToolRegistry,
+        model_visible_specs: Vec<ToolSpec>,
+        exact_tail_tool_surface_outcome: Option<ExactTailToolSurfaceOutcome>,
+    ) -> Self {
         Self {
             registry,
             model_visible_specs,
+            exact_tail_tool_surface_outcome,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(registry: ToolRegistry, model_visible_specs: Vec<ToolSpec>) -> Self {
+        Self::from_parts_with_exact_tail_tool_surface_outcome(registry, model_visible_specs, None)
     }
 
     pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
         self.model_visible_specs.clone()
+    }
+
+    pub(crate) fn exact_tail_tool_surface_outcome(&self) -> Option<&ExactTailToolSurfaceOutcome> {
+        self.exact_tail_tool_surface_outcome.as_ref()
     }
 
     #[cfg(test)]

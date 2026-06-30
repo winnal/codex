@@ -7,6 +7,7 @@ use crate::context_manager::estimate_response_items_token_count;
 use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_user_message_content;
+use crate::tools::exact_tail_continuity::derive_exact_tail_tool_surface_hint;
 use codex_analytics::CompactionTrigger;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::models::ContentItem;
@@ -161,6 +162,7 @@ pub(crate) fn plan_exact_tail(
         .map(|item| estimate_response_items_token_count(std::slice::from_ref(item)))
         .max()
         .unwrap_or(0);
+    let tool_surface_hint = derive_exact_tail_tool_surface_hint(&hot_suffix);
     let cold_user_messages = collect_user_messages(&cold_history);
     let coverage = ExactTailCoverage {
         cold_covered_groups,
@@ -203,6 +205,12 @@ pub(crate) fn plan_exact_tail(
         semantic_transcript_reduction_tokens: None,
         retained_cold_message_tokens: None,
         retained_cold_message_count: None,
+        hot_tool_call_count: tool_surface_hint.hot_tool_call_count,
+        hot_tool_namespace_count: tool_surface_hint.hot_tool_namespace_count,
+        hot_tool_reference_count: tool_surface_hint.hot_tool_reference_count,
+        hot_tool_reference_overflow_count: tool_surface_hint.hot_tool_reference_overflow_count,
+        out_of_scope_dependency_protocol_count: tool_surface_hint
+            .out_of_scope_dependency_protocol_count,
     };
     trace_plan(&diagnostics);
     Ok(ExactTailPlan {
@@ -211,6 +219,7 @@ pub(crate) fn plan_exact_tail(
         cold_user_messages,
         diagnostics,
         coverage,
+        tool_surface_hint,
     })
 }
 
@@ -405,6 +414,11 @@ fn trace_plan(diagnostics: &ExactTailDiagnostics) {
         hot_group_count = diagnostics.hot_group_count,
         cold_group_count = diagnostics.cold_group_count,
         filtered_context_item_count = diagnostics.filtered_context_item_count,
+        hot_tool_call_count = diagnostics.hot_tool_call_count,
+        hot_tool_namespace_count = diagnostics.hot_tool_namespace_count,
+        hot_tool_reference_count = diagnostics.hot_tool_reference_count,
+        hot_tool_reference_overflow_count = diagnostics.hot_tool_reference_overflow_count,
+        out_of_scope_dependency_protocol_count = diagnostics.out_of_scope_dependency_protocol_count,
         "exact-tail compaction plan built"
     );
 }

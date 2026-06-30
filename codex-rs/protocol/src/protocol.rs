@@ -1272,6 +1272,9 @@ pub enum EventMsg {
     /// Content-free numeric diagnostics for exact-tail compaction.
     ExactTailCompactionDiagnostic(Box<ExactTailCompactionDiagnosticEvent>),
 
+    /// Content-free diagnostics for exact-tail post-compaction tool-surface continuity.
+    ExactTailToolSurfaceDiagnostic(ExactTailToolSurfaceDiagnosticEvent),
+
     /// Conversation history was rolled back by dropping the last N user turns.
     ThreadRolledBack(ThreadRolledBackEvent),
 
@@ -2141,6 +2144,45 @@ pub struct ExactTailCompactionDiagnosticEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub retained_cold_message_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub hot_tool_call_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub hot_tool_namespace_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub hot_tool_reference_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub hot_tool_reference_overflow_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub out_of_scope_dependency_protocol_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct ExactTailToolSurfaceDiagnosticEvent {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub compaction_id: String,
+    pub route: String,
+    pub hot_tool_call_count: usize,
+    pub hot_tool_namespace_count: usize,
+    pub hot_tool_reference_count: usize,
+    pub rehydrated_tool_count: usize,
+    pub missing_hot_tool_count: usize,
+    pub already_direct_tool_count: usize,
+    pub discoverable_hot_tool_count: usize,
+    pub missing_notice_emitted_count: usize,
+    pub missing_no_path_count: usize,
+    pub hot_tool_reference_overflow_count: usize,
+    pub hot_tool_reference_overflow_notice_emitted_count: usize,
+    pub out_of_scope_dependency_protocol_count: usize,
+    pub tool_surface_changed_after_compaction: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tool_surface_rehydration_failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
