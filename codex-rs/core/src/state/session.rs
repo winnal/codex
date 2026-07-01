@@ -293,6 +293,14 @@ impl SessionState {
         self.active_exact_tail_tool_surface_hint.clone()
     }
 
+    pub(crate) fn mark_exact_tail_tool_surface_notice_emitted(&mut self, compaction_id: &str) {
+        if let Some(hint) = self.active_exact_tail_tool_surface_hint.as_mut()
+            && hint.compaction_id == compaction_id
+        {
+            hint.mark_notice_emitted();
+        }
+    }
+
     pub(crate) fn record_granted_permissions(
         &mut self,
         environment_id: &str,

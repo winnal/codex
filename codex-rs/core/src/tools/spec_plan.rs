@@ -260,11 +260,11 @@ fn apply_exact_tail_tool_surface_continuity(
         );
     }
 
-    let missing_notice_emitted_count = usize::from(
-        state.missing_hot_tool_count > 0 || pending.hint.hot_tool_reference_overflow_count > 0,
-    );
+    let should_emit_notice = !pending.notice_already_emitted
+        && (state.missing_hot_tool_count > 0 || pending.hint.hot_tool_reference_overflow_count > 0);
+    let missing_notice_emitted_count = usize::from(should_emit_notice);
     let hot_tool_reference_overflow_notice_emitted_count =
-        usize::from(pending.hint.hot_tool_reference_overflow_count > 0);
+        usize::from(should_emit_notice && pending.hint.hot_tool_reference_overflow_count > 0);
     let tool_surface_changed_after_compaction =
         state.rehydrated_tool_count > 0 || missing_notice_emitted_count > 0;
     Some(ExactTailToolSurfaceOutcome {

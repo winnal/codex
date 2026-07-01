@@ -24,6 +24,7 @@ pub(crate) struct PendingExactTailToolSurfaceHint {
     pub(crate) compaction_id: String,
     pub(crate) route: String,
     pub(crate) hint: ExactTailToolSurfaceHint,
+    pub(crate) notice_already_emitted: bool,
 }
 
 impl PendingExactTailToolSurfaceHint {
@@ -36,7 +37,17 @@ impl PendingExactTailToolSurfaceHint {
             compaction_id: compaction_id.into(),
             route: route.into(),
             hint,
+            notice_already_emitted: false,
         }
+    }
+
+    pub(crate) fn with_notice_already_emitted(mut self, value: bool) -> Self {
+        self.notice_already_emitted = value;
+        self
+    }
+
+    pub(crate) fn mark_notice_emitted(&mut self) {
+        self.notice_already_emitted = true;
     }
 }
 
@@ -115,14 +126,20 @@ pub(crate) fn exact_tail_tool_surface_notice_item(
 ) -> Option<ResponseItem> {
     let missing = outcome.missing_hot_tool_count;
     let overflow = outcome.hot_tool_reference_overflow_count;
-    if missing == 0 && overflow == 0 {
+    if outcome.missing_notice_emitted_count == 0
+        && outcome.hot_tool_reference_overflow_notice_emitted_count == 0
+    {
         return None;
     }
 
     Some(ContextualUserFragment::into(
         ExactTailToolSurfaceNotice::new(
-            missing,
-            overflow,
+            (outcome.missing_notice_emitted_count > 0)
+                .then_some(missing)
+                .unwrap_or(0),
+            (outcome.hot_tool_reference_overflow_notice_emitted_count > 0)
+                .then_some(overflow)
+                .unwrap_or(0),
             outcome.missing_no_path_count,
             outcome.missing_tool_references.clone(),
         ),

@@ -3444,6 +3444,11 @@ impl Session {
         state.active_exact_tail_tool_surface_hint()
     }
 
+    pub(crate) async fn mark_exact_tail_tool_surface_notice_emitted(&self, compaction_id: &str) {
+        let mut state = self.state.lock().await;
+        state.mark_exact_tail_tool_surface_notice_emitted(compaction_id);
+    }
+
     pub(crate) async fn current_window_id(&self) -> String {
         let state = self.state.lock().await;
         let thread_id = self.thread_id;

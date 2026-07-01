@@ -6,6 +6,7 @@ use crate::tools::exact_tail_continuity::derive_exact_tail_tool_surface_hint;
 use codex_protocol::protocol::ExactTailCompactionDiagnosticEvent;
 use codex_protocol::protocol::ExactTailCompactionFitResult;
 use codex_protocol::protocol::ExactTailCompactionRoute;
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -54,6 +55,7 @@ struct ActiveReplaySegment<'a> {
     reference_context_item: TurnReferenceContextItem,
     base_replacement_history: Option<&'a [ResponseItem]>,
     exact_tail_compaction_source: Option<RecoveredExactTailCompactionSource>,
+    exact_tail_tool_surface_notice_emitted_compaction_ids: BTreeSet<String>,
     window: Option<ReconstructedWindow>,
 }
 
@@ -64,6 +66,7 @@ struct RolloutReconstructionState<'a> {
     reference_context_item: TurnReferenceContextItem,
     window: Option<ReconstructedWindow>,
     exact_tail_compaction_source: Option<RecoveredExactTailCompactionSource>,
+    exact_tail_tool_surface_notice_emitted_compaction_ids: BTreeSet<String>,
     pending_rollback_turns: usize,
 }
 
@@ -132,6 +135,10 @@ fn finalize_active_segment<'a>(
         state.base_replacement_history = Some(segment_base_replacement_history);
         state.exact_tail_compaction_source = active_segment.exact_tail_compaction_source;
     }
+
+    state
+        .exact_tail_tool_surface_notice_emitted_compaction_ids
+        .extend(active_segment.exact_tail_tool_surface_notice_emitted_compaction_ids);
 
     if state.window.is_none() {
         state.window = active_segment.window;
@@ -224,7 +231,17 @@ impl Session {
                             );
                     }
                 }
-                RolloutItem::EventMsg(EventMsg::ExactTailToolSurfaceDiagnostic(_)) => {}
+                RolloutItem::EventMsg(EventMsg::ExactTailToolSurfaceDiagnostic(event)) => {
+                    if event.missing_notice_emitted_count > 0
+                        || event.hot_tool_reference_overflow_notice_emitted_count > 0
+                    {
+                        let active_segment =
+                            active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                        active_segment
+                            .exact_tail_tool_surface_notice_emitted_compaction_ids
+                            .insert(event.compaction_id.clone());
+                    }
+                }
                 RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
@@ -333,6 +350,11 @@ impl Session {
         let mut history = ContextManager::new();
         let mut saw_legacy_compaction_without_replacement_history = false;
         let recovered_exact_tail_compaction_source = state.exact_tail_compaction_source.as_ref();
+        let notice_already_emitted = recovered_exact_tail_compaction_source.is_some_and(|source| {
+            state
+                .exact_tail_tool_surface_notice_emitted_compaction_ids
+                .contains(&source.compaction_id)
+        });
         let pending_exact_tail_tool_surface_hint =
             state
                 .base_replacement_history
@@ -340,6 +362,7 @@ impl Session {
                     recover_pending_exact_tail_tool_surface_hint(
                         base_replacement_history,
                         recovered_exact_tail_compaction_source?,
+                        notice_already_emitted,
                     )
                 });
         if let Some(base_replacement_history) = state.base_replacement_history {
@@ -430,11 +453,14 @@ impl Session {
 fn recover_pending_exact_tail_tool_surface_hint(
     replacement_history: &[ResponseItem],
     source: &RecoveredExactTailCompactionSource,
+    notice_already_emitted: bool,
 ) -> Option<PendingExactTailToolSurfaceHint> {
     let hot_suffix = source.hot_suffix_from_replacement_history(replacement_history)?;
     let hint = derive_exact_tail_tool_surface_hint(hot_suffix);
-    exact_tail_tool_surface_hint_has_signal(&hint)
-        .then(|| PendingExactTailToolSurfaceHint::new(&source.compaction_id, &source.route, hint))
+    exact_tail_tool_surface_hint_has_signal(&hint).then(|| {
+        PendingExactTailToolSurfaceHint::new(&source.compaction_id, &source.route, hint)
+            .with_notice_already_emitted(notice_already_emitted)
+    })
 }
 
 fn exact_tail_tool_surface_hint_has_signal(hint: &ExactTailToolSurfaceHint) -> bool {

@@ -1419,6 +1419,9 @@ async fn built_tools_with_exact_tail_tool_surface_hint(
         &sess.services.tool_search_handler_cache,
     );
     if let Some(outcome) = router.exact_tail_tool_surface_outcome() {
+        let emitted_notice = outcome.missing_notice_emitted_count > 0
+            || outcome.hot_tool_reference_overflow_notice_emitted_count > 0;
+        let compaction_id = outcome.compaction_id.clone();
         sess.send_event(
             turn_context,
             EventMsg::ExactTailToolSurfaceDiagnostic(
@@ -1426,6 +1429,10 @@ async fn built_tools_with_exact_tail_tool_surface_hint(
             ),
         )
         .await;
+        if emitted_notice {
+            sess.mark_exact_tail_tool_surface_notice_emitted(&compaction_id)
+                .await;
+        }
     }
     Ok(Arc::new(router))
 }

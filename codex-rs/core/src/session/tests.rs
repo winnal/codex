@@ -286,6 +286,7 @@ async fn exact_tail_tool_surface_hint_lifecycle() -> anyhow::Result<()> {
     assert_eq!(repeated_outcome.compaction_id, "compact-test");
     assert_eq!(repeated_outcome.route, "local");
     assert_eq!(repeated_outcome.missing_hot_tool_count, 1);
+    assert_eq!(repeated_outcome.missing_notice_emitted_count, 0);
 
     Ok(())
 }
@@ -334,7 +335,11 @@ async fn exact_tail_tool_surface_hint_survives_startup_prewarm_tool_build() -> a
 
     let repeated_router =
         crate::session::turn::built_tools(&session, &turn_context, &cancellation_token).await?;
-    assert!(repeated_router.exact_tail_tool_surface_outcome().is_some());
+    let repeated_outcome = repeated_router
+        .exact_tail_tool_surface_outcome()
+        .expect("active exact-tail hint should survive later normal tool builds");
+    assert_eq!(repeated_outcome.missing_hot_tool_count, 1);
+    assert_eq!(repeated_outcome.missing_notice_emitted_count, 0);
 
     Ok(())
 }
@@ -556,6 +561,7 @@ async fn resumed_exact_tail_compaction_reconstructs_active_tool_surface_hint_aft
             .expect("surviving compacted window should recover active exact-tail hint");
         assert_eq!(outcome.compaction_id, "compact");
         assert_eq!(outcome.missing_hot_tool_count, 1);
+        assert_eq!(outcome.missing_notice_emitted_count, 0);
     }
 
     Ok(())
@@ -762,6 +768,32 @@ async fn exact_tail_tool_surface_notice_is_added_to_prompt_input() {
     assert_eq!(prompt.input.len(), 2);
     assert!(notice.contains("1 tool reference(s)"));
     assert!(notice.contains("Rediscover still-available deferred tools"));
+}
+
+#[tokio::test]
+async fn exact_tail_tool_surface_notice_is_not_added_after_notice_consumed() {
+    let (_session, turn_context) = make_session_and_context().await;
+    let router = ToolRouter::from_parts_with_exact_tail_tool_surface_outcome(
+        ToolRegistry::from_tools(Vec::<Arc<dyn CoreToolRuntime>>::new()),
+        Vec::new(),
+        Some(
+            crate::tools::exact_tail_continuity::ExactTailToolSurfaceOutcome {
+                missing_hot_tool_count: 1,
+                missing_notice_emitted_count: 0,
+                discoverable_hot_tool_count: 1,
+                ..Default::default()
+            },
+        ),
+    );
+
+    let prompt = crate::session::turn::build_prompt(
+        vec![user_message("hello")],
+        &router,
+        &turn_context,
+        BaseInstructions::default(),
+    );
+
+    assert_eq!(prompt.input, vec![user_message("hello")]);
 }
 
 fn test_session_telemetry_without_metadata() -> SessionTelemetry {
