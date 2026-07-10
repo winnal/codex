@@ -22,6 +22,7 @@ use crate::compact_exact_tail::prepare_exact_tail_plan;
 pub(crate) use crate::compact_route::CompactRoute;
 pub(crate) use crate::compact_route::compact_route;
 use crate::config::Config;
+use crate::context::world_state::WorldState;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -44,7 +45,7 @@ use codex_analytics::CompactionStatus;
 use codex_analytics::CompactionStrategy;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::now_unix_seconds;
-use codex_app_server_protocol::ConfigLayerSource;
+use codex_config::ConfigLayerSource;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
@@ -73,12 +74,34 @@ pub(crate) const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 
 /// Controls whether compaction replacement history must carry initial context.
 ///
-/// Pre-turn/manual compaction clears the reference context item and lets the next turn reinject.
-/// Mid-turn compaction must inject context above the last real user so the summary stays last.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Pre-turn/manual compaction variants use `DoNotInject`: they replace history with a summary and
+/// clear `reference_context_item`, so the next regular turn will fully reinject initial context
+/// after compaction.
+///
+/// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
+/// compaction summary as the last item in history after mid-turn compaction; we therefore inject
+/// initial context into the replacement history just above the last real user message.
+#[derive(Debug)]
 pub(crate) enum InitialContextInjection {
-    BeforeLastUserMessage,
+    BeforeLastUserMessage(Arc<WorldState>),
     DoNotInject,
+}
+
+pub(crate) async fn build_compaction_initial_context(
+    sess: &Session,
+    turn_context: &TurnContext,
+    initial_context_injection: &InitialContextInjection,
+) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+    // Return the rendered state with its items so history and its baseline stay identical.
+    match initial_context_injection {
+        InitialContextInjection::BeforeLastUserMessage(world_state) => {
+            let items = sess
+                .build_initial_context_with_world_state(turn_context, world_state.as_ref())
+                .await;
+            (items, Some(Arc::clone(world_state)))
+        }
+        InitialContextInjection::DoNotInject => (Vec::new(), None),
+    }
 }
 
 pub(crate) fn should_use_remote_compact_task(provider: &ModelProviderInfo) -> bool {
@@ -293,13 +316,13 @@ async fn run_compact_task_inner_impl(
     );
     let source_history_items = source_history.raw_items().to_vec();
     let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
-        sess: sess.as_ref(),
-        turn_context: turn_context.as_ref(),
+        sess: &sess,
+        turn_context: &turn_context,
         history_items: &source_history_items,
         base_instructions: &base_instructions,
         policy,
         trigger,
-        initial_context_injection,
+        initial_context_injection: &initial_context_injection,
         estimated_summary_scaffold_overhead_tokens: local_summary_scaffold_overhead_tokens(),
         retained_cold_user_message_budget_tokens:
             EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS,
@@ -419,6 +442,12 @@ async fn run_compact_task_inner_impl(
             Err(err @ (CodexErr::Interrupted | CodexErr::TurnAborted)) => {
                 return Err(err);
             }
+            Err(e @ CodexErr::SessionBudgetExceeded) => {
+                sess.track_turn_codex_error(turn_context.as_ref(), &e);
+                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+                sess.send_event(&turn_context, event).await;
+                return Err(e);
+            }
             Err(e @ CodexErr::ContextWindowExceeded) => {
                 if exact_tail_plan.is_some() {
                     let error = exact_tail_backend_context_exceeded_error();
@@ -524,7 +553,7 @@ async fn run_compact_task_inner_impl(
         match build_exact_tail_replacement(
             prepared,
             new_history,
-            initial_context_injection,
+            &initial_context_injection,
             estimate_response_items_token_count(&compaction_output.completed_items),
         ) {
             Ok(replacement) => {
@@ -564,19 +593,33 @@ async fn run_compact_task_inner_impl(
     }
     let (window_number, window_ids) = sess.advance_auto_compact_window().await;
 
-    if exact_tail_plan.is_none()
-        && matches!(
-            initial_context_injection,
-            InitialContextInjection::BeforeLastUserMessage
+    let world_state_baseline = if exact_tail_plan.is_some() {
+        match &initial_context_injection {
+            InitialContextInjection::BeforeLastUserMessage(world_state) => {
+                Some(Arc::clone(world_state))
+            }
+            InitialContextInjection::DoNotInject => None,
+        }
+    } else {
+        let (initial_context, world_state_baseline) = build_compaction_initial_context(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &initial_context_injection,
         )
-    {
-        let initial_context = sess.build_initial_context(turn_context.as_ref()).await;
-        new_history =
-            insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
-    }
+        .await;
+        if !initial_context.is_empty() {
+            new_history = insert_initial_context_before_last_real_user_or_summary(
+                new_history,
+                initial_context,
+            );
+        }
+        world_state_baseline
+    };
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
-        InitialContextInjection::BeforeLastUserMessage => Some(turn_context.to_turn_context_item()),
+        InitialContextInjection::BeforeLastUserMessage(_) => {
+            Some(turn_context.to_turn_context_item())
+        }
     };
     let compacted_item = CompactedItem {
         message: summary_text.clone(),
@@ -590,6 +633,7 @@ async fn run_compact_task_inner_impl(
         turn_context.as_ref(),
         new_history,
         reference_context_item,
+        world_state_baseline,
         compacted_item,
     )
     .await;

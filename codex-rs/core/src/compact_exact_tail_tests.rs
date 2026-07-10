@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
 use crate::context_manager::model_visible_tool_output_item_token_limit;
 use crate::tools::exact_tail_continuity::derive_exact_tail_tool_surface_hint;
@@ -18,6 +19,25 @@ use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use pretty_assertions::assert_eq;
+use std::sync::Arc;
+
+fn mid_turn_injection() -> InitialContextInjection {
+    InitialContextInjection::BeforeLastUserMessage(Arc::new(WorldState::default()))
+}
+
+#[test]
+fn item_id_synthesis_cannot_mutate_exact_hot_suffix_after_verification() {
+    let mut plan = plan(vec![user("old"), user("recent")], 1);
+    let error = ensure_hot_suffix_item_ids_are_stable(&plan, /*item_ids_enabled*/ true)
+        .expect_err("missing hot item IDs must fail before compaction");
+    assert_eq!(error.reason, ExactTailFailReason::HotSuffixItemIdMissing);
+
+    for item in &mut plan.hot_suffix {
+        item.set_id(Some("msg_existing".to_string()));
+    }
+    ensure_hot_suffix_item_ids_are_stable(&plan, /*item_ids_enabled*/ true)
+        .expect("existing hot item IDs remain stable during installation");
+}
 
 fn user(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -1214,7 +1234,7 @@ fn mid_turn_replacement_inserts_initial_context_before_protected_hot_suffix() {
             second_hot_user.clone(),
             second_hot_assistant.clone(),
         ],
-        InitialContextInjection::BeforeLastUserMessage,
+        &mid_turn_injection(),
     );
 
     assert_eq!(
@@ -1242,7 +1262,7 @@ fn mid_turn_replacement_inserts_initial_context_before_agent_message_boundary() 
         vec![summary.clone()],
         vec![initial_context.clone()],
         vec![delegated_instruction.clone()],
-        InitialContextInjection::BeforeLastUserMessage,
+        &mid_turn_injection(),
     );
 
     assert_eq!(
@@ -1263,7 +1283,7 @@ fn mid_turn_replacement_inserts_initial_context_before_inter_agent_instruction_b
         vec![summary.clone()],
         vec![initial_context.clone()],
         vec![delegated_instruction.clone()],
-        InitialContextInjection::BeforeLastUserMessage,
+        &mid_turn_injection(),
     );
 
     assert_eq!(

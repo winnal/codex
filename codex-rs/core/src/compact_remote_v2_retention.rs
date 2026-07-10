@@ -10,6 +10,7 @@ use codex_utils_output_truncation::truncate_text;
 // server-side path remains the reference implementation.
 pub(crate) const REMOTE_COMPACTION_V2_RETAINED_MESSAGE_TOKEN_BUDGET: usize = 64_000;
 
+#[cfg(test)]
 pub(crate) fn build_v2_compacted_history(
     prompt_input: &[ResponseItem],
     compaction_output: ResponseItem,
@@ -22,6 +23,7 @@ pub(crate) fn build_v2_compacted_history(
     (retained, retained_image_count)
 }
 
+#[cfg(test)]
 pub(crate) fn retained_messages_for_remote_compaction_v2(
     prompt_input: &[ResponseItem],
     max_tokens: usize,

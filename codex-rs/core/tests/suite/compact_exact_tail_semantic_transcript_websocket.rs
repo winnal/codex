@@ -43,12 +43,11 @@ async fn exact_tail_semantic_transcript_manual_clears_cached_websocket_continuat
         )],
     ])
     .await;
-    let mut builder = semantic_builder()
-        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            let _ = config.features.disable(Feature::RemoteCompactionV2);
-        });
+    let mut builder = semantic_builder().with_config(|config| {
+        let _ = config.features.disable(Feature::RemoteCompactionV2);
+    });
     let test = builder.build_with_websocket_server(&server).await?;
+    wait_for_startup_websocket_prewarm(&server).await;
 
     submit_turn(&test, "SEM_MANUAL_COLD_USER").await?;
     submit_turn(&test, "SEM_MANUAL_HOT_USER").await?;
@@ -124,6 +123,7 @@ async fn exact_tail_semantic_transcript_auto_clears_cached_websocket_continuatio
         config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::BodyAfterPrefix;
     });
     let test = builder.build_with_websocket_server(&server).await?;
+    wait_for_startup_websocket_prewarm(&server).await;
 
     submit_turn(&test, "SEM_AUTO_WS_COLD_USER").await?;
     submit_turn(&test, "SEM_AUTO_WS_HOT_USER").await?;
@@ -151,7 +151,7 @@ async fn exact_tail_semantic_transcript_auto_clears_cached_websocket_continuatio
 
 fn semantic_builder() -> core_test_support::test_codex::TestCodexBuilder {
     test_codex()
-        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             set_test_compact_prompt(config);
             config.model_context_window = Some(200_000);
@@ -164,6 +164,18 @@ fn semantic_builder() -> core_test_support::test_codex::TestCodexBuilder {
 async fn submit_turn(test: &TestCodex, prompt: &str) -> Result<()> {
     test.submit_turn_with_completion_timeout(prompt, Duration::from_secs(90))
         .await
+}
+
+async fn wait_for_startup_websocket_prewarm(
+    server: &core_test_support::responses::WebSocketTestServer,
+) {
+    let request = tokio::time::timeout(
+        Duration::from_secs(90),
+        server.wait_for_request(/*connection_index*/ 0, /*request_index*/ 0),
+    )
+    .await
+    .expect("startup websocket prewarm request");
+    assert_eq!(request.body_json()["generate"].as_bool(), Some(false));
 }
 
 fn assert_v2_compaction_handshake(

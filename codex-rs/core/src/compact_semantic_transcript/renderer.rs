@@ -263,7 +263,9 @@ pub(crate) fn render_semantic_transcript(
                     )?);
                 }
             }
-            ResponseItem::CompactionTrigger { .. } | ResponseItem::Other => {}
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::CompactionTrigger { .. }
+            | ResponseItem::Other => {}
         }
     }
 

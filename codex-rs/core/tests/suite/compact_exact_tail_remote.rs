@@ -355,6 +355,13 @@ async fn exact_tail_remote_legacy_user_only_output_fails_without_installing_hist
                 ev_assistant_message("remote-user-only-hot-assistant", "REMOTE_USER_ONLY_HOT"),
                 ev_completed("remote-user-only-hot-response"),
             ]),
+            sse(vec![
+                ev_assistant_message(
+                    "remote-user-only-recovery-assistant",
+                    "REMOTE_USER_ONLY_RECOVERY",
+                ),
+                ev_completed("remote-user-only-recovery-response"),
+            ]),
         ],
     )
     .await;
@@ -388,6 +395,10 @@ async fn exact_tail_remote_legacy_user_only_output_fails_without_installing_hist
     submit_turn(&test, "REMOTE_USER_ONLY_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
     let error_message = wait_for_error_message(&test).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
     assert!(
         error_message.contains("ExactTailNoUsableColdSummary"),
@@ -406,6 +417,15 @@ async fn exact_tail_remote_legacy_user_only_output_fails_without_installing_hist
     assert!(
         replacement_history_from_rollout(&rollout_path).is_err(),
         "failed remote exact-tail user-only output must not install compacted history"
+    );
+    let failed_window_id = response_mock.requests()[1].header("x-codex-window-id");
+    submit_turn(&test, "REMOTE_USER_ONLY_RECOVERY_USER").await?;
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].header("x-codex-window-id"),
+        failed_window_id,
+        "failed legacy compaction must not advance the active context window"
     );
 
     shutdown_codex(&test).await?;
@@ -1141,6 +1161,13 @@ async fn exact_tail_remote_v2_empty_compaction_fails_without_installing_history(
                 ev_compaction_item(""),
                 ev_completed("remote-v2-empty-compact-response"),
             ]),
+            sse(vec![
+                ev_assistant_message(
+                    "remote-v2-empty-recovery-assistant",
+                    "REMOTE_V2_EMPTY_RECOVERY",
+                ),
+                ev_completed("remote-v2-empty-recovery-response"),
+            ]),
         ],
     )
     .await;
@@ -1163,6 +1190,10 @@ async fn exact_tail_remote_v2_empty_compaction_fails_without_installing_history(
     submit_turn(&test, "REMOTE_V2_EMPTY_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
     let error_message = wait_for_error_message(&test).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
 
     assert!(
         error_message.contains("ExactTailNoUsableColdSummary"),
@@ -1211,6 +1242,15 @@ async fn exact_tail_remote_v2_empty_compaction_fails_without_installing_history(
             .get("hot_suffix_exact_match")
             .and_then(Value::as_bool),
         None
+    );
+    let failed_window_id = requests[1].header("x-codex-window-id");
+    submit_turn(&test, "REMOTE_V2_EMPTY_RECOVERY_USER").await?;
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests[3].header("x-codex-window-id"),
+        failed_window_id,
+        "failed v2 compaction must not advance the active context window"
     );
 
     shutdown_codex(&test).await?;

@@ -26,6 +26,7 @@ fn exact_tail_hint_extracts_current_reference_names_from_hot_suffix() {
             id: None,
             status: None,
             call_id: "call-custom".to_string(),
+            namespace: None,
             name: "freeform_tool".to_string(),
             input: "{}".to_string(),
             internal_chat_message_metadata_passthrough: None,

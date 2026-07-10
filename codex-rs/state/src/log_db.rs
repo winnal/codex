@@ -199,6 +199,9 @@ where
 
     fn on_event(&self, event: &Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
         let metadata = event.metadata();
+        // `tracing-log` checks filters with the original log target before
+        // dispatching an event whose tracing target is `log`, so the outer
+        // target filter cannot reliably reject these bridged events.
         if matches!(
             metadata.target(),
             "log" | "codex_otel.log_only" | "codex_otel.trace_safe"

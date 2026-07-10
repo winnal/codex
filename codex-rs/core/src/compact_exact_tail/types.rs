@@ -11,6 +11,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ExactTailModelVisibleItemKind;
+use std::sync::Arc;
 
 pub(crate) const EXACT_TAIL_CONSERVATIVE_SUMMARY_BUDGET_TOKENS: i64 = 16_384;
 pub(crate) const EXACT_TAIL_REPLACEMENT_OVERHEAD_MARGIN_TOKENS: i64 = 1_024;
@@ -78,6 +79,7 @@ pub(crate) enum ExactTailFailReason {
     NoUsableColdSummary,
     ModelVisibleItemTooLarge,
     BackendContextExceeded,
+    HotSuffixItemIdMissing,
     HotSuffixMismatch,
 }
 
@@ -92,6 +94,7 @@ impl ExactTailFailReason {
             Self::NoUsableColdSummary => "ExactTailNoUsableColdSummary",
             Self::ModelVisibleItemTooLarge => "ExactTailModelVisibleItemTooLarge",
             Self::BackendContextExceeded => "ExactTailBackendContextExceeded",
+            Self::HotSuffixItemIdMissing => "ExactTailHotSuffixItemIdMissing",
             Self::HotSuffixMismatch => "ExactTailHotSuffixMismatch",
         }
     }
@@ -259,13 +262,13 @@ pub(crate) struct ExactTailPlanInput<'a> {
 }
 
 pub(crate) struct ExactTailPrepareInput<'a> {
-    pub(crate) sess: &'a Session,
-    pub(crate) turn_context: &'a TurnContext,
+    pub(crate) sess: &'a Arc<Session>,
+    pub(crate) turn_context: &'a Arc<TurnContext>,
     pub(crate) history_items: &'a [ResponseItem],
     pub(crate) base_instructions: &'a BaseInstructions,
     pub(crate) policy: CompactionHistoryPolicy,
     pub(crate) trigger: CompactionTrigger,
-    pub(crate) initial_context_injection: InitialContextInjection,
+    pub(crate) initial_context_injection: &'a InitialContextInjection,
     pub(crate) estimated_summary_scaffold_overhead_tokens: i64,
     pub(crate) retained_cold_user_message_budget_tokens: i64,
     pub(crate) normalized_tool_output_count: usize,

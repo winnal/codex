@@ -71,8 +71,9 @@ pub(crate) async fn prepare_exact_tail_plan(
     };
 
     let current_context = match initial_context_injection {
-        InitialContextInjection::BeforeLastUserMessage => {
-            sess.build_initial_context(turn_context).await
+        InitialContextInjection::BeforeLastUserMessage(world_state) => {
+            sess.build_initial_context_with_world_state(turn_context, world_state)
+                .await
         }
         InitialContextInjection::DoNotInject => {
             sess.build_initial_context_without_side_effects(turn_context)
@@ -81,7 +82,7 @@ pub(crate) async fn prepare_exact_tail_plan(
     };
     ensure_model_visible_items_within_limit(&current_context, max_model_visible_item_tokens)?;
     let initial_context = match initial_context_injection {
-        InitialContextInjection::BeforeLastUserMessage => current_context.clone(),
+        InitialContextInjection::BeforeLastUserMessage(_) => current_context.clone(),
         InitialContextInjection::DoNotInject => Vec::new(),
     };
     let base_instruction_tokens =
@@ -91,7 +92,7 @@ pub(crate) async fn prepare_exact_tail_plan(
         base_instruction_tokens.saturating_add(current_context_tokens);
     let final_replacement_extra_budget_tokens = match initial_context_injection {
         InitialContextInjection::DoNotInject => required_current_context_budget,
-        InitialContextInjection::BeforeLastUserMessage => base_instruction_tokens,
+        InitialContextInjection::BeforeLastUserMessage(_) => base_instruction_tokens,
     };
     let mut plan = plan_exact_tail(ExactTailPlanInput {
         history_items,
@@ -110,11 +111,40 @@ pub(crate) async fn prepare_exact_tail_plan(
         implementation,
     })?;
     plan.diagnostics.normalized_tool_output_count = normalized_tool_output_count;
+    ensure_hot_suffix_item_ids_are_stable(&plan, turn_context.item_ids_enabled())?;
 
     Ok(Some(PreparedExactTailPlan {
         plan,
         initial_context,
     }))
+}
+
+fn ensure_hot_suffix_item_ids_are_stable(
+    plan: &ExactTailPlan,
+    item_ids_enabled: bool,
+) -> Result<(), ExactTailError> {
+    if !item_ids_enabled {
+        return Ok(());
+    }
+    if plan
+        .hot_suffix
+        .iter()
+        .any(response_item_will_receive_missing_id)
+    {
+        return Err(ExactTailError::new(
+            ExactTailFailReason::HotSuffixItemIdMissing,
+            "Exact-tail compaction cannot preserve the hot suffix exactly because item-ID synthesis would mutate a retained item.",
+        ));
+    }
+    Ok(())
+}
+
+fn response_item_will_receive_missing_id(item: &ResponseItem) -> bool {
+    item.id().is_none()
+        && !matches!(
+            item,
+            ResponseItem::CompactionTrigger { .. } | ResponseItem::Other
+        )
 }
 
 pub(crate) fn local_summary_scaffold_overhead_tokens() -> i64 {
@@ -191,7 +221,8 @@ fn response_item_has_usable_cold_summary(item: &ResponseItem) -> bool {
         } => encrypted_content
             .as_deref()
             .is_some_and(|content| !content.trim().is_empty()),
-        ResponseItem::Reasoning { .. }
+        ResponseItem::AdditionalTools { .. }
+        | ResponseItem::Reasoning { .. }
         | ResponseItem::LocalShellCall { .. }
         | ResponseItem::FunctionCall { .. }
         | ResponseItem::ToolSearchCall { .. }
@@ -251,17 +282,17 @@ pub(crate) fn append_hot_suffix_to_replacement(
     mut compacted_history: Vec<ResponseItem>,
     initial_context: Vec<ResponseItem>,
     hot_suffix: Vec<ResponseItem>,
-    initial_context_injection: InitialContextInjection,
+    initial_context_injection: &InitialContextInjection,
 ) -> Vec<ResponseItem> {
     match initial_context_injection {
         InitialContextInjection::DoNotInject => {
             compacted_history.extend(hot_suffix);
             compacted_history
         }
-        InitialContextInjection::BeforeLastUserMessage if hot_suffix.is_empty() => {
+        InitialContextInjection::BeforeLastUserMessage(_) if hot_suffix.is_empty() => {
             insert_exact_tail_initial_context(compacted_history, initial_context)
         }
-        InitialContextInjection::BeforeLastUserMessage => {
+        InitialContextInjection::BeforeLastUserMessage(_) => {
             compacted_history.extend(initial_context);
             compacted_history.extend(hot_suffix);
             compacted_history
@@ -320,7 +351,7 @@ fn response_item_is_summary_user_message(item: &ResponseItem) -> bool {
 pub(crate) fn build_exact_tail_replacement(
     prepared: &PreparedExactTailPlan,
     compacted_history: Vec<ResponseItem>,
-    initial_context_injection: InitialContextInjection,
+    initial_context_injection: &InitialContextInjection,
     actual_summary_tokens: i64,
 ) -> Result<ExactTailReplacement, ExactTailError> {
     let replacement_history = append_hot_suffix_to_replacement(
@@ -734,6 +765,9 @@ pub(super) fn ensure_model_visible_items_within_limit(
 
 fn model_visible_item_kind(item: &ResponseItem) -> (&'static str, ExactTailModelVisibleItemKind) {
     match item {
+        ResponseItem::AdditionalTools { .. } => {
+            ("additional_tools", ExactTailModelVisibleItemKind::Other)
+        }
         ResponseItem::Message { .. } => ("message", ExactTailModelVisibleItemKind::Message),
         ResponseItem::AgentMessage { .. } => {
             ("agent_message", ExactTailModelVisibleItemKind::AgentMessage)

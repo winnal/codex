@@ -134,12 +134,16 @@ pub(crate) fn exact_tail_tool_surface_notice_item(
 
     Some(ContextualUserFragment::into(
         ExactTailToolSurfaceNotice::new(
-            (outcome.missing_notice_emitted_count > 0)
-                .then_some(missing)
-                .unwrap_or(0),
-            (outcome.hot_tool_reference_overflow_notice_emitted_count > 0)
-                .then_some(overflow)
-                .unwrap_or(0),
+            if outcome.missing_notice_emitted_count > 0 {
+                missing
+            } else {
+                0
+            },
+            if outcome.hot_tool_reference_overflow_notice_emitted_count > 0 {
+                overflow
+            } else {
+                0
+            },
             outcome.missing_no_path_count,
             outcome.missing_tool_references.clone(),
         ),
@@ -188,7 +192,8 @@ impl ToolSurfaceHintCollector {
             ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
                 self.out_of_scope_dependency_protocol_count += 1;
             }
-            ResponseItem::Message { .. }
+            ResponseItem::AdditionalTools { .. }
+            | ResponseItem::Message { .. }
             | ResponseItem::AgentMessage { .. }
             | ResponseItem::Reasoning { .. }
             | ResponseItem::Compaction { .. }

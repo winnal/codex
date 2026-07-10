@@ -65,7 +65,9 @@ pub(crate) fn classify_exact_tail_history_item(item: &ResponseItem) -> ExactTail
         | ResponseItem::CustomToolCallOutput { .. }
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. } => ExactTailItemClass::DependencyProtocol,
-        ResponseItem::CompactionTrigger { .. } => ExactTailItemClass::StaleContextWrapper,
+        ResponseItem::AdditionalTools { .. } | ResponseItem::CompactionTrigger { .. } => {
+            ExactTailItemClass::StaleContextWrapper
+        }
         ResponseItem::Other => ExactTailItemClass::Unsupported,
     }
 }
