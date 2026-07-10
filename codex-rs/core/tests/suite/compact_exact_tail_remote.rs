@@ -1,5 +1,6 @@
 use super::compact_exact_tail_support::*;
 use codex_protocol::config_types::CompactExactTailStrategy;
+use core_test_support::responses::ev_custom_tool_call;
 use pretty_assertions::assert_eq;
 
 const TURN_STATE_HEADER: &str = "x-codex-turn-state";
@@ -202,6 +203,128 @@ async fn exact_tail_remote_legacy_rehydrates_tool_surface_after_compact() -> Res
     assert_eq!(diagnostic["route"], serde_json::json!("remote_legacy"));
     assert_eq!(diagnostic["rehydrated_tool_count"], serde_json::json!(1));
     assert_eq!(diagnostic["missing_hot_tool_count"], serde_json::json!(0));
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_legacy_keeps_code_mode_entrypoint_available_after_compact() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message(
+                    "remote-legacy-code-mode-cold",
+                    &format!("REMOTE_LEGACY_CODE_MODE_COLD {}", "cold ".repeat(200)),
+                ),
+                ev_completed("remote-legacy-code-mode-cold-response"),
+            ]),
+            sse(vec![
+                ev_response_created("remote-legacy-code-mode-exec-response"),
+                ev_custom_tool_call(
+                    "remote-legacy-code-mode-exec-call",
+                    codex_code_mode::PUBLIC_TOOL_NAME,
+                    "text('REMOTE_LEGACY_CODE_MODE_EXECUTED');",
+                ),
+                ev_completed("remote-legacy-code-mode-exec-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message("remote-legacy-code-mode-hot", "REMOTE_LEGACY_CODE_MODE_HOT"),
+                ev_completed("remote-legacy-code-mode-hot-response"),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "remote-legacy-code-mode-follow",
+                    "REMOTE_LEGACY_CODE_MODE_FOLLOW",
+                ),
+                ev_completed("remote-legacy-code-mode-follow-response"),
+            ]),
+        ],
+    )
+    .await;
+    let compacted_history = vec![codex_protocol::models::ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "REMOTE_LEGACY_CODE_MODE_SUMMARY".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let _compact_mock =
+        mount_compact_json_once(&server, json!({ "output": compacted_history })).await;
+    let mut builder = test_codex()
+        .with_model("test-gpt-5.1-codex")
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("code mode should be enabled");
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(200_000);
+            config.compact_preserve_recent_tokens = Some(100);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    submit_turn(&test, "REMOTE_LEGACY_CODE_MODE_COLD_USER").await?;
+    submit_turn(&test, "REMOTE_LEGACY_CODE_MODE_HOT_USER").await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_compact_turn_complete(&test).await;
+    submit_turn(&test, "REMOTE_LEGACY_CODE_MODE_FOLLOW_USER").await?;
+
+    let requests = response_mock.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "expected cold, exec, exec continuation, and post-compaction follow-up requests"
+    );
+    let exec_output = requests[2].custom_tool_call_output("remote-legacy-code-mode-exec-call");
+    let (_, exec_success) = requests[2]
+        .custom_tool_call_output_content_and_success("remote-legacy-code-mode-exec-call")
+        .expect("exec continuation should contain the custom tool output");
+    assert_ne!(
+        exec_success,
+        Some(false),
+        "code-mode exec failed: {exec_output}"
+    );
+    assert!(
+        exec_output
+            .to_string()
+            .contains("REMOTE_LEGACY_CODE_MODE_EXECUTED"),
+        "exec continuation should contain the expected marker: {exec_output}"
+    );
+    let follow_up = requests.last().expect("follow-up request");
+    let follow_up_body = follow_up.body_json();
+    let follow_up_tools = follow_up_body
+        .get("tools")
+        .and_then(Value::as_array)
+        .expect("follow-up request tools");
+    assert!(
+        follow_up_tools.iter().any(|tool| {
+            tool.get("name").and_then(Value::as_str) == Some(codex_code_mode::PUBLIC_TOOL_NAME)
+        }),
+        "post-compaction follow-up must expose the code-mode exec tool"
+    );
+    assert!(
+        !follow_up.body_contains_text("<exact_tail_tool_surface_notice>"),
+        "available code-mode exec must not produce a missing-tool notice"
+    );
+
+    let diagnostics = exact_tail_tool_surface_diagnostics_from_rollout(&rollout_path)?;
+    assert_eq!(diagnostics.len(), 1);
+    let diagnostic = &diagnostics[0];
+    assert_eq!(diagnostic["route"], json!("remote_legacy"));
+    assert_eq!(diagnostic["already_direct_tool_count"], json!(1));
+    assert_eq!(diagnostic["missing_hot_tool_count"], json!(0));
+    assert_eq!(diagnostic["missing_tool_references"], json!([]));
 
     shutdown_codex(&test).await?;
     Ok(())

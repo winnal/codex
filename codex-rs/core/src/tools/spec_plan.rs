@@ -623,6 +623,19 @@ fn apply_exact_tail_reference_continuity(
     tool_search_visible: bool,
     state: &mut ExactTailToolSurfaceContinuityState,
 ) {
+    let turn_context = context.step_context.turn.as_ref();
+    // Code-mode entrypoints are appended after continuity so their nested tool specs include any
+    // rehydrated runtimes, but active code mode guarantees that both entrypoints will be direct.
+    if matches!(
+        effective_tool_mode(turn_context),
+        ToolMode::CodeMode | ToolMode::CodeModeOnly
+    ) && !codex_code_mode::is_code_mode_nested_tool(&codex_tools::code_mode_name_for_tool_name(
+        reference,
+    )) {
+        state.record_already_direct();
+        return;
+    }
+
     let Some(index) = planned_tools
         .runtimes
         .iter()

@@ -1090,6 +1090,79 @@ async fn deferred_extension_tools_are_discoverable_with_tool_search() {
 }
 
 #[tokio::test]
+async fn exact_tail_hint_tracks_late_bound_code_mode_entrypoints_by_mode() {
+    let references = vec![
+        ToolName::plain(codex_code_mode::PUBLIC_TOOL_NAME),
+        ToolName::plain(codex_code_mode::WAIT_TOOL_NAME),
+    ];
+    let mut enabled_expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ references.len(),
+        /*hot_tool_namespace_count*/ 0,
+    );
+    enabled_expected.already_direct_tool_count = references.len();
+    let enabled = probe_with(
+        |turn| {
+            set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);
+        },
+        ToolPlanInputs {
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(references.clone())),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    enabled.assert_visible_contains(&[
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+    ]);
+    assert_eq!(
+        enabled.exact_tail_tool_surface_outcome,
+        Some(enabled_expected)
+    );
+    assert!(
+        exact_tail_tool_surface_notice_item(
+            enabled
+                .exact_tail_tool_surface_outcome
+                .as_ref()
+                .expect("exact-tail outcome"),
+        )
+        .is_none(),
+        "available code-mode entrypoints must not emit a missing-tool notice"
+    );
+
+    let mut disabled_expected = expected_exact_tail_outcome(
+        /*hot_tool_reference_count*/ references.len(),
+        /*hot_tool_namespace_count*/ 0,
+    );
+    disabled_expected.missing_hot_tool_count = references.len();
+    disabled_expected.missing_notice_emitted_count = 1;
+    disabled_expected.missing_no_path_count = references.len();
+    disabled_expected.missing_tool_references =
+        references.iter().map(tool_reference_label).collect();
+    disabled_expected.missing_tool_rejection_reasons = vec!["no_runtime".to_string()];
+    disabled_expected.tool_surface_changed_after_compaction = true;
+    disabled_expected.tool_surface_rehydration_failure_reason =
+        Some("hot_tool_references_not_model_visible".to_string());
+    let disabled = probe_with(
+        |_| {},
+        ToolPlanInputs {
+            exact_tail_tool_surface_hint: Some(pending_exact_tail_hint(references)),
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    disabled.assert_visible_lacks(&[
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+    ]);
+    assert_eq!(
+        disabled.exact_tail_tool_surface_outcome,
+        Some(disabled_expected)
+    );
+}
+
+#[tokio::test]
 async fn exact_tail_hint_rehydrates_current_deferred_dynamic_tool() {
     let tool_name = ToolName::namespaced("codex_app", "restored_tool");
     let mut expected = expected_exact_tail_outcome(
@@ -1103,6 +1176,7 @@ async fn exact_tail_hint_rehydrates_current_deferred_dynamic_tool() {
     let plan = probe_with(
         |turn| {
             turn.model_info.supports_search_tool = true;
+            set_feature(turn, Feature::CodeMode, /*enabled*/ true);
         },
         ToolPlanInputs {
             dynamic_tools: vec![dynamic_tool(
