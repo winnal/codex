@@ -343,6 +343,7 @@ async fn run_remote_compact_task_inner_impl(
         exact_tail_plan.plan.diagnostics.implementation,
     );
     let new_history = replacement.replacement_history;
+    let item_provenance = replacement.item_provenance;
     if let Some(client_session) = client_session {
         client_session.reset_responses_continuation();
     }
@@ -361,6 +362,7 @@ async fn run_remote_compact_task_inner_impl(
     let compacted_item = CompactedItem {
         message: String::new(),
         replacement_history: Some(new_history.clone()),
+        replacement_history_direct_user_source_indices: None,
         window_number: Some(new_window_number),
         first_window_id: Some(new_window_ids.first_window_id.to_string()),
         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
@@ -373,6 +375,7 @@ async fn run_remote_compact_task_inner_impl(
     sess.replace_compacted_history(
         compaction_turn_context.as_ref(),
         new_history,
+        item_provenance,
         reference_context_item,
         world_state_baseline,
         compacted_item,

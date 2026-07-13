@@ -49,7 +49,7 @@ use codex_protocol::protocol::WarningEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 
-use crate::context_manager::is_user_turn_boundary;
+use crate::context_manager::is_instruction_turn_boundary;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
 use codex_rmcp_client::ElicitationAction;
@@ -635,7 +635,8 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     let turn_count = history
         .raw_items()
         .iter()
-        .filter(|item| is_user_turn_boundary(item))
+        .zip(history.item_provenance())
+        .filter(|(item, provenance)| is_instruction_turn_boundary(item, **provenance))
         .count();
     sess.services.session_telemetry.counter(
         "codex.conversation.turn.count",

@@ -3,6 +3,7 @@ use crate::compact::SUMMARY_PREFIX;
 use crate::compact::build_compacted_history;
 use crate::compact::is_summary_message;
 use crate::context_manager::ContextManager;
+use crate::context_manager::HistoryItemProvenance;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::context_manager::is_user_turn_boundary;
 use crate::session::session::Session;
@@ -26,6 +27,12 @@ use tracing::warn;
 mod groups;
 mod planner;
 mod types;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ExactTailValidationOrigin<'a> {
+    History(&'a [HistoryItemProvenance]),
+    Derived,
+}
 
 pub(crate) use planner::classify_exact_tail_history_item;
 pub(crate) use planner::exact_tail_replacement_budget;
@@ -52,6 +59,7 @@ pub(crate) async fn prepare_exact_tail_plan(
         sess,
         turn_context,
         history_items,
+        history_item_provenance,
         base_instructions,
         policy,
         trigger,
@@ -69,6 +77,12 @@ pub(crate) async fn prepare_exact_tail_plan(
     else {
         return Ok(None);
     };
+    let model_context_window = turn_context.model_context_window().ok_or_else(|| {
+        ExactTailError::new(
+            ExactTailFailReason::BudgetUnavailable,
+            "Exact-tail compaction requires a known model context window.",
+        )
+    })?;
 
     let current_context = match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage(world_state) => {
@@ -80,7 +94,11 @@ pub(crate) async fn prepare_exact_tail_plan(
                 .await
         }
     };
-    ensure_model_visible_items_within_limit(&current_context, max_model_visible_item_tokens)?;
+    ensure_model_visible_items_within_limit(
+        &current_context,
+        max_model_visible_item_tokens,
+        ExactTailValidationOrigin::Derived,
+    )?;
     let initial_context = match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage(_) => current_context.clone(),
         InitialContextInjection::DoNotInject => Vec::new(),
@@ -94,28 +112,32 @@ pub(crate) async fn prepare_exact_tail_plan(
         InitialContextInjection::DoNotInject => required_current_context_budget,
         InitialContextInjection::BeforeLastUserMessage(_) => base_instruction_tokens,
     };
-    let mut plan = plan_exact_tail(ExactTailPlanInput {
-        history_items,
-        target_tokens,
-        effective_replacement_budget: exact_tail_replacement_budget(
-            turn_context.model_context_window(),
-            turn_context.config.model_auto_compact_token_limit,
-            turn_context.config.model_auto_compact_token_limit_scope,
-            trigger,
-        ),
-        required_current_context_budget,
-        final_replacement_extra_budget_tokens,
-        max_model_visible_item_tokens,
-        estimated_summary_scaffold_overhead_tokens,
-        retained_cold_user_message_budget_tokens,
-        implementation,
-    })?;
+    let mut plan = plan_exact_tail(
+        ExactTailPlanInput {
+            history_items,
+            target_tokens,
+            effective_replacement_budget: Some(exact_tail_replacement_budget(
+                model_context_window,
+                turn_context.config.model_auto_compact_token_limit,
+                turn_context.config.model_auto_compact_token_limit_scope,
+                trigger,
+            )),
+            required_current_context_budget,
+            final_replacement_extra_budget_tokens,
+            max_model_visible_item_tokens,
+            estimated_summary_scaffold_overhead_tokens,
+            retained_cold_user_message_budget_tokens,
+            implementation,
+        },
+        history_item_provenance,
+    )?;
     plan.diagnostics.normalized_tool_output_count = normalized_tool_output_count;
     ensure_hot_suffix_item_ids_are_stable(&plan, turn_context.item_ids_enabled())?;
 
     Ok(Some(PreparedExactTailPlan {
         plan,
         initial_context,
+        model_context_window,
     }))
 }
 
@@ -255,19 +277,6 @@ fn content_item_has_non_empty_text(item: &ContentItem) -> bool {
     }
 }
 
-pub(crate) fn exact_tail_cold_input_too_large_error(
-    request_tokens: i64,
-    context_window: i64,
-) -> CodexErr {
-    CodexErr::Stream(
-        format!(
-            "{}: exact-tail compaction request estimates to {request_tokens} tokens, exceeding context window {context_window}; pruning cold input would lose coverage",
-            ExactTailFailReason::ColdInputTooLarge.as_str()
-        ),
-        None,
-    )
-}
-
 pub(crate) fn exact_tail_backend_context_exceeded_error() -> CodexErr {
     CodexErr::Stream(
         format!(
@@ -360,9 +369,19 @@ pub(crate) fn build_exact_tail_replacement(
         prepared.plan.hot_suffix.clone(),
         initial_context_injection,
     );
-    let final_replacement_tokens_estimate =
+    let (final_replacement_tokens_estimate, hot_suffix_proof) =
         check_replacement_fits(&prepared.plan, &replacement_history, actual_summary_tokens)?;
-    let hot_suffix_proof = verify_exact_hot_suffix_preserved(prepared, &replacement_history)?;
+    let derived_item_count = replacement_history
+        .len()
+        .checked_sub(prepared.plan.hot_suffix.len())
+        .ok_or_else(|| {
+            ExactTailError::new(
+                ExactTailFailReason::HotSuffixMismatch,
+                "exact-tail replacement is shorter than the planned hot suffix",
+            )
+        })?;
+    let mut item_provenance = vec![HistoryItemProvenance::Other; derived_item_count];
+    item_provenance.extend_from_slice(&prepared.plan.hot_suffix_provenance);
     Ok(ExactTailReplacement {
         diagnostics: ExactTailReplacementDiagnostics {
             actual_summary_tokens,
@@ -374,6 +393,7 @@ pub(crate) fn build_exact_tail_replacement(
         },
         tool_surface_hint: prepared.plan.tool_surface_hint.clone(),
         replacement_history,
+        item_provenance,
     })
 }
 
@@ -389,11 +409,19 @@ pub(crate) fn pending_exact_tail_tool_surface_hint(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn verify_exact_hot_suffix_preserved(
     prepared: &PreparedExactTailPlan,
     replacement_history: &[ResponseItem],
 ) -> Result<ExactTailHotSuffixProof, ExactTailError> {
-    let planned_hot_suffix = prepared.plan.hot_suffix.as_slice();
+    exact_hot_suffix_proof(&prepared.plan, replacement_history)
+}
+
+fn exact_hot_suffix_proof(
+    plan: &ExactTailPlan,
+    replacement_history: &[ResponseItem],
+) -> Result<ExactTailHotSuffixProof, ExactTailError> {
+    let planned_hot_suffix = plan.hot_suffix.as_slice();
     if planned_hot_suffix.is_empty() {
         return Ok(ExactTailHotSuffixProof {
             exact_match: true,
@@ -621,10 +649,27 @@ pub(crate) fn check_replacement_fits(
     plan: &ExactTailPlan,
     replacement_history: &[ResponseItem],
     actual_summary_tokens: i64,
-) -> Result<i64, ExactTailError> {
+) -> Result<(i64, ExactTailHotSuffixProof), ExactTailError> {
+    let hot_suffix_proof = exact_hot_suffix_proof(plan, replacement_history)?;
+    let derived_item_count = replacement_history
+        .len()
+        .checked_sub(plan.hot_suffix.len())
+        .ok_or_else(|| {
+            ExactTailError::new(
+                ExactTailFailReason::HotSuffixMismatch,
+                "exact-tail replacement is shorter than the planned hot suffix",
+            )
+        })?;
+    let (derived_history, exact_hot_suffix) = replacement_history.split_at(derived_item_count);
     ensure_model_visible_items_within_limit(
-        replacement_history,
+        derived_history,
         plan.diagnostics.max_model_visible_item_tokens,
+        ExactTailValidationOrigin::Derived,
+    )?;
+    ensure_model_visible_items_within_limit(
+        exact_hot_suffix,
+        plan.diagnostics.max_model_visible_item_tokens,
+        ExactTailValidationOrigin::History(&plan.hot_suffix_provenance),
     )?;
     let replacement_tokens_estimate = estimate_response_items_token_count(replacement_history);
     let final_tokens_estimate = replacement_tokens_estimate
@@ -662,7 +707,7 @@ pub(crate) fn check_replacement_fits(
         "exact-tail replacement fit checked"
     );
     if fits {
-        Ok(final_tokens_estimate)
+        Ok((final_tokens_estimate, hot_suffix_proof))
     } else {
         Err(ExactTailError::new(
             ExactTailFailReason::ReplacementTooLarge,
@@ -679,16 +724,50 @@ pub(crate) fn check_replacement_fits(
 pub(crate) fn check_cold_input_fits(
     plan: &ExactTailPlan,
     compact_request_items: &[ResponseItem],
-    context_window: Option<i64>,
+    expectation: ExactTailCompactInputExpectation<'_>,
+    context_window: i64,
+    base_instructions: &codex_protocol::models::BaseInstructions,
 ) -> Result<(), ExactTailError> {
-    ensure_model_visible_items_within_limit(
-        compact_request_items,
-        plan.diagnostics.max_model_visible_item_tokens,
-    )?;
-    let Some(context_window) = context_window else {
-        return Ok(());
-    };
-    let request_tokens = estimate_response_items_token_count(compact_request_items);
+    match expectation {
+        ExactTailCompactInputExpectation::Source { derived_items } => {
+            let Some(expected_item_count) =
+                plan.cold_history.len().checked_add(derived_items.len())
+            else {
+                return Err(exact_tail_cold_input_mismatch_error());
+            };
+            if compact_request_items.len() != expected_item_count {
+                return Err(exact_tail_cold_input_mismatch_error());
+            }
+            let (exact_cold_history, generated_request_items) =
+                compact_request_items.split_at(plan.cold_history.len());
+            if exact_cold_history != plan.cold_history || generated_request_items != derived_items {
+                return Err(exact_tail_cold_input_mismatch_error());
+            }
+            ensure_model_visible_items_within_limit(
+                exact_cold_history,
+                plan.diagnostics.max_model_visible_item_tokens,
+                ExactTailValidationOrigin::History(&plan.cold_history_provenance),
+            )?;
+            ensure_model_visible_items_within_limit(
+                generated_request_items,
+                plan.diagnostics.max_model_visible_item_tokens,
+                ExactTailValidationOrigin::Derived,
+            )?;
+        }
+        ExactTailCompactInputExpectation::Derived { expected_items } => {
+            if compact_request_items != expected_items {
+                return Err(exact_tail_cold_input_mismatch_error());
+            }
+            ensure_model_visible_items_within_limit(
+                compact_request_items,
+                plan.diagnostics.max_model_visible_item_tokens,
+                ExactTailValidationOrigin::Derived,
+            )?;
+        }
+    }
+    let request_tokens = estimate_response_items_token_count(compact_request_items).saturating_add(
+        i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX),
+    );
     if request_tokens <= context_window {
         return Ok(());
     }
@@ -703,19 +782,42 @@ pub(crate) fn check_cold_input_fits(
     );
     Err(ExactTailError::new(
         ExactTailFailReason::ColdInputTooLarge,
-        "Exact-tail compaction could not safely summarize the cold prefix without losing coverage. Try a smaller compact_preserve_recent_tokens, compact earlier, or disable exact-tail.",
+        "Exact-tail compaction could not safely summarize the cold prefix without losing coverage. Compact earlier, use a model with a larger context window, or disable exact-tail.",
     ))
+}
+
+fn exact_tail_cold_input_mismatch_error() -> ExactTailError {
+    ExactTailError::new(
+        ExactTailFailReason::ColdInputMismatch,
+        "exact-tail compaction input differs from the declared final prompt vector",
+    )
 }
 
 pub(super) fn ensure_model_visible_items_within_limit(
     items: &[ResponseItem],
     max_model_visible_item_tokens: i64,
+    origin: ExactTailValidationOrigin<'_>,
 ) -> Result<(), ExactTailError> {
-    for item in items {
-        if matches!(
-            classify_exact_tail_history_item(item),
-            ExactTailItemClass::StaleContextWrapper
-        ) {
+    let history_item_provenance = match origin {
+        ExactTailValidationOrigin::History(item_provenance) => {
+            if item_provenance.len() != items.len() {
+                return Err(ExactTailError::new(
+                    ExactTailFailReason::ColdInputMismatch,
+                    "exact-tail item provenance does not align with model-visible history",
+                ));
+            }
+            Some(item_provenance)
+        }
+        ExactTailValidationOrigin::Derived => None,
+    };
+    for (index, item) in items.iter().enumerate() {
+        // Original user messages are source history, not tool output. Preserve them exactly and
+        // govern them by the aggregate hot-suffix, cold-request, and replacement budgets.
+        let is_exact_source_user_message = history_item_provenance.is_some_and(|provenance| {
+            provenance[index] == HistoryItemProvenance::DirectUserSource
+                && matches!(item, ResponseItem::Message { role, .. } if role == "user")
+        });
+        if is_exact_source_user_message {
             continue;
         }
         // Tool-call request items are model-authored history, not tool outputs.

@@ -187,6 +187,7 @@ use crate::config::PermissionProfileState;
 use crate::config::StartedNetworkProxy;
 use crate::config::resolve_web_search_mode_for_turn;
 use crate::context_manager::ContextManager;
+use crate::context_manager::HistoryItemProvenance;
 use crate::thread_rollout_truncation::initial_history_has_prior_user_turns;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerSource;
@@ -1433,6 +1434,7 @@ impl Session {
     ) -> Option<PreviousTurnSettings> {
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
+            history_item_provenance,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -1451,7 +1453,11 @@ impl Session {
         prepare_response_items(&mut history);
         {
             let mut state = self.state.lock().await;
-            state.replace_history(history, reference_context_item);
+            state.replace_history_with_provenance(
+                history,
+                history_item_provenance,
+                reference_context_item,
+            );
             if let Some(hint) = pending_exact_tail_tool_surface_hint {
                 state.set_active_exact_tail_tool_surface_hint(hint);
             }
@@ -1787,6 +1793,16 @@ impl Session {
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        self.send_event_with_persistence(turn_context, msg, /*persist*/ true)
+            .await;
+    }
+
+    async fn send_event_with_persistence(
+        &self,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+        persist: bool,
+    ) {
         let legacy_source = msg.clone();
         if let EventMsg::Error(error) = &legacy_source
             && error
@@ -1810,7 +1826,7 @@ impl Session {
             id: turn_context.sub_id.clone(),
             msg,
         };
-        self.send_event_raw(event).await;
+        self.send_event_raw_with_persistence(event, persist).await;
         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
             .await;
         self.maybe_mirror_event_text_to_realtime(&legacy_source)
@@ -1827,7 +1843,8 @@ impl Session {
                 id: turn_context.sub_id.clone(),
                 msg: legacy,
             };
-            self.send_event_raw(legacy_event).await;
+            self.send_event_raw_with_persistence(legacy_event, persist)
+                .await;
         }
     }
 
@@ -2023,8 +2040,18 @@ impl Session {
         turn_context: &TurnContext,
         item: TurnItem,
     ) {
+        self.emit_turn_item_completed_with_persistence(turn_context, item, /*persist*/ true)
+            .await;
+    }
+
+    async fn emit_turn_item_completed_with_persistence(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+        persist: bool,
+    ) {
         record_turn_ttfm_metric(turn_context, &item).await;
-        self.send_event(
+        self.send_event_with_persistence(
             turn_context,
             EventMsg::ItemCompleted(ItemCompletedEvent {
                 thread_id: self.thread_id,
@@ -2032,6 +2059,7 @@ impl Session {
                 item,
                 completed_at_ms: now_unix_timestamp_ms(),
             }),
+            persist,
         )
         .await;
     }
@@ -2853,18 +2881,57 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
+        self.record_conversation_items_with_provenance(
+            turn_context,
+            items,
+            HistoryItemProvenance::Other,
+        )
+        .await;
+    }
+
+    async fn record_conversation_items_with_provenance(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+        provenance: HistoryItemProvenance,
+    ) -> bool {
         let items = self.prepare_conversation_items_for_history(turn_context, items);
         let items = items.as_ref();
         {
             let mut state = self.state.lock().await;
-            state.current_time_reminder.note_recorded_items(items);
-            state.record_items(
-                items.iter(),
-                turn_context.model_info.truncation_policy.into(),
-            );
+            state
+                .current_time_reminder
+                .note_recorded_items(items, provenance);
+            match provenance {
+                HistoryItemProvenance::DirectUserSource => state.record_direct_user_source_items(
+                    items.iter(),
+                    turn_context.model_info.truncation_policy.into(),
+                ),
+                HistoryItemProvenance::Other => state.record_items(
+                    items.iter(),
+                    turn_context.model_info.truncation_policy.into(),
+                ),
+            }
         }
-        self.persist_rollout_response_items(items).await;
+        let persisted = match provenance {
+            HistoryItemProvenance::DirectUserSource => {
+                let rollout_items = items
+                    .iter()
+                    .flat_map(|item| {
+                        [
+                            RolloutItem::EventMsg(EventMsg::RawResponseItem(
+                                RawResponseItemEvent { item: item.clone() },
+                            )),
+                            RolloutItem::ResponseItem(item.clone()),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                self.persist_rollout_items(&rollout_items).await
+            }
+            HistoryItemProvenance::Other => self.persist_rollout_response_items(items).await,
+        };
         self.send_raw_response_items(turn_context, items).await;
+        persisted
     }
 
     pub(crate) async fn record_step_world_state_if_changed(
@@ -2963,7 +3030,9 @@ impl Session {
         let response_item = items[0].clone();
         {
             let mut state = self.state.lock().await;
-            state.current_time_reminder.note_recorded_items(items);
+            state
+                .current_time_reminder
+                .note_recorded_items(items, HistoryItemProvenance::Other);
             state.record_items(
                 items.iter(),
                 turn_context.model_info.truncation_policy.into(),
@@ -3053,6 +3122,7 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         items: Vec<ResponseItem>,
+        item_provenance: Vec<HistoryItemProvenance>,
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
         compacted_item: CompactedItem,
@@ -3062,15 +3132,36 @@ impl Session {
         } else {
             items
         };
+        assert_eq!(items.len(), item_provenance.len());
+        let direct_user_source_indices = item_provenance
+            .iter()
+            .enumerate()
+            .filter_map(|(index, provenance)| {
+                if *provenance != HistoryItemProvenance::DirectUserSource {
+                    return None;
+                }
+                assert!(matches!(
+                    items.get(index),
+                    Some(ResponseItem::Message { role, .. }) if role == "user"
+                ));
+                Some(u32::try_from(index))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .ok();
         let compacted_item = CompactedItem {
             replacement_history: Some(items.clone()),
+            replacement_history_direct_user_source_indices: direct_user_source_indices,
             ..compacted_item
         };
         // Compaction starts a new history window, so its WorldState baseline must be full.
         let mut world_state_item = None;
         {
             let mut state = self.state.lock().await;
-            state.replace_history(items, reference_context_item.clone());
+            state.replace_history_with_provenance(
+                items,
+                item_provenance,
+                reference_context_item.clone(),
+            );
             if let Some(world_state) = world_state_baseline {
                 let snapshot = world_state.snapshot();
                 world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
@@ -3095,13 +3186,13 @@ impl Session {
         }
     }
 
-    async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
+    async fn persist_rollout_response_items(&self, items: &[ResponseItem]) -> bool {
         let rollout_items: Vec<RolloutItem> = items
             .iter()
             .cloned()
             .map(RolloutItem::ResponseItem)
             .collect();
-        self.persist_rollout_items(&rollout_items).await;
+        self.persist_rollout_items(&rollout_items).await
     }
 
     pub fn enabled(&self, feature: Feature) -> bool {
@@ -3147,9 +3238,10 @@ impl Session {
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
     async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
         for item in items {
-            self.send_event(
+            self.send_event_with_persistence(
                 turn_context,
                 EventMsg::RawResponseItem(RawResponseItemEvent { item: item.clone() }),
+                /*persist*/ false,
             )
             .await;
         }
@@ -3558,12 +3650,14 @@ impl Session {
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
-    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) {
+    pub(crate) async fn persist_rollout_items(&self, items: &[RolloutItem]) -> bool {
         if let Some(live_thread) = self.live_thread()
             && let Err(e) = live_thread.append_items(items).await
         {
             error!("failed to record rollout items: {e:#}");
+            return false;
         }
+        true
     }
 
     pub(crate) async fn clone_history(&self) -> ContextManager {
@@ -3626,15 +3720,18 @@ impl Session {
         let context_items = self
             .build_initial_context_with_world_state(turn_context, world_state.as_ref())
             .await;
+        let item_provenance = vec![HistoryItemProvenance::Other; context_items.len()];
         let turn_context_item = turn_context.to_turn_context_item();
         self.replace_compacted_history(
             turn_context,
             context_items,
+            item_provenance,
             Some(turn_context_item),
             Some(world_state),
             CompactedItem {
                 message: String::new(),
                 replacement_history: None,
+                replacement_history_direct_user_source_indices: None,
                 window_number: Some(window_number),
                 first_window_id: Some(window_ids.first_window_id.to_string()),
                 previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
@@ -3914,13 +4011,23 @@ impl Session {
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         let response_item = self.response_item_from_user_input(input.to_vec());
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
+        let direct_source_persisted = self
+            .record_conversation_items_with_provenance(
+                turn_context,
+                std::slice::from_ref(&response_item),
+                HistoryItemProvenance::DirectUserSource,
+            )
             .await;
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_id = client_id;
         let turn_item = TurnItem::UserMessage(user_message_item);
         self.emit_turn_item_started(turn_context, &turn_item).await;
-        self.emit_turn_item_completed(turn_context, turn_item).await;
+        self.emit_turn_item_completed_with_persistence(
+            turn_context,
+            turn_item,
+            direct_source_persisted,
+        )
+        .await;
         self.ensure_rollout_materialized().await;
     }
 

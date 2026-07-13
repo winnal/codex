@@ -1061,12 +1061,24 @@ fn strip_legacy_ghost_snapshot_rollout_line(value: &mut Value) -> bool {
             .get("payload")
             .is_some_and(is_legacy_ghost_snapshot_response_item),
         Some("compacted") => {
-            if let Some(replacement_history) = value
-                .get_mut("payload")
-                .and_then(|payload| payload.get_mut("replacement_history"))
-                .and_then(Value::as_array_mut)
-            {
-                replacement_history.retain(|item| !is_legacy_ghost_snapshot_response_item(item));
+            if let Some(payload) = value.get_mut("payload") {
+                let removed_item = payload
+                    .get_mut("replacement_history")
+                    .and_then(Value::as_array_mut)
+                    .is_some_and(|replacement_history| {
+                        let original_len = replacement_history.len();
+                        replacement_history
+                            .retain(|item| !is_legacy_ghost_snapshot_response_item(item));
+                        replacement_history.len() != original_len
+                    });
+                if removed_item
+                    && payload
+                        .get("replacement_history_direct_user_source_indices")
+                        .is_some()
+                {
+                    payload["replacement_history_direct_user_source_indices"] =
+                        Value::Array(Vec::new());
+                }
             }
             false
         }

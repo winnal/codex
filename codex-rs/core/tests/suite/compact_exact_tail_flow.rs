@@ -392,6 +392,10 @@ async fn exact_tail_replacement_history_survives_resume() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_tail_manual_compact_twice_preserves_newest_suffix_each_time() -> Result<()> {
     let server = start_mock_server().await;
+    let cold_user = format!(
+        "  TWICE_COLD_USER_START\r\nUTF8: 漢字 🥭\nquoted: \"exact\"\\path\r\n{}\nTWICE_COLD_USER_END  ",
+        "c".repeat(120_000)
+    );
     let response_mock = mount_sse_sequence(
         &server,
         vec![
@@ -427,11 +431,12 @@ async fn exact_tail_manual_compact_twice_preserves_newest_suffix_each_time() -> 
         config.model_provider = provider;
         set_test_compact_prompt(config);
         config.model_context_window = Some(200_000);
+        config.tool_output_token_limit = Some(20_000);
         config.compact_preserve_recent_tokens = Some(1);
     });
     let test = builder.build(&server).await?;
 
-    test.submit_turn_with_completion_timeout("TWICE_COLD_USER", Duration::from_secs(90))
+    test.submit_turn_with_completion_timeout(&cold_user, Duration::from_secs(90))
         .await?;
     test.submit_turn_with_completion_timeout("TWICE_HOT_USER", Duration::from_secs(90))
         .await?;
@@ -460,7 +465,25 @@ async fn exact_tail_manual_compact_twice_preserves_newest_suffix_each_time() -> 
         6,
         "expected cold, hot, first compact, after-one, second compact, and final requests"
     );
+    assert_eq!(
+        requests[2]
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| *text == &cold_user)
+            .count(),
+        1,
+        "the production-sized local cold source must reach compaction byte-for-byte exactly once"
+    );
     let second_compact_body = requests[4].body_json().to_string();
+    let second_compact_user_texts = requests[4].message_input_texts("user");
+    let retained_cold_user = second_compact_user_texts
+        .iter()
+        .find(|text| text.starts_with("  TWICE_COLD_USER_START"))
+        .expect("second compaction should receive the retained cold user anchor");
+    assert!(
+        retained_cold_user.len() < cold_user.len(),
+        "the retained anchor must remain derived and capped on the second compaction"
+    );
     assert!(
         body_contains_text(&second_compact_body, "TWICE_EXACT_TAIL_SUMMARY_ONE")
             && body_contains_text(&second_compact_body, "TWICE_HOT_ASSISTANT")

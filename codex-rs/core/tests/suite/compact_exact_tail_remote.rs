@@ -1,5 +1,6 @@
 use super::compact_exact_tail_support::*;
 use codex_protocol::config_types::CompactExactTailStrategy;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_custom_tool_call;
 use pretty_assertions::assert_eq;
 
@@ -102,6 +103,142 @@ async fn exact_tail_remote_legacy_manual_compact_excludes_newest_atomic_hot_suff
     assert!(
         !input_contains_text(&follow_up_input, "REMOTE_COLD_ASSISTANT"),
         "follow-up should not replay cold assistant text outside the remote summary"
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_remote_legacy_preserves_oversize_source_user_items_exactly() -> Result<()> {
+    let server = start_mock_server().await;
+    let cold_prefix = "  OVERSIZE_COLD_USER_START\r\nUTF8: 漢字 🥭\nquoted: \"exact\"\\path\r\n";
+    let cold_suffix = "\nOVERSIZE_COLD_USER_END  ";
+    let cold_fill_bytes = 713_041 - cold_prefix.len() - cold_suffix.len();
+    let cold_user = format!("{cold_prefix}{}{cold_suffix}", "c".repeat(cold_fill_bytes));
+    assert_eq!(cold_user.len(), 713_041);
+    let hot_user = format!(
+        "OVERSIZE_HOT_USER_START{}OVERSIZE_HOT_USER_END",
+        "h".repeat(25_000 * 4)
+    );
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message(
+                    "oversize-source-cold-assistant",
+                    "OVERSIZE_SOURCE_COLD_ASSISTANT",
+                ),
+                ev_completed("oversize-source-cold-response"),
+            ]),
+            sse(vec![ev_completed("oversize-source-hot-response")]),
+            sse(vec![
+                ev_assistant_message(
+                    "oversize-source-follow-up-assistant",
+                    "OVERSIZE_SOURCE_FOLLOW_UP_DONE",
+                ),
+                ev_completed("oversize-source-follow-up-response"),
+            ]),
+        ],
+    )
+    .await;
+    let compacted_history = vec![codex_protocol::models::ResponseItem::Compaction {
+        id: None,
+        encrypted_content: "OVERSIZE_SOURCE_EXACT_TAIL_SUMMARY".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    }];
+    let compact_mock =
+        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = Some(400_000);
+            config.tool_output_token_limit = Some(20_000);
+            config.compact_preserve_recent_tokens = Some(1);
+            let _ = config.features.disable(Feature::RemoteCompactionV2);
+        });
+    let test = builder.build_with_auto_env(&server).await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    submit_turn(&test, &cold_user).await?;
+    submit_turn(&test, &hot_user).await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_compact_turn_complete(&test).await;
+    submit_turn(&test, "OVERSIZE_SOURCE_FOLLOW_UP_USER").await?;
+
+    let compact_request = compact_mock.single_request();
+    let compact_user_texts = compact_request.message_input_texts("user");
+    assert_eq!(
+        compact_user_texts
+            .iter()
+            .filter(|text| *text == &cold_user)
+            .count(),
+        1,
+        "the cold source user must reach the compactor byte-for-byte exactly once"
+    );
+    assert!(
+        compact_user_texts.iter().all(|text| text != &hot_user),
+        "the exact hot source user must stay out of the compaction request"
+    );
+
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 3);
+    let follow_up_user_texts = requests[2].message_input_texts("user");
+    assert_eq!(
+        follow_up_user_texts
+            .iter()
+            .filter(|text| *text == &hot_user)
+            .count(),
+        1,
+        "the oversized hot source user must be reinstalled exactly once"
+    );
+    assert!(
+        follow_up_user_texts.iter().all(|text| text != &cold_user),
+        "the cold source user must be represented by the compacted summary after installation"
+    );
+    let checkpoint = replacement_checkpoint_from_rollout(&rollout_path)?;
+    let direct_source_indices = checkpoint
+        .replacement_history_direct_user_source_indices
+        .expect("new checkpoints must carry authoritative direct-source provenance");
+    assert_eq!(direct_source_indices.len(), 1);
+    let direct_source_index = usize::try_from(direct_source_indices[0])?;
+    let direct_source_item = checkpoint
+        .replacement_history
+        .as_ref()
+        .and_then(|history| history.get(direct_source_index))
+        .expect("checkpoint direct-source index must resolve");
+    let codex_protocol::models::ResponseItem::Message { role, content, .. } = direct_source_item
+    else {
+        panic!("checkpoint direct-source index must point to a user message")
+    };
+    assert_eq!(
+        (role, content),
+        (
+            &"user".to_string(),
+            &vec![codex_protocol::models::ContentItem::InputText {
+                text: hot_user.clone(),
+            }],
+        ),
+        "the checkpoint must bind the durable exemption to the exact hot source item"
+    );
+
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    let diagnostic = diagnostics.last().expect("exact-tail diagnostic");
+    assert_eq!(diagnostic["fit_result"], serde_json::json!("success"));
+    assert_eq!(
+        diagnostic["hot_suffix_exact_match"],
+        serde_json::json!(true)
+    );
+    assert!(
+        diagnostic["largest_hot_item_tokens"]
+            .as_i64()
+            .is_some_and(|tokens| tokens > 22_000),
+        "the fixture must prove exact preservation above the configured tool-output envelope"
     );
 
     shutdown_codex(&test).await?;
@@ -651,6 +788,10 @@ async fn exact_tail_remote_legacy_backend_context_window_error_emits_diagnostic(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Result<()> {
     let server = start_mock_server().await;
+    let cold_user = format!(
+        "REMOTE_V2_ROUTE_COLD_USER_START{}REMOTE_V2_ROUTE_COLD_USER_END",
+        "c".repeat(120_000)
+    );
     let response_mock = mount_sse_sequence(
         &server,
         vec![
@@ -686,7 +827,8 @@ async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Resu
         .with_auth(CodexAuth::from_api_key("dummy"))
         .with_config(|config| {
             set_test_compact_prompt(config);
-            config.model_context_window = Some(200_000);
+            config.model_context_window = Some(400_000);
+            config.tool_output_token_limit = Some(20_000);
             config.compact_preserve_recent_tokens = Some(1);
             explicitly_enable_remote_compaction_v2(config);
         });
@@ -697,7 +839,7 @@ async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Resu
         .clone()
         .expect("rollout path");
 
-    submit_turn(&test, "REMOTE_V2_ROUTE_COLD_USER").await?;
+    submit_turn(&test, &cold_user).await?;
     submit_turn(&test, "REMOTE_V2_ROUTE_HOT_USER").await?;
     test.codex.submit(Op::Compact).await?;
     wait_for_compact_turn_complete(&test).await;
@@ -728,6 +870,15 @@ async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Resu
     assert!(
         body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_COLD_USER"),
         "cold user should be sent to v2 compact; compact body: {compact_body}"
+    );
+    assert!(
+        compact_request
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| *text == &cold_user)
+            .count()
+            == 1,
+        "the production-sized cold source user must reach v2 compaction byte-for-byte"
     );
     assert!(
         body_contains_text(&compact_body_text, "REMOTE_V2_ROUTE_COLD_ASSISTANT"),
@@ -772,6 +923,15 @@ async fn exact_tail_remote_v2_enabled_manual_uses_cold_only_v2_request() -> Resu
     assert!(
         !input_contains_text(&requests[3].input(), "REMOTE_V2_ROUTE_COLD_ASSISTANT"),
         "follow-up should not replay cold assistant text outside the v2 summary"
+    );
+    let retained_cold_user = requests[3]
+        .message_input_texts("user")
+        .into_iter()
+        .find(|text| text.starts_with("REMOTE_V2_ROUTE_COLD_USER_START"))
+        .expect("v2 replacement should retain a bounded cold user anchor");
+    assert!(
+        retained_cold_user.len() < cold_user.len(),
+        "the retained derived anchor must be capped before installation"
     );
     let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
     assert_eq!(diagnostics.len(), 1);
@@ -1613,6 +1773,100 @@ async fn exact_tail_remote_v2_enabled_auto_uses_cold_only_v2_request() -> Result
     assert!(
         !input_contains_text(&requests[3].input(), "REMOTE_V2_ROUTE_AUTO_COLD_ASSISTANT"),
         "follow-up should not replay cold assistant text outside the v2 auto summary"
+    );
+
+    shutdown_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_tail_auto_requires_known_context_window_before_any_compaction_request() -> Result<()>
+{
+    let server = start_mock_server().await;
+    let oversized_cold_user = format!(
+        "UNKNOWN_WINDOW_OVERSIZED_COLD_START{}UNKNOWN_WINDOW_OVERSIZED_COLD_END",
+        "c".repeat(183_044)
+    );
+    let response_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message(
+                    "unknown-window-cold-assistant",
+                    "UNKNOWN_WINDOW_COLD_ASSISTANT",
+                ),
+                ev_completed_with_tokens("unknown-window-cold-response", /*total_tokens*/ 50),
+            ]),
+            sse(vec![
+                ev_assistant_message(
+                    "unknown-window-hot-assistant",
+                    "UNKNOWN_WINDOW_HOT_ASSISTANT",
+                ),
+                ev_completed_with_tokens("unknown-window-hot-response", /*total_tokens*/ 500),
+            ]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_auth(CodexAuth::from_api_key("dummy"))
+        .with_model_info_override("gpt-5.2", |model_info| {
+            model_info.context_window = None;
+            model_info.max_context_window = None;
+        })
+        .with_config(|config| {
+            set_test_compact_prompt(config);
+            config.model_context_window = None;
+            config.model_auto_compact_token_limit = Some(100);
+            config.model_auto_compact_token_limit_scope = AutoCompactTokenLimitScope::Total;
+            config.compact_preserve_recent_tokens = Some(1);
+            explicitly_enable_remote_compaction_v2(config);
+        })
+        .build(&server)
+        .await?;
+    let rollout_path = test
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
+
+    submit_turn(&test, &oversized_cold_user).await?;
+    submit_turn(&test, "UNKNOWN_WINDOW_HOT_USER").await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "UNKNOWN_WINDOW_TRIGGER_USER".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let error_message = wait_for_error_message(&test).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert!(
+        error_message.contains("ExactTailBudgetUnavailable"),
+        "expected a structured missing-budget error, got {error_message}"
+    );
+    assert_eq!(
+        response_mock.requests().len(),
+        2,
+        "unknown context budget must fail before a v2 compaction or trigger-turn request"
+    );
+    assert!(
+        replacement_history_from_rollout(&rollout_path).is_err(),
+        "budget failure must not install a replacement history"
+    );
+    let diagnostics = exact_tail_diagnostics_from_rollout(&rollout_path)?;
+    let diagnostic = diagnostics.last().expect("exact-tail diagnostic");
+    assert_eq!(
+        diagnostic.get("failure_reason").and_then(Value::as_str),
+        Some("ExactTailBudgetUnavailable")
     );
 
     shutdown_codex(&test).await?;

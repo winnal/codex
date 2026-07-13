@@ -12,6 +12,7 @@ use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
 use crate::context_manager::ContextManager;
+use crate::context_manager::HistoryItemProvenance;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
@@ -90,6 +91,14 @@ impl SessionState {
         self.history.record_items(items, policy);
     }
 
+    pub(crate) fn record_direct_user_source_items<I>(&mut self, items: I, policy: TruncationPolicy)
+    where
+        I: IntoIterator,
+        I::Item: std::ops::Deref<Target = ResponseItem>,
+    {
+        self.history.record_direct_user_source_items(items, policy);
+    }
+
     pub(crate) fn previous_turn_settings(&self) -> Option<PreviousTurnSettings> {
         self.previous_turn_settings.clone()
     }
@@ -114,12 +123,23 @@ impl SessionState {
         self.history.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_history(
         &mut self,
         items: Vec<ResponseItem>,
         reference_context_item: Option<TurnContextItem>,
     ) {
-        self.history.replace(items);
+        let item_provenance = vec![HistoryItemProvenance::Other; items.len()];
+        self.replace_history_with_provenance(items, item_provenance, reference_context_item);
+    }
+
+    pub(crate) fn replace_history_with_provenance(
+        &mut self,
+        items: Vec<ResponseItem>,
+        item_provenance: Vec<HistoryItemProvenance>,
+        reference_context_item: Option<TurnContextItem>,
+    ) {
+        self.history.replace_with_provenance(items, item_provenance);
         self.history
             .set_reference_context_item(reference_context_item);
         self.auto_compact_window.clear_prefill();

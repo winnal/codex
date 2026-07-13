@@ -38,11 +38,24 @@ const FUNCTION_OUTPUT_TRUNCATION_MAX_PASSES: usize = 16;
 const FUNCTION_OUTPUT_OMITTED_FOR_BUDGET: &str =
     "[tool output omitted: exceeded configured model-visible item budget]";
 
+/// Records whether a history item is an original user submission.
+///
+/// Exact-tail compaction uses this sidecar instead of message shape or content so generated user-
+/// role items can never acquire the direct-user per-item-cap exemption.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum HistoryItemProvenance {
+    DirectUserSource,
+    #[default]
+    Other,
+}
+
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
     items: Vec<ResponseItem>,
+    /// Indexed in parallel with `items`.
+    item_provenance: Vec<HistoryItemProvenance>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
     token_info: Option<TokenUsageInfo>,
@@ -65,6 +78,7 @@ impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
             items: Vec::new(),
+            item_provenance: Vec::new(),
             history_version: 0,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
@@ -128,6 +142,26 @@ impl ContextManager {
         I: IntoIterator,
         I::Item: std::ops::Deref<Target = ResponseItem>,
     {
+        self.record_items_with_provenance(items, HistoryItemProvenance::Other, policy);
+    }
+
+    pub(crate) fn record_direct_user_source_items<I>(&mut self, items: I, policy: TruncationPolicy)
+    where
+        I: IntoIterator,
+        I::Item: std::ops::Deref<Target = ResponseItem>,
+    {
+        self.record_items_with_provenance(items, HistoryItemProvenance::DirectUserSource, policy);
+    }
+
+    fn record_items_with_provenance<I>(
+        &mut self,
+        items: I,
+        provenance: HistoryItemProvenance,
+        policy: TruncationPolicy,
+    ) where
+        I: IntoIterator,
+        I::Item: std::ops::Deref<Target = ResponseItem>,
+    {
         for item in items {
             let item_ref = item.deref();
             if !is_api_message(item_ref) {
@@ -135,7 +169,15 @@ impl ContextManager {
             }
 
             let processed = process_item_for_policy(item_ref, policy);
+            let item_provenance = if provenance == HistoryItemProvenance::DirectUserSource
+                && !matches!(&processed, ResponseItem::Message { role, .. } if role == "user")
+            {
+                HistoryItemProvenance::Other
+            } else {
+                provenance
+            };
             self.items.push(processed);
+            self.item_provenance.push(item_provenance);
         }
     }
 
@@ -148,9 +190,24 @@ impl ContextManager {
         self.items
     }
 
+    pub(crate) fn for_exact_tail_prompt(
+        mut self,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItem> {
+        self.normalize_history_with_error_mode(
+            input_modalities,
+            normalize::NormalizationErrorMode::Suppress,
+        );
+        self.items
+    }
+
     /// Returns raw items in the history.
     pub(crate) fn raw_items(&self) -> &[ResponseItem] {
         &self.items
+    }
+
+    pub(crate) fn item_provenance(&self) -> &[HistoryItemProvenance] {
+        &self.item_provenance
     }
 
     /// Returns raw items in the history and consumes the snapshot.
@@ -190,18 +247,46 @@ impl ContextManager {
             // Remove the oldest item (front of the list). Items are ordered from
             // oldest → newest, so index 0 is the first entry recorded.
             let removed = self.items.remove(0);
+            self.item_provenance.remove(0);
             // If the removed item participates in a call/output pair, also remove
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
-            normalize::remove_corresponding_for(&mut self.items, &removed);
+            if let Some(index) = normalize::remove_corresponding_for(&mut self.items, &removed) {
+                self.item_provenance.remove(index);
+            }
             self.world_state_baseline = None;
         }
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
+        let item_provenance = vec![HistoryItemProvenance::Other; items.len()];
+        self.replace_with_provenance(items, item_provenance);
+    }
+
+    pub(crate) fn replace_with_provenance(
+        &mut self,
+        items: Vec<ResponseItem>,
+        item_provenance: Vec<HistoryItemProvenance>,
+    ) {
+        assert_eq!(items.len(), item_provenance.len());
         self.items = items;
+        self.item_provenance = item_provenance;
         self.history_version = self.history_version.saturating_add(1);
         self.world_state_baseline = None;
+    }
+
+    pub(crate) fn mark_direct_user_source(&mut self, index: usize) -> bool {
+        if !matches!(
+            self.items.get(index),
+            Some(ResponseItem::Message { role, .. }) if role == "user"
+        ) {
+            return false;
+        }
+        let Some(provenance) = self.item_provenance.get_mut(index) else {
+            return false;
+        };
+        *provenance = HistoryItemProvenance::DirectUserSource;
+        true
     }
 
     pub(crate) fn normalize_tool_outputs_to_policy(&mut self, policy: TruncationPolicy) -> usize {
@@ -231,9 +316,15 @@ impl ContextManager {
     /// Replace image content in the last turn if it originated from a tool output.
     /// Returns true when a tool image was replaced, false otherwise.
     pub(crate) fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {
-        let Some(index) = self.items.iter().rposition(|item| {
-            matches!(item, ResponseItem::FunctionCallOutput { .. }) || is_user_turn_boundary(item)
-        }) else {
+        let Some(index) =
+            self.items
+                .iter()
+                .zip(&self.item_provenance)
+                .rposition(|(item, provenance)| {
+                    matches!(item, ResponseItem::FunctionCallOutput { .. })
+                        || is_instruction_turn_boundary(item, *provenance)
+                })
+        else {
             return false;
         };
 
@@ -284,9 +375,10 @@ impl ContextManager {
         }
 
         let snapshot = self.items.clone();
-        let user_positions = user_message_positions(&snapshot);
+        let provenance_snapshot = self.item_provenance.clone();
+        let user_positions = instruction_turn_positions(&snapshot, &provenance_snapshot);
         let Some(&first_instruction_turn_idx) = user_positions.first() else {
-            self.replace(snapshot);
+            self.replace_with_provenance(snapshot, provenance_snapshot);
             return;
         };
 
@@ -297,10 +389,17 @@ impl ContextManager {
             user_positions[user_positions.len() - n_from_end]
         };
 
-        cut_idx =
-            self.trim_pre_turn_context_updates(&snapshot, first_instruction_turn_idx, cut_idx);
+        cut_idx = self.trim_pre_turn_context_updates(
+            &snapshot,
+            &provenance_snapshot,
+            first_instruction_turn_idx,
+            cut_idx,
+        );
 
-        self.replace(snapshot[..cut_idx].to_vec());
+        self.replace_with_provenance(
+            snapshot[..cut_idx].to_vec(),
+            provenance_snapshot[..cut_idx].to_vec(),
+        );
     }
 
     pub(crate) fn update_token_info(
@@ -317,7 +416,12 @@ impl ContextManager {
 
     fn get_non_last_reasoning_items_tokens(&self) -> i64 {
         // Get reasoning items excluding all the ones after the last instruction boundary.
-        let Some(last_user_index) = self.items.iter().rposition(is_user_turn_boundary) else {
+        let Some(last_user_index) = self
+            .items
+            .iter()
+            .zip(&self.item_provenance)
+            .rposition(|(item, provenance)| is_instruction_turn_boundary(item, *provenance))
+        else {
             return 0;
         };
 
@@ -382,11 +486,22 @@ impl ContextManager {
     /// 2. every output has a corresponding call entry
     /// 3. when images are unsupported, image content is stripped from messages and tool outputs
     fn normalize_history(&mut self, input_modalities: &[InputModality]) {
+        self.normalize_history_with_error_mode(
+            input_modalities,
+            normalize::NormalizationErrorMode::Report,
+        );
+    }
+
+    fn normalize_history_with_error_mode(
+        &mut self,
+        input_modalities: &[InputModality],
+        error_mode: normalize::NormalizationErrorMode,
+    ) {
         // all function/tool calls must have a corresponding output
-        normalize::ensure_call_outputs_present(&mut self.items);
+        normalize::ensure_call_outputs_present(&mut self.items, error_mode);
 
         // all outputs must have a corresponding function/tool call
-        normalize::remove_orphan_outputs(&mut self.items);
+        normalize::remove_orphan_outputs(&mut self.items, error_mode);
 
         // strip images when model does not support them
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
@@ -412,6 +527,7 @@ impl ContextManager {
     fn trim_pre_turn_context_updates(
         &mut self,
         snapshot: &[ResponseItem],
+        item_provenance: &[HistoryItemProvenance],
         first_instruction_turn_idx: usize,
         mut cut_idx: usize,
     ) -> usize {
@@ -429,7 +545,10 @@ impl ContextManager {
                     cut_idx -= 1;
                 }
                 ResponseItem::Message { role, content, .. }
-                    if role == "user" && is_contextual_user_message_content(content) =>
+                    if role == "user"
+                        && item_provenance[cut_idx - 1]
+                            != HistoryItemProvenance::DirectUserSource
+                        && is_contextual_user_message_content(content) =>
                 {
                     cut_idx -= 1;
                 }
@@ -832,14 +951,27 @@ pub(crate) fn is_user_turn_boundary(item: &ResponseItem) -> bool {
         || (role == "assistant" && is_inter_agent_instruction_content(content))
 }
 
+pub(crate) fn is_instruction_turn_boundary(
+    item: &ResponseItem,
+    provenance: HistoryItemProvenance,
+) -> bool {
+    (provenance == HistoryItemProvenance::DirectUserSource
+        && matches!(item, ResponseItem::Message { role, .. } if role == "user"))
+        || is_user_turn_boundary(item)
+}
+
 fn is_inter_agent_instruction_content(content: &[ContentItem]) -> bool {
     InterAgentCommunication::is_message_content(content)
 }
 
-fn user_message_positions(items: &[ResponseItem]) -> Vec<usize> {
+fn instruction_turn_positions(
+    items: &[ResponseItem],
+    item_provenance: &[HistoryItemProvenance],
+) -> Vec<usize> {
+    assert_eq!(items.len(), item_provenance.len());
     let mut positions = Vec::new();
-    for (idx, item) in items.iter().enumerate() {
-        if is_user_turn_boundary(item) {
+    for (idx, (item, provenance)) in items.iter().zip(item_provenance).enumerate() {
+        if is_instruction_turn_boundary(item, *provenance) {
             positions.push(idx);
         }
     }

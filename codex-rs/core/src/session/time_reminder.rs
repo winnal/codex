@@ -8,7 +8,8 @@ use codex_protocol::models::ResponseItem;
 use super::session::Session;
 use super::turn_context::TurnContext;
 use crate::context::ContextualUserFragment;
-use crate::context_manager::is_user_turn_boundary;
+use crate::context_manager::HistoryItemProvenance;
+use crate::context_manager::is_instruction_turn_boundary;
 
 #[derive(Default)]
 pub(crate) struct CurrentTimeReminderState {
@@ -18,9 +19,13 @@ pub(crate) struct CurrentTimeReminderState {
 }
 
 impl CurrentTimeReminderState {
-    pub(super) fn note_recorded_items(&mut self, items: &[ResponseItem]) {
+    pub(super) fn note_recorded_items(
+        &mut self,
+        items: &[ResponseItem],
+        provenance: HistoryItemProvenance,
+    ) {
         if items.iter().any(|item| {
-            is_user_turn_boundary(item)
+            is_instruction_turn_boundary(item, provenance)
                 || matches!(
                     item,
                     ResponseItem::FunctionCallOutput { .. }
@@ -104,3 +109,7 @@ pub(super) async fn maybe_record_current_time_reminder(
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "time_reminder_tests.rs"]
+mod tests;

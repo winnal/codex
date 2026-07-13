@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
+use crate::context_manager::HistoryItemProvenance;
 use crate::init_state_db;
 use crate::thread_manager::StartThreadOptions;
 use assert_matches::assert_matches;
@@ -1162,18 +1163,18 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     let replacement_history = vec![
         ResponseItem::Message {
             id: None,
-            role: "user".to_string(),
+            role: "developer".to_string(),
             content: vec![ContentItem::InputText {
-                text: "compacted parent summary".to_string(),
+                text: "Parent root guidance.".to_string(),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
         ResponseItem::Message {
             id: None,
-            role: "developer".to_string(),
+            role: "user".to_string(),
             content: vec![ContentItem::InputText {
-                text: "Parent root guidance.".to_string(),
+                text: "compacted parent summary".to_string(),
             }],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
@@ -1186,6 +1187,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(replacement_history),
+                replacement_history_direct_user_source_indices: Some(vec![1]),
                 window_number: None,
                 first_window_id: None,
                 previous_window_id: None,
@@ -1238,6 +1240,25 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     assert!(
         history_contains_text(history.raw_items(), "compacted parent summary"),
         "forked child history should retain compacted non-hint content"
+    );
+    let summary_index = history
+        .raw_items()
+        .iter()
+        .position(|item| {
+            matches!(
+                item,
+                ResponseItem::Message { content, .. }
+                    if content.iter().any(|item| matches!(
+                        item,
+                        ContentItem::InputText { text } | ContentItem::OutputText { text }
+                            if text.contains("compacted parent summary")
+                    ))
+            )
+        })
+        .expect("compacted source should remain in child history");
+    assert_eq!(
+        history.item_provenance()[summary_index],
+        HistoryItemProvenance::DirectUserSource
     );
     assert!(
         !history_contains_text(history.raw_items(), "Parent root guidance."),

@@ -369,6 +369,25 @@ fn non_last_reasoning_tokens_ignore_entries_after_last_user() {
 }
 
 #[test]
+fn non_last_reasoning_tokens_use_context_shaped_direct_source_as_boundary() {
+    let mut history = ContextManager::new();
+    history.replace_with_provenance(
+        vec![
+            reasoning_with_encrypted_content(/*len*/ 1_000),
+            user_input_text_msg("<environment_context>literal source</environment_context>"),
+            reasoning_with_encrypted_content(/*len*/ 2_000),
+        ],
+        vec![
+            HistoryItemProvenance::Other,
+            HistoryItemProvenance::DirectUserSource,
+            HistoryItemProvenance::Other,
+        ],
+    );
+
+    assert_eq!(history.get_non_last_reasoning_items_tokens(), 25);
+}
+
+#[test]
 fn items_after_last_model_generated_tokens_include_user_and_tool_output() {
     let history = create_history_with_items(vec![
         assistant_msg("already counted by API"),
@@ -856,6 +875,37 @@ fn replace_last_turn_images_does_not_touch_user_images() {
 }
 
 #[test]
+fn replace_last_turn_images_stops_at_context_shaped_direct_source() {
+    let tool_output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call-1".to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+            ]),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let direct = user_input_text_msg("<environment_context>literal source</environment_context>");
+    let expected = vec![tool_output, direct];
+    let mut history = ContextManager::new();
+    history.replace_with_provenance(
+        expected.clone(),
+        vec![
+            HistoryItemProvenance::Other,
+            HistoryItemProvenance::DirectUserSource,
+        ],
+    );
+
+    assert!(!history.replace_last_turn_images("Invalid image"));
+    assert_eq!(history.raw_items(), expected);
+}
+
+#[test]
 fn remove_first_item_handles_local_shell_pair() {
     let items = vec![
         ResponseItem::LocalShellCall {
@@ -917,6 +967,47 @@ fn drop_last_n_user_turns_preserves_prefix() {
         history.for_prompt(&modalities),
         vec![assistant_msg("session prefix item")]
     );
+}
+
+#[test]
+fn drop_last_n_user_turns_uses_direct_source_provenance_for_boundaries() {
+    let prefix = assistant_msg("session prefix item");
+    let older_direct =
+        user_input_text_msg("<environment_context>literal user text</environment_context>");
+    let older_answer = assistant_msg("older answer");
+    let retained = vec![prefix.clone(), older_direct, older_answer];
+    let newest_user = user_msg("newest user");
+    let newest_answer = assistant_msg("newest answer");
+    let mut history = ContextManager::new();
+    let mut source = retained.clone();
+    source.extend([newest_user, newest_answer]);
+    history.replace_with_provenance(
+        source,
+        vec![
+            HistoryItemProvenance::Other,
+            HistoryItemProvenance::DirectUserSource,
+            HistoryItemProvenance::Other,
+            HistoryItemProvenance::DirectUserSource,
+            HistoryItemProvenance::Other,
+        ],
+    );
+
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    assert_eq!(history.raw_items(), retained);
+    assert_eq!(
+        history.item_provenance(),
+        &[
+            HistoryItemProvenance::Other,
+            HistoryItemProvenance::DirectUserSource,
+            HistoryItemProvenance::Other,
+        ]
+    );
+
+    history.drop_last_n_user_turns(/*num_turns*/ 1);
+
+    assert_eq!(history.raw_items(), std::slice::from_ref(&prefix));
+    assert_eq!(history.item_provenance(), &[HistoryItemProvenance::Other]);
 }
 
 #[test]

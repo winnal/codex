@@ -6,6 +6,7 @@ use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::compact_exact_tail::CompactionHistoryPolicy;
 use crate::compact_exact_tail::EXACT_TAIL_LOCAL_RETAINED_COLD_USER_MESSAGE_BUDGET_TOKENS;
+use crate::compact_exact_tail::ExactTailCompactInputExpectation;
 use crate::compact_exact_tail::ExactTailImplementation;
 use crate::compact_exact_tail::ExactTailPrepareInput;
 use crate::compact_exact_tail::build_exact_tail_replacement;
@@ -14,7 +15,6 @@ use crate::compact_exact_tail::emit_exact_tail_compaction_diagnostic;
 use crate::compact_exact_tail::emit_exact_tail_prepare_failure_diagnostic;
 use crate::compact_exact_tail::ensure_non_empty_local_summary;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
-use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::local_summary_scaffold_overhead_tokens;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::pending_exact_tail_tool_surface_hint;
@@ -23,6 +23,7 @@ pub(crate) use crate::compact_route::CompactRoute;
 pub(crate) use crate::compact_route::compact_route;
 use crate::config::Config;
 use crate::context::world_state::WorldState;
+use crate::context_manager::HistoryItemProvenance;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -315,10 +316,12 @@ async fn run_compact_task_inner_impl(
         turn_context.model_info.truncation_policy.into(),
     );
     let source_history_items = source_history.raw_items().to_vec();
+    let source_history_item_provenance = source_history.item_provenance().to_vec();
     let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
         sess: &sess,
         turn_context: &turn_context,
         history_items: &source_history_items,
+        history_item_provenance: &source_history_item_provenance,
         base_instructions: &base_instructions,
         policy,
         trigger,
@@ -352,15 +355,23 @@ async fn run_compact_task_inner_impl(
     if let Some(prepared) = &exact_tail_plan {
         history.replace(prepared.plan.cold_history.clone());
     }
+    let compaction_prompt_item: ResponseItem = initial_input_for_turn.into();
     history.record_items(
-        &[initial_input_for_turn.into()],
+        std::slice::from_ref(&compaction_prompt_item),
         turn_context.model_info.truncation_policy.into(),
     );
-    if let Some(prepared) = &exact_tail_plan {
+    let exact_tail_turn_input = if let Some(prepared) = &exact_tail_plan {
+        let turn_input = history
+            .clone()
+            .for_exact_tail_prompt(&turn_context.model_info.input_modalities);
         if let Err(error) = check_cold_input_fits(
             &prepared.plan,
-            history.raw_items(),
-            turn_context.model_context_window(),
+            &turn_input,
+            ExactTailCompactInputExpectation::Source {
+                derived_items: std::slice::from_ref(&compaction_prompt_item),
+            },
+            prepared.model_context_window,
+            &base_instructions,
         ) {
             let failure_reason = error.reason;
             emit_exact_tail_compaction_diagnostic(
@@ -377,26 +388,10 @@ async fn run_compact_task_inner_impl(
             send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
             return Err(error);
         }
-        if let Some(context_window) = turn_context.model_context_window()
-            && let Some(request_tokens) =
-                history.estimate_token_count_with_base_instructions(&base_instructions)
-            && request_tokens > context_window
-        {
-            let error = exact_tail_cold_input_too_large_error(request_tokens, context_window);
-            emit_exact_tail_compaction_diagnostic(
-                sess.as_ref(),
-                turn_context.as_ref(),
-                &compaction_id,
-                trigger,
-                &prepared.plan,
-                None,
-                Some(super::compact_exact_tail::ExactTailFailReason::ColdInputTooLarge),
-            )
-            .await;
-            send_local_compaction_error(&sess, turn_context.as_ref(), &error).await;
-            return Err(error);
-        }
-    }
+        Some(turn_input)
+    } else {
+        None
+    };
 
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
@@ -411,9 +406,11 @@ async fn run_compact_task_inner_impl(
 
     let compaction_output = loop {
         // Clone is required because of the loop
-        let turn_input = history
-            .clone()
-            .for_prompt(&turn_context.model_info.input_modalities);
+        let turn_input = exact_tail_turn_input.clone().unwrap_or_else(|| {
+            history
+                .clone()
+                .for_prompt(&turn_context.model_info.input_modalities)
+        });
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
@@ -549,6 +546,7 @@ async fn run_compact_task_inner_impl(
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
     }
     let mut exact_tail_tool_surface_hint = None;
+    let mut exact_tail_item_provenance = None;
     if let Some(prepared) = &exact_tail_plan {
         match build_exact_tail_replacement(
             prepared,
@@ -572,6 +570,7 @@ async fn run_compact_task_inner_impl(
                     &replacement,
                     prepared.plan.diagnostics.implementation,
                 ));
+                exact_tail_item_provenance = Some(replacement.item_provenance);
                 new_history = replacement.replacement_history;
             }
             Err(error) => {
@@ -624,14 +623,18 @@ async fn run_compact_task_inner_impl(
     let compacted_item = CompactedItem {
         message: summary_text.clone(),
         replacement_history: Some(new_history.clone()),
+        replacement_history_direct_user_source_indices: None,
         window_number: Some(window_number),
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
         window_id: Some(window_ids.window_id.to_string()),
     };
+    let item_provenance = exact_tail_item_provenance
+        .unwrap_or_else(|| vec![HistoryItemProvenance::Other; new_history.len()]);
     sess.replace_compacted_history(
         turn_context.as_ref(),
         new_history,
+        item_provenance,
         reference_context_item,
         world_state_baseline,
         compacted_item,
@@ -780,26 +783,60 @@ pub(crate) struct CompactedUserMessage {
 pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUserMessage> {
     items
         .iter()
-        .filter_map(|item| match crate::event_mapping::parse_turn_item(item) {
+        .filter_map(|item| compacted_user_message(item, HistoryItemProvenance::Other))
+        .collect()
+}
+
+pub(crate) fn collect_user_messages_with_provenance(
+    items: &[ResponseItem],
+    item_provenance: &[HistoryItemProvenance],
+) -> Vec<CompactedUserMessage> {
+    assert_eq!(items.len(), item_provenance.len());
+    items
+        .iter()
+        .zip(item_provenance)
+        .filter_map(|(item, provenance)| compacted_user_message(item, *provenance))
+        .collect()
+}
+
+fn compacted_user_message(
+    item: &ResponseItem,
+    provenance: HistoryItemProvenance,
+) -> Option<CompactedUserMessage> {
+    let message = match provenance {
+        HistoryItemProvenance::DirectUserSource => match item {
+            ResponseItem::Message { role, content, .. } if role == "user" => content
+                .iter()
+                .filter_map(|item| match item {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        Some(text.as_str())
+                    }
+                    ContentItem::InputImage { .. } => None,
+                })
+                .collect::<String>(),
+            _ => return None,
+        },
+        HistoryItemProvenance::Other => match crate::event_mapping::parse_turn_item(item) {
             Some(TurnItem::UserMessage(user)) => {
                 if is_summary_message(&user.message()) {
-                    None
+                    return None;
                 } else {
-                    Some(CompactedUserMessage {
-                        message: user.message(),
-                        internal_chat_message_metadata_passthrough: match item {
-                            ResponseItem::Message {
-                                internal_chat_message_metadata_passthrough,
-                                ..
-                            } => internal_chat_message_metadata_passthrough.clone(),
-                            _ => None,
-                        },
-                    })
+                    user.message()
                 }
             }
+            _ => return None,
+        },
+    };
+    Some(CompactedUserMessage {
+        message,
+        internal_chat_message_metadata_passthrough: match item {
+            ResponseItem::Message {
+                internal_chat_message_metadata_passthrough,
+                ..
+            } => internal_chat_message_metadata_passthrough.clone(),
             _ => None,
-        })
-        .collect()
+        },
+    })
 }
 
 pub(crate) fn is_summary_message(message: &str) -> bool {

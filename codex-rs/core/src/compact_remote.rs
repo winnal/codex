@@ -14,6 +14,7 @@ use crate::compact_exact_tail::pending_exact_tail_tool_surface_hint;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
+use crate::context_manager::HistoryItemProvenance;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -267,6 +268,7 @@ async fn run_remote_compact_task_inner_impl(
         exact_tail_plan,
     } = attempt;
     let mut exact_tail_tool_surface_hint = None;
+    let mut exact_tail_item_provenance = None;
     let (new_history, world_state_baseline) = if let Some(prepared) = &exact_tail_plan {
         new_history.retain(should_keep_compacted_history_item);
         if let Err(error) = ensure_replacement_has_cold_summary(&prepared.plan, &new_history) {
@@ -325,6 +327,7 @@ async fn run_remote_compact_task_inner_impl(
             }
             InitialContextInjection::DoNotInject => None,
         };
+        exact_tail_item_provenance = Some(replacement.item_provenance);
         (replacement.replacement_history, world_state_baseline)
     } else {
         process_compacted_history(
@@ -335,6 +338,8 @@ async fn run_remote_compact_task_inner_impl(
         )
         .await
     };
+    let item_provenance = exact_tail_item_provenance
+        .unwrap_or_else(|| vec![HistoryItemProvenance::Other; new_history.len()]);
 
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let reference_context_item = match initial_context_injection {
@@ -346,6 +351,7 @@ async fn run_remote_compact_task_inner_impl(
     let compacted_item = CompactedItem {
         message: String::new(),
         replacement_history: Some(new_history.clone()),
+        replacement_history_direct_user_source_indices: None,
         window_number: Some(new_window_number),
         first_window_id: Some(new_window_ids.first_window_id.to_string()),
         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
@@ -361,6 +367,7 @@ async fn run_remote_compact_task_inner_impl(
     sess.replace_compacted_history(
         compaction_turn_context.as_ref(),
         new_history,
+        item_provenance,
         reference_context_item,
         world_state_baseline,
         compacted_item,

@@ -364,17 +364,8 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
             "type": "compacted",
             "payload": {
                 "message": "summary",
+                "replacement_history_direct_user_source_indices": [1],
                 "replacement_history": [
-                    {
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": "kept",
-                            }
-                        ],
-                    },
                     {
                         "type": "ghost_snapshot",
                         "ghost_commit": {
@@ -382,6 +373,16 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
                             "preexisting_untracked_dirs": [],
                             "preexisting_untracked_files": [],
                         },
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "kept",
+                            }
+                        ],
                     }
                 ],
             },
@@ -406,6 +407,10 @@ async fn load_rollout_items_filters_legacy_ghost_snapshots_from_compaction_histo
         &replacement_history[0],
         ResponseItem::Message { .. }
     ));
+    assert_eq!(
+        compacted.replacement_history_direct_user_source_indices,
+        Some(Vec::new())
+    );
 
     Ok(())
 }

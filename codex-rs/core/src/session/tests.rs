@@ -488,6 +488,7 @@ async fn resumed_exact_tail_compaction_reconstructs_tool_surface_hint() -> anyho
                 RolloutItem::Compacted(CompactedItem {
                     message: String::new(),
                     replacement_history: Some(replacement_history.clone()),
+                    replacement_history_direct_user_source_indices: None,
                     window_number: None,
                     first_window_id: None,
                     previous_window_id: None,
@@ -557,6 +558,7 @@ async fn resumed_exact_tail_compaction_recovers_tool_surface_hint_without_compac
                     RolloutItem::Compacted(CompactedItem {
                         message: String::new(),
                         replacement_history: Some(replacement_history),
+                        replacement_history_direct_user_source_indices: None,
                         window_number: None,
                         first_window_id: None,
                         previous_window_id: None,
@@ -613,6 +615,7 @@ async fn resumed_exact_tail_compaction_reconstructs_active_tool_surface_hint_aft
                         replacement_history: Some(exact_tail_resume_replacement_history(
                             "diagnosed_active_tool",
                         )),
+                        replacement_history_direct_user_source_indices: None,
                         window_number: None,
                         first_window_id: None,
                         previous_window_id: None,
@@ -654,6 +657,7 @@ async fn resumed_exact_tail_compaction_uses_newest_active_tool_surface_hint() ->
                     replacement_history: Some(exact_tail_resume_replacement_history(
                         "diagnosed_active_tool",
                     )),
+                    replacement_history_direct_user_source_indices: None,
                     window_number: None,
                     first_window_id: None,
                     previous_window_id: None,
@@ -673,6 +677,7 @@ async fn resumed_exact_tail_compaction_uses_newest_active_tool_surface_hint() ->
                     replacement_history: Some(exact_tail_resume_replacement_history(
                         "newer_active_tool",
                     )),
+                    replacement_history_direct_user_source_indices: None,
                     window_number: None,
                     first_window_id: None,
                     previous_window_id: None,
@@ -2339,6 +2344,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
     let rollout_items = vec![RolloutItem::Compacted(CompactedItem {
         message: String::new(),
         replacement_history: Some(replacement_history.clone()),
+        replacement_history_direct_user_source_indices: None,
         window_number: Some(42),
         first_window_id: Some(first_window_id.to_string()),
         previous_window_id: Some(previous_window_id.to_string()),
@@ -2429,6 +2435,67 @@ async fn record_response_item_and_emit_turn_item_emits_hook_prompt_lifecycle() {
     ));
 
     assert!(rx.try_recv().is_err(), "no extra events expected");
+}
+
+#[tokio::test]
+async fn direct_user_prompt_persists_atomic_source_before_compatibility_item() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let rollout_path = attach_thread_persistence(&mut session).await;
+
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn_context,
+            &[UserInput::Text {
+                text: "<environment_context>literal direct source</environment_context>"
+                    .to_string(),
+                text_elements: Vec::new(),
+            }],
+            /*client_id*/ None,
+        )
+        .await;
+    session.flush_rollout().await.expect("rollout should flush");
+
+    let InitialHistory::Resumed(resumed) = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read rollout history")
+    else {
+        panic!("expected resumed rollout history");
+    };
+    let raw_positions = resumed
+        .history
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            matches!(item, RolloutItem::EventMsg(EventMsg::RawResponseItem(_))).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(raw_positions.len(), 1);
+    let raw_index = raw_positions[0];
+    let RolloutItem::EventMsg(EventMsg::RawResponseItem(raw)) = &resumed.history[raw_index] else {
+        unreachable!();
+    };
+    assert_eq!(
+        resumed
+            .history
+            .get(raw_index + 1)
+            .and_then(|item| match item {
+                RolloutItem::ResponseItem(item) => Some(item),
+                _ => None,
+            }),
+        Some(&raw.item)
+    );
+    assert!(resumed.history[raw_index + 2..].iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::EventMsg(
+                EventMsg::UserMessage(_)
+                    | EventMsg::ItemCompleted(ItemCompletedEvent {
+                        item: TurnItem::UserMessage(_),
+                        ..
+                    })
+            )
+        )
+    }));
 }
 
 #[tokio::test]
@@ -4088,6 +4155,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
         RolloutItem::Compacted(CompactedItem {
             message: "summary after compaction".to_string(),
             replacement_history: Some(compacted_history.clone()),
+            replacement_history_direct_user_source_indices: None,
             window_number: Some(7),
             first_window_id: Some(first_window_id.to_string()),
             previous_window_id: Some(previous_window_id.to_string()),
@@ -11315,6 +11383,7 @@ async fn sample_rollout(
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary1.to_string(),
         replacement_history: None,
+        replacement_history_direct_user_source_indices: None,
         window_number: Some(window_number),
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
@@ -11362,6 +11431,7 @@ async fn sample_rollout(
     rollout_items.push(RolloutItem::Compacted(CompactedItem {
         message: summary2.to_string(),
         replacement_history: None,
+        replacement_history_direct_user_source_indices: None,
         window_number: Some(window_number),
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),

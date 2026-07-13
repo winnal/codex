@@ -542,12 +542,65 @@ impl AgentControl {
             if let RolloutItem::Compacted(compacted) = item
                 && let Some(replacement_history) = compacted.replacement_history.as_mut()
             {
-                replacement_history.retain(|response_item| {
-                    !is_multi_agent_v2_usage_hint_message(
-                        response_item,
+                let had_provenance = compacted
+                    .replacement_history_direct_user_source_indices
+                    .is_some();
+                let mut direct_source = vec![false; replacement_history.len()];
+                let mut previous_index = None;
+                let indices_valid = compacted
+                    .replacement_history_direct_user_source_indices
+                    .take()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .all(|index| {
+                        if previous_index.is_some_and(|previous| previous >= index) {
+                            return false;
+                        }
+                        previous_index = Some(index);
+                        let Ok(index) = usize::try_from(index) else {
+                            return false;
+                        };
+                        let Some(item) = replacement_history.get(index) else {
+                            return false;
+                        };
+                        if direct_source[index]
+                            || !matches!(item, ResponseItem::Message { role, .. } if role == "user")
+                        {
+                            return false;
+                        }
+                        direct_source[index] = true;
+                        true
+                    });
+                if !indices_valid {
+                    direct_source.fill(false);
+                }
+                let mut filtered_indices_valid = indices_valid;
+                let mut filtered_history = Vec::with_capacity(replacement_history.len());
+                let mut filtered_direct_indices = Vec::new();
+                for (old_index, response_item) in
+                    std::mem::take(replacement_history).into_iter().enumerate()
+                {
+                    if is_multi_agent_v2_usage_hint_message(
+                        &response_item,
                         &multi_agent_v2_usage_hint_texts_to_filter,
-                    )
-                });
+                    ) {
+                        continue;
+                    }
+                    if direct_source[old_index] {
+                        if let Ok(index) = u32::try_from(filtered_history.len()) {
+                            filtered_direct_indices.push(index);
+                        } else {
+                            filtered_indices_valid = false;
+                        }
+                    }
+                    filtered_history.push(response_item);
+                }
+                if !filtered_indices_valid {
+                    filtered_direct_indices.clear();
+                }
+                *replacement_history = filtered_history;
+                compacted.replacement_history_direct_user_source_indices =
+                    had_provenance.then_some(filtered_direct_indices);
             }
         }
         if preserve_reference_context_item

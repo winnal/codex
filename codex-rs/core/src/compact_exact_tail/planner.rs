@@ -1,8 +1,9 @@
 use super::ensure_model_visible_items_within_limit;
 use super::groups::build_groups;
-use crate::compact::collect_user_messages;
+use crate::compact::collect_user_messages_with_provenance;
 use crate::compact::is_summary_message;
 use crate::context::parse_visible_hook_prompt_message;
+use crate::context_manager::HistoryItemProvenance;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::event_mapping::has_non_contextual_dev_message_content;
 use crate::event_mapping::is_contextual_dev_message_content;
@@ -24,10 +25,14 @@ use super::ExactTailFailReason;
 use super::ExactTailItemClass;
 use super::ExactTailPlan;
 use super::ExactTailPlanInput;
+use super::ExactTailValidationOrigin;
 
 const POST_SUMMARY_COLD_RESERVE_DIVISOR: i64 = 10;
 
-pub(crate) fn classify_exact_tail_history_item(item: &ResponseItem) -> ExactTailItemClass {
+pub(crate) fn classify_exact_tail_history_item(
+    item: &ResponseItem,
+    provenance: HistoryItemProvenance,
+) -> ExactTailItemClass {
     match item {
         ResponseItem::Message { role, content, .. } if role == "developer" => {
             if is_contextual_dev_message_content(content) {
@@ -43,7 +48,9 @@ pub(crate) fn classify_exact_tail_history_item(item: &ResponseItem) -> ExactTail
         ResponseItem::Message {
             id, role, content, ..
         } if role == "user" => {
-            if parse_visible_hook_prompt_message(id.as_ref(), content).is_some() {
+            if provenance == HistoryItemProvenance::DirectUserSource
+                || parse_visible_hook_prompt_message(id.as_ref(), content).is_some()
+            {
                 ExactTailItemClass::ConversationOrProtocol
             } else if is_contextual_user_message_content(content) {
                 ExactTailItemClass::StaleContextWrapper
@@ -74,6 +81,7 @@ pub(crate) fn classify_exact_tail_history_item(item: &ResponseItem) -> ExactTail
 
 pub(crate) fn plan_exact_tail(
     input: ExactTailPlanInput<'_>,
+    history_item_provenance: &[HistoryItemProvenance],
 ) -> Result<ExactTailPlan, ExactTailError> {
     let ExactTailPlanInput {
         history_items,
@@ -99,8 +107,15 @@ pub(crate) fn plan_exact_tail(
         retained_cold_user_message_budget_tokens,
     );
 
+    if history_items.len() != history_item_provenance.len() {
+        return Err(ExactTailError::new(
+            ExactTailFailReason::ColdInputMismatch,
+            "exact-tail history provenance does not align with source history",
+        ));
+    }
     let raw_item_count = history_items.len();
-    let (groups, filtered_stale_groups, filtered_context_item_count) = build_groups(history_items);
+    let (groups, filtered_stale_groups, filtered_context_item_count) =
+        build_groups(history_items, history_item_provenance);
     let group_count = groups.len();
 
     if let Some(newest_group) = groups.last()
@@ -144,19 +159,27 @@ pub(crate) fn plan_exact_tail(
     }
 
     let mut cold_history = Vec::new();
+    let mut cold_history_provenance = Vec::new();
     let mut hot_suffix = Vec::new();
+    let mut hot_suffix_provenance = Vec::new();
     let mut cold_covered_groups = Vec::new();
     let mut hot_exact_groups = Vec::new();
 
     for group in groups.iter().take(cold_group_count) {
         cold_covered_groups.push(group.id);
         cold_history.extend(group.items.clone());
+        cold_history_provenance.extend(group.item_provenance.clone());
     }
     for group in groups.iter().skip(cold_group_count) {
         hot_exact_groups.push(group.id);
         hot_suffix.extend(group.items.clone());
+        hot_suffix_provenance.extend(group.item_provenance.clone());
     }
-    ensure_model_visible_items_within_limit(&hot_suffix, max_model_visible_item_tokens)?;
+    ensure_model_visible_items_within_limit(
+        &hot_suffix,
+        max_model_visible_item_tokens,
+        ExactTailValidationOrigin::History(&hot_suffix_provenance),
+    )?;
 
     let cold_tokens = estimate_response_items_token_count(&cold_history);
     let largest_hot_item_tokens = hot_suffix
@@ -165,7 +188,8 @@ pub(crate) fn plan_exact_tail(
         .max()
         .unwrap_or(0);
     let tool_surface_hint = derive_exact_tail_tool_surface_hint(&hot_suffix);
-    let cold_user_messages = collect_user_messages(&cold_history);
+    let cold_user_messages =
+        collect_user_messages_with_provenance(&cold_history, &cold_history_provenance);
     let coverage = ExactTailCoverage {
         cold_covered_groups,
         hot_exact_groups,
@@ -217,7 +241,9 @@ pub(crate) fn plan_exact_tail(
     trace_plan(&diagnostics);
     Ok(ExactTailPlan {
         cold_history,
+        cold_history_provenance,
         hot_suffix,
+        hot_suffix_provenance,
         cold_user_messages,
         diagnostics,
         coverage,
@@ -319,13 +345,22 @@ fn post_summary_cold_reserve(groups: &[super::groups::ExactTailGroup]) -> PostSu
 }
 
 fn group_contains_compaction_summary(group: &super::groups::ExactTailGroup) -> bool {
-    group.items.iter().any(response_item_is_compaction_summary)
+    group
+        .items
+        .iter()
+        .zip(&group.item_provenance)
+        .any(|(item, provenance)| response_item_is_compaction_summary(item, *provenance))
 }
 
-fn response_item_is_compaction_summary(item: &ResponseItem) -> bool {
+fn response_item_is_compaction_summary(
+    item: &ResponseItem,
+    provenance: HistoryItemProvenance,
+) -> bool {
     match item {
         ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. } => true,
-        ResponseItem::Message { role, content, .. } if role == "user" => {
+        ResponseItem::Message { role, content, .. }
+            if role == "user" && provenance != HistoryItemProvenance::DirectUserSource =>
+        {
             content.iter().any(content_item_is_summary_text)
         }
         _ => false,
@@ -366,23 +401,18 @@ pub(crate) fn exact_tail_budget_reservation(
 }
 
 pub(crate) fn exact_tail_replacement_budget(
-    model_context_window: Option<i64>,
+    model_context_window: i64,
     model_auto_compact_token_limit: Option<i64>,
     model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope,
     trigger: CompactionTrigger,
-) -> Option<i64> {
+) -> i64 {
     match trigger {
         CompactionTrigger::Auto => match model_auto_compact_token_limit_scope {
-            AutoCompactTokenLimitScope::Total => {
-                match (model_auto_compact_token_limit, model_context_window) {
-                    (Some(limit), Some(window)) => Some(limit.min(window)),
-                    (Some(limit), None) => Some(limit),
-                    (None, window) => window,
-                }
-            }
-            AutoCompactTokenLimitScope::BodyAfterPrefix => {
-                model_context_window.or(model_auto_compact_token_limit)
-            }
+            AutoCompactTokenLimitScope::Total => model_auto_compact_token_limit
+                .map_or(model_context_window, |limit| {
+                    limit.min(model_context_window)
+                }),
+            AutoCompactTokenLimitScope::BodyAfterPrefix => model_context_window,
         },
         CompactionTrigger::Manual => model_context_window,
     }

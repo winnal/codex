@@ -444,6 +444,33 @@ fn fork_turn_positions_ignore_zero_turn_rollback_markers() {
 }
 
 #[test]
+fn durable_direct_source_is_one_boundary_and_is_excluded_from_a_before_user_fork() {
+    let source = user_msg("<environment_context>literal direct source</environment_context>");
+    let raw = RolloutItem::EventMsg(EventMsg::RawResponseItem(
+        codex_protocol::protocol::RawResponseItemEvent {
+            item: source.clone(),
+        },
+    ));
+    let rollout = vec![
+        RolloutItem::ResponseItem(assistant_msg("prefix")),
+        raw.clone(),
+        raw,
+        RolloutItem::ResponseItem(source),
+        RolloutItem::ResponseItem(assistant_msg("answer")),
+    ];
+
+    assert_eq!(user_message_positions_in_rollout(&rollout), vec![1]);
+    assert_eq!(fork_turn_positions_in_rollout(&rollout), vec![1]);
+    assert_eq!(
+        serde_json::to_value(truncate_rollout_before_nth_user_message_from_start(
+            &rollout, 0,
+        ))
+        .unwrap(),
+        serde_json::to_value(&rollout[..1]).unwrap()
+    );
+}
+
+#[test]
 fn truncates_rollout_to_last_n_fork_turns_discards_trigger_boundaries_in_rolled_back_suffix() {
     let rollout = vec![
         RolloutItem::ResponseItem(user_msg("u1")),

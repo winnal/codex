@@ -6,6 +6,7 @@ use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact_exact_tail::CompactionHistoryPolicy;
+use crate::compact_exact_tail::ExactTailCompactInputExpectation;
 use crate::compact_exact_tail::ExactTailFailReason;
 use crate::compact_exact_tail::ExactTailImplementation;
 use crate::compact_exact_tail::ExactTailPrepareInput;
@@ -14,7 +15,6 @@ use crate::compact_exact_tail::check_cold_input_fits;
 use crate::compact_exact_tail::emit_exact_tail_compaction_diagnostic;
 use crate::compact_exact_tail::emit_exact_tail_prepare_failure_diagnostic;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
-use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::compact_remote_v2::RemoteCompactionV2Output;
@@ -65,6 +65,7 @@ pub(super) async fn run_semantic_transcript_attempt(
         turn_context.model_info.truncation_policy.into(),
     );
     let source_history_items = source_history.raw_items().to_vec();
+    let source_history_item_provenance = source_history.item_provenance().to_vec();
     let implementation = ExactTailImplementation::SemanticTranscript;
     let retained_budget = turn_context
         .config
@@ -73,6 +74,7 @@ pub(super) async fn run_semantic_transcript_attempt(
         sess,
         turn_context,
         history_items: &source_history_items,
+        history_item_provenance: &source_history_item_provenance,
         base_instructions: &base_instructions,
         policy,
         trigger,
@@ -159,10 +161,20 @@ pub(super) async fn run_semantic_transcript_attempt(
 
     let mut history = ContextManager::new();
     history.replace(transcript.items);
+    let trace_input_history = history.raw_items().to_vec();
+    let compaction_trigger = ResponseItem::CompactionTrigger {};
+    let mut expected_input = trace_input_history.clone();
+    expected_input.push(compaction_trigger.clone());
+    let mut input = history.for_exact_tail_prompt(&turn_context.model_info.input_modalities);
+    input.push(compaction_trigger);
     if let Err(error) = check_cold_input_fits(
         &exact_tail_plan.plan,
-        history.raw_items(),
-        turn_context.model_context_window(),
+        &input,
+        ExactTailCompactInputExpectation::Derived {
+            expected_items: &expected_input,
+        },
+        exact_tail_plan.model_context_window,
+        &base_instructions,
     ) {
         emit_exact_tail_compaction_diagnostic(
             sess.as_ref(),
@@ -176,37 +188,12 @@ pub(super) async fn run_semantic_transcript_attempt(
         .await;
         return Err(error.into_codex_err());
     }
-    if let Some(context_window) = turn_context.model_context_window()
-        && let Some(request_tokens) =
-            history.estimate_token_count_with_base_instructions(&base_instructions)
-        && request_tokens > context_window
-    {
-        emit_exact_tail_compaction_diagnostic(
-            sess.as_ref(),
-            turn_context.as_ref(),
-            compaction_id,
-            trigger,
-            &exact_tail_plan.plan,
-            None,
-            Some(ExactTailFailReason::ColdInputTooLarge),
-        )
-        .await;
-        return Err(exact_tail_cold_input_too_large_error(
-            request_tokens,
-            context_window,
-        ));
-    }
-
-    let trace_input_history = history.raw_items().to_vec();
-    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
     let tool_router = built_tools_without_exact_tail_tool_surface_hint(
         sess.as_ref(),
         step_context.as_ref(),
         &CancellationToken::new(),
     )
     .await?;
-    let mut input = prompt_input;
-    input.push(ResponseItem::CompactionTrigger {});
     let prompt = Prompt {
         input,
         tools: tool_router.model_visible_specs(),

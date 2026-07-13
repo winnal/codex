@@ -15,6 +15,9 @@ use crate::compact_exact_tail::pending_exact_tail_tool_surface_hint;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_remote::process_compacted_history;
 use crate::compact_remote::should_keep_compacted_history_item;
+use crate::compact_remote_v2_retention::REMOTE_COMPACTION_V2_RETAINED_MESSAGE_TOKEN_BUDGET;
+use crate::compact_remote_v2_retention::retained_messages_for_remote_compaction_v2_with_item_cap;
+use crate::context_manager::HistoryItemProvenance;
 use crate::context_manager::estimate_response_items_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
@@ -309,10 +312,22 @@ async fn run_remote_compact_task_inner_impl(
         .await;
         return Err(error.into_codex_err());
     }
-    let (compacted_history, retained_images) =
-        build_v2_compacted_history(&prompt_input, compaction_output);
+    let (compacted_history, retained_images) = if let Some(prepared) = &exact_tail_plan {
+        let (mut retained, retained_images) =
+            retained_messages_for_remote_compaction_v2_with_item_cap(
+                &prompt_input,
+                REMOTE_COMPACTION_V2_RETAINED_MESSAGE_TOKEN_BUDGET,
+                usize::try_from(prepared.plan.diagnostics.max_model_visible_item_tokens)
+                    .unwrap_or(usize::MAX),
+            );
+        retained.push(compaction_output);
+        (retained, retained_images)
+    } else {
+        build_v2_compacted_history(&prompt_input, compaction_output)
+    };
     analytics_details.retained_image_count = Some(retained_images);
     let mut exact_tail_tool_surface_hint = None;
+    let mut exact_tail_item_provenance = None;
     let (new_history, world_state_baseline) = if let Some(prepared) = &exact_tail_plan {
         let replacement = match build_exact_tail_replacement(
             prepared,
@@ -362,6 +377,7 @@ async fn run_remote_compact_task_inner_impl(
             }
             InitialContextInjection::DoNotInject => None,
         };
+        exact_tail_item_provenance = Some(replacement.item_provenance);
         (replacement.replacement_history, world_state_baseline)
     } else {
         process_compacted_history(
@@ -372,6 +388,8 @@ async fn run_remote_compact_task_inner_impl(
         )
         .await
     };
+    let item_provenance = exact_tail_item_provenance
+        .unwrap_or_else(|| vec![HistoryItemProvenance::Other; new_history.len()]);
 
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let reference_context_item = match initial_context_injection {
@@ -383,6 +401,7 @@ async fn run_remote_compact_task_inner_impl(
     let compacted_item = CompactedItem {
         message: String::new(),
         replacement_history: Some(new_history.clone()),
+        replacement_history_direct_user_source_indices: None,
         window_number: Some(new_window_number),
         first_window_id: Some(new_window_ids.first_window_id.to_string()),
         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
@@ -395,6 +414,7 @@ async fn run_remote_compact_task_inner_impl(
     sess.replace_compacted_history(
         compaction_turn_context.as_ref(),
         new_history,
+        item_provenance,
         reference_context_item,
         world_state_baseline,
         compacted_item,

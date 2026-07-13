@@ -7,6 +7,7 @@ use crate::client::CompactConversationRequestSettings;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact_exact_tail::CompactionHistoryPolicy;
+use crate::compact_exact_tail::ExactTailCompactInputExpectation;
 use crate::compact_exact_tail::ExactTailImplementation;
 use crate::compact_exact_tail::ExactTailPrepareInput;
 use crate::compact_exact_tail::PreparedExactTailPlan;
@@ -14,7 +15,6 @@ use crate::compact_exact_tail::check_cold_input_fits;
 use crate::compact_exact_tail::emit_exact_tail_compaction_diagnostic;
 use crate::compact_exact_tail::emit_exact_tail_prepare_failure_diagnostic;
 use crate::compact_exact_tail::exact_tail_backend_context_exceeded_error;
-use crate::compact_exact_tail::exact_tail_cold_input_too_large_error;
 use crate::compact_exact_tail::normalize_tool_outputs_for_exact_tail_policy;
 use crate::compact_exact_tail::prepare_exact_tail_plan;
 use crate::compact_exact_tail::remote_legacy_summary_scaffold_overhead_tokens;
@@ -58,11 +58,13 @@ pub(super) async fn run_remote_compact_attempt(
         turn_context.model_info.truncation_policy.into(),
     );
     let source_history_items = history.raw_items().to_vec();
+    let source_history_item_provenance = history.item_provenance().to_vec();
     let exact_tail_implementation = ExactTailImplementation::RemoteLegacy;
     let exact_tail_plan = match prepare_exact_tail_plan(ExactTailPrepareInput {
         sess,
         turn_context,
         history_items: &source_history_items,
+        history_item_provenance: &source_history_item_provenance,
         base_instructions: &base_instructions,
         policy,
         trigger: compaction_metadata.trigger(),
@@ -92,43 +94,6 @@ pub(super) async fn run_remote_compact_attempt(
 
     if let Some(prepared) = &exact_tail_plan {
         history.replace(prepared.plan.cold_history.clone());
-        if let Err(error) = check_cold_input_fits(
-            &prepared.plan,
-            history.raw_items(),
-            turn_context.model_context_window(),
-        ) {
-            emit_exact_tail_compaction_diagnostic(
-                sess.as_ref(),
-                turn_context.as_ref(),
-                compaction_id,
-                compaction_metadata.trigger(),
-                &prepared.plan,
-                None,
-                Some(error.reason),
-            )
-            .await;
-            return Err(error.into_codex_err());
-        }
-        if let Some(context_window) = turn_context.model_context_window()
-            && let Some(request_tokens) =
-                history.estimate_token_count_with_base_instructions(&base_instructions)
-            && request_tokens > context_window
-        {
-            emit_exact_tail_compaction_diagnostic(
-                sess.as_ref(),
-                turn_context.as_ref(),
-                compaction_id,
-                compaction_metadata.trigger(),
-                &prepared.plan,
-                None,
-                Some(crate::compact_exact_tail::ExactTailFailReason::ColdInputTooLarge),
-            )
-            .await;
-            return Err(exact_tail_cold_input_too_large_error(
-                request_tokens,
-                context_window,
-            ));
-        }
     } else {
         let (rewritten_outputs, estimated_deleted_tokens) =
             trim_function_call_history_to_fit_context_window(
@@ -156,7 +121,32 @@ pub(super) async fn run_remote_compact_attempt(
         }
     }
     let trace_input_history = history.raw_items().to_vec();
-    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let prompt_input = if exact_tail_plan.is_some() {
+        history.for_exact_tail_prompt(&turn_context.model_info.input_modalities)
+    } else {
+        history.for_prompt(&turn_context.model_info.input_modalities)
+    };
+    if let Some(prepared) = &exact_tail_plan
+        && let Err(error) = check_cold_input_fits(
+            &prepared.plan,
+            &prompt_input,
+            ExactTailCompactInputExpectation::Source { derived_items: &[] },
+            prepared.model_context_window,
+            &base_instructions,
+        )
+    {
+        emit_exact_tail_compaction_diagnostic(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            compaction_id,
+            compaction_metadata.trigger(),
+            &prepared.plan,
+            None,
+            Some(error.reason),
+        )
+        .await;
+        return Err(error.into_codex_err());
+    }
     let tool_router = built_tools_without_exact_tail_tool_surface_hint(
         sess.as_ref(),
         step_context.as_ref(),

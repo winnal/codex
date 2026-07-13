@@ -3404,6 +3404,10 @@ pub struct CompactedItem {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replacement_history: Option<Vec<ResponseItem>>,
+    /// Indices into `replacement_history` whose items are exact direct user source messages.
+    /// `None` means provenance was not recorded; `Some([])` authoritatively means no items qualify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_history_direct_user_source_indices: Option<Vec<u32>>,
     /// Monotonic position of this context window within the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_number: Option<u64>,

@@ -1,7 +1,7 @@
 //! Helpers for truncating rollouts based on "user turn" boundaries.
 //!
-//! In core, "user turns" are detected by scanning `ResponseItem::Message` items and
-//! interpreting them via `event_mapping::parse_turn_item(...)`.
+//! New rollouts carry direct user sources explicitly. Legacy `ResponseItem::Message` entries are
+//! still interpreted through `event_mapping::parse_turn_item(...)`.
 
 use crate::context_manager::is_user_turn_boundary;
 use crate::event_mapping;
@@ -23,6 +23,9 @@ pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &Initia
 fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {
     match item {
         RolloutItem::ResponseItem(item) => is_user_turn_boundary(item),
+        RolloutItem::EventMsg(EventMsg::RawResponseItem(event)) => {
+            is_direct_user_source(&event.item)
+        }
         RolloutItem::InterAgentCommunication(_) => true,
         _ => false,
     }
@@ -30,30 +33,45 @@ fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {
 
 /// Return the indices of user message boundaries in a rollout.
 ///
-/// A user message boundary is a `RolloutItem::ResponseItem(ResponseItem::Message { .. })`
-/// whose parsed turn item is `TurnItem::UserMessage`.
+/// New rollouts use persisted `RawResponseItem` events; legacy response items use content parsing.
 ///
 /// Rollouts can contain `ThreadRolledBack` markers. Those markers indicate that the
 /// last N user turns were removed from the effective thread history; we apply them here so
 /// indexing uses the post-rollback history rather than the raw stream.
 pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize> {
     let mut user_positions = Vec::new();
+    let mut durable_direct_user_source = None;
     for (idx, item) in items.iter().enumerate() {
         match item {
-            RolloutItem::ResponseItem(item @ ResponseItem::Message { .. })
+            RolloutItem::EventMsg(EventMsg::RawResponseItem(event))
+                if is_direct_user_source(&event.item) =>
+            {
+                if durable_direct_user_source
+                    .as_ref()
+                    .is_none_or(|source| source != &event.item)
+                {
+                    user_positions.push(idx);
+                }
+                durable_direct_user_source = Some(event.item.clone());
+            }
+            RolloutItem::ResponseItem(item @ ResponseItem::Message { .. }) => {
+                if durable_direct_user_source.take().as_ref() == Some(item) {
+                    continue;
+                }
                 if matches!(
                     event_mapping::parse_turn_item(item),
                     Some(TurnItem::UserMessage(_))
-                ) =>
-            {
-                user_positions.push(idx);
+                ) {
+                    user_positions.push(idx);
+                }
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                durable_direct_user_source = None;
                 let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
                 let new_len = user_positions.len().saturating_sub(num_turns);
                 user_positions.truncate(new_len);
             }
-            _ => {}
+            _ => durable_direct_user_source = None,
         }
     }
     user_positions
@@ -73,9 +91,25 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
 pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize> {
     let mut rollback_turn_positions = Vec::new();
     let mut fork_turn_positions = Vec::new();
+    let mut durable_direct_user_source = None;
     for (idx, item) in items.iter().enumerate() {
         match item {
+            RolloutItem::EventMsg(EventMsg::RawResponseItem(event))
+                if is_direct_user_source(&event.item) =>
+            {
+                if durable_direct_user_source
+                    .as_ref()
+                    .is_none_or(|source| source != &event.item)
+                {
+                    rollback_turn_positions.push(idx);
+                    fork_turn_positions.push(idx);
+                }
+                durable_direct_user_source = Some(event.item.clone());
+            }
             RolloutItem::ResponseItem(item) => {
+                if durable_direct_user_source.take().as_ref() == Some(item) {
+                    continue;
+                }
                 let has_delivery_metadata = matches!(item, ResponseItem::AgentMessage { .. })
                     && idx.checked_sub(1).is_some_and(|previous_idx| {
                         matches!(
@@ -91,18 +125,21 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
                 }
             }
             RolloutItem::InterAgentCommunication(communication) => {
+                durable_direct_user_source = None;
                 rollback_turn_positions.push(idx);
                 if communication.trigger_turn {
                     fork_turn_positions.push(idx);
                 }
             }
             RolloutItem::InterAgentCommunicationMetadata { trigger_turn } => {
+                durable_direct_user_source = None;
                 rollback_turn_positions.push(idx);
                 if *trigger_turn {
                     fork_turn_positions.push(idx);
                 }
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                durable_direct_user_source = None;
                 let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
                 if num_turns == 0 {
                     continue;
@@ -119,10 +156,14 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
                 rollback_turn_positions.truncate(new_rollback_len);
                 fork_turn_positions.retain(|position| *position < rollback_start_idx);
             }
-            _ => {}
+            _ => durable_direct_user_source = None,
         }
     }
     fork_turn_positions
+}
+
+fn is_direct_user_source(item: &ResponseItem) -> bool {
+    matches!(item, ResponseItem::Message { role, .. } if role == "user")
 }
 
 /// Return a prefix of `items` obtained by cutting strictly before the nth user message.

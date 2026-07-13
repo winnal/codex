@@ -4,15 +4,19 @@ use super::tests::build_world_state_from_turn_context;
 use super::tests::make_session_and_context;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
+use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::WorldStateItem;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -103,6 +107,229 @@ fn completed_user_turn_rollout(
         },
     )));
     rollout_items
+}
+
+#[tokio::test]
+async fn reconstruct_history_validates_compacted_provenance_atomically() {
+    let replacement_history = vec![
+        user_message("<environment_context>literal direct text</environment_context>"),
+        assistant_message("answer"),
+        user_message("derived retained anchor"),
+    ];
+    for (direct_user_source_indices, expected_provenance) in [
+        (
+            Some(vec![0]),
+            vec![
+                HistoryItemProvenance::DirectUserSource,
+                HistoryItemProvenance::Other,
+                HistoryItemProvenance::Other,
+            ],
+        ),
+        (None, vec![HistoryItemProvenance::Other; 3]),
+        (Some(Vec::new()), vec![HistoryItemProvenance::Other; 3]),
+        (Some(vec![1]), vec![HistoryItemProvenance::Other; 3]),
+        (Some(vec![0, 0]), vec![HistoryItemProvenance::Other; 3]),
+        (Some(vec![2, 0]), vec![HistoryItemProvenance::Other; 3]),
+        (Some(vec![9]), vec![HistoryItemProvenance::Other; 3]),
+    ] {
+        let (session, turn_context) = make_session_and_context().await;
+        let rollout_items = vec![RolloutItem::Compacted(CompactedItem {
+            message: String::new(),
+            replacement_history: Some(replacement_history.clone()),
+            replacement_history_direct_user_source_indices: direct_user_source_indices,
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        })];
+
+        let reconstructed = session
+            .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+            .await;
+
+        assert_eq!(reconstructed.history_item_provenance, expected_provenance);
+    }
+}
+
+#[tokio::test]
+async fn reconstruct_history_restores_and_deduplicates_atomic_direct_source() {
+    let response_item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "<image><environment_context>literal source</environment_context>"
+                    .to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: "data:image/png;base64,prepared-image".to_string(),
+                detail: None,
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let raw_source = RolloutItem::EventMsg(EventMsg::RawResponseItem(
+        codex_protocol::protocol::RawResponseItemEvent {
+            item: response_item.clone(),
+        },
+    ));
+    for rollout_items in [
+        vec![raw_source.clone()],
+        vec![
+            raw_source.clone(),
+            raw_source.clone(),
+            RolloutItem::ResponseItem(response_item.clone()),
+        ],
+    ] {
+        let (session, turn_context) = make_session_and_context().await;
+        let reconstructed = session
+            .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+            .await;
+
+        assert_eq!(reconstructed.history, vec![response_item.clone()]);
+        assert_eq!(
+            reconstructed.history_item_provenance,
+            vec![HistoryItemProvenance::DirectUserSource]
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconstruct_history_recovers_pre_carrier_source_only_in_paginated_mode() {
+    for (history_mode, matching_turn, intervening_item, expected_direct_source) in [
+        (ThreadHistoryMode::Paginated, true, false, true),
+        (ThreadHistoryMode::Paginated, false, false, false),
+        (ThreadHistoryMode::Legacy, true, false, false),
+        (ThreadHistoryMode::Legacy, false, false, false),
+        (ThreadHistoryMode::Paginated, true, true, false),
+    ] {
+        let (session, mut turn_context) = make_session_and_context().await;
+        turn_context.history_mode = history_mode;
+        let mut response_item = user_message("prepared pre-carrier source");
+        response_item.set_turn_id_if_missing(&turn_context.sub_id);
+        let marker_turn_id = if matching_turn {
+            turn_context.sub_id.clone()
+        } else {
+            "different-turn".to_string()
+        };
+        let mut rollout_items = vec![RolloutItem::ResponseItem(response_item.clone())];
+        if intervening_item {
+            rollout_items.push(RolloutItem::ResponseItem(assistant_message("intervening")));
+        }
+        rollout_items.push(RolloutItem::EventMsg(EventMsg::ItemCompleted(
+            ItemCompletedEvent {
+                thread_id: session.thread_id,
+                turn_id: marker_turn_id,
+                item: TurnItem::UserMessage(UserMessageItem::new(&[])),
+                completed_at_ms: 0,
+            },
+        )));
+
+        let reconstructed = session
+            .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+            .await;
+
+        let mut expected_history = vec![response_item];
+        if intervening_item {
+            expected_history.push(assistant_message("intervening"));
+        }
+        assert_eq!(reconstructed.history, expected_history);
+        assert_eq!(
+            reconstructed.history_item_provenance,
+            std::iter::once(if expected_direct_source {
+                HistoryItemProvenance::DirectUserSource
+            } else {
+                HistoryItemProvenance::Other
+            })
+            .chain(intervening_item.then_some(HistoryItemProvenance::Other))
+            .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconstruct_history_counts_only_paginated_item_completed_as_user_turn() {
+    for (history_mode, expected_user_turn) in [
+        (ThreadHistoryMode::Paginated, true),
+        (ThreadHistoryMode::Legacy, false),
+    ] {
+        let (session, mut turn_context) = make_session_and_context().await;
+        turn_context.history_mode = history_mode;
+        let mut previous_context_item = turn_context.to_turn_context_item();
+        previous_context_item.model = "previous-rollout-model".to_string();
+        previous_context_item.comp_hash = Some("previous-comp-hash".to_string());
+        let turn_id = previous_context_item
+            .turn_id
+            .clone()
+            .expect("turn context should have turn_id");
+        let expected_settings = PreviousTurnSettings {
+            model: previous_context_item.model.clone(),
+            comp_hash: previous_context_item.comp_hash.clone(),
+            realtime_active: previous_context_item.realtime_active,
+        };
+        let rollout_items = vec![
+            RolloutItem::TurnContext(previous_context_item.clone()),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: session.thread_id,
+                turn_id,
+                item: TurnItem::UserMessage(UserMessageItem::new(&[])),
+                completed_at_ms: 0,
+            })),
+        ];
+
+        let reconstructed = session
+            .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+            .await;
+
+        assert_eq!(
+            reconstructed.previous_turn_settings,
+            expected_user_turn.then_some(expected_settings)
+        );
+        assert_eq!(
+            reconstructed.reference_context_item,
+            expected_user_turn.then_some(previous_context_item)
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconstruct_history_does_not_promote_items_around_a_different_raw_source() {
+    let (session, turn_context) = make_session_and_context().await;
+    let ordinary_before = user_message("ordinary before");
+    let direct = user_message("durable direct source");
+    let ordinary_after = user_message("different ordinary after");
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(ordinary_before.clone()),
+        RolloutItem::EventMsg(EventMsg::RawResponseItem(
+            codex_protocol::protocol::RawResponseItemEvent {
+                item: direct.clone(),
+            },
+        )),
+        RolloutItem::ResponseItem(ordinary_after.clone()),
+        RolloutItem::EventMsg(EventMsg::RawResponseItem(
+            codex_protocol::protocol::RawResponseItemEvent {
+                item: assistant_message("non-user raw item"),
+            },
+        )),
+    ];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed.history,
+        vec![ordinary_before, direct, ordinary_after]
+    );
+    assert_eq!(
+        reconstructed.history_item_provenance,
+        vec![
+            HistoryItemProvenance::Other,
+            HistoryItemProvenance::DirectUserSource,
+            HistoryItemProvenance::Other,
+        ]
+    );
 }
 
 #[tokio::test]
@@ -925,6 +1152,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -985,6 +1213,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1054,6 +1283,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            replacement_history_direct_user_source_indices: None,
             window_number: Some(2),
             first_window_id: Some(compacted_first_window_id.to_string()),
             previous_window_id: Some(compacted_previous_window_id.to_string()),
@@ -1089,6 +1319,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
             RolloutItem::Compacted(CompactedItem {
                 message: String::new(),
                 replacement_history: Some(Vec::new()),
+                replacement_history_direct_user_source_indices: None,
                 window_number: Some(1),
                 first_window_id: None,
                 previous_window_id: None,
@@ -1136,6 +1367,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1163,6 +1395,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1198,6 +1431,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
         RolloutItem::Compacted(CompactedItem {
             message: "legacy summary".to_string(),
             replacement_history: None,
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1297,6 +1531,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1454,6 +1689,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1695,6 +1931,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1864,6 +2101,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
         RolloutItem::Compacted(CompactedItem {
             message: String::new(),
             replacement_history: Some(Vec::new()),
+            replacement_history_direct_user_source_indices: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,

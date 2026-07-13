@@ -14,7 +14,24 @@ const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
 
-pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NormalizationErrorMode {
+    Report,
+    Suppress,
+}
+
+impl NormalizationErrorMode {
+    fn report(self, message: String) {
+        if self == Self::Report {
+            error_or_panic(message);
+        }
+    }
+}
+
+pub(crate) fn ensure_call_outputs_present(
+    items: &mut Vec<ResponseItem>,
+    error_mode: NormalizationErrorMode,
+) {
     let mut function_output_ids = HashSet::new();
     let mut tool_search_output_ids = HashSet::new();
     let mut custom_tool_output_ids = HashSet::new();
@@ -78,7 +95,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
             ResponseItem::CustomToolCall { id, call_id, .. }
                 if !custom_tool_output_ids.contains(call_id.as_str()) =>
             {
-                error_or_panic(format!(
+                error_mode.report(format!(
                     "Custom tool call output is missing for call id: {call_id}"
                 ));
                 missing_outputs_to_insert.push((
@@ -98,7 +115,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                 call_id: Some(call_id),
                 ..
             } if !function_output_ids.contains(call_id.as_str()) => {
-                error_or_panic(format!(
+                error_mode.report(format!(
                     "Local shell call output is missing for call id: {call_id}"
                 ));
                 missing_outputs_to_insert.push((
@@ -141,7 +158,10 @@ fn synthetic_output_id(prefix: &str, item_id: Option<&str>) -> Option<String> {
     ))
 }
 
-pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
+pub(crate) fn remove_orphan_outputs(
+    items: &mut Vec<ResponseItem>,
+    error_mode: NormalizationErrorMode,
+) {
     let function_call_ids: HashSet<String> = items
         .iter()
         .filter_map(|i| match i {
@@ -185,7 +205,7 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
             let has_match =
                 function_call_ids.contains(call_id) || local_shell_call_ids.contains(call_id);
             if !has_match {
-                error_or_panic(format!(
+                error_mode.report(format!(
                     "Orphan function call output for call id: {call_id}"
                 ));
             }
@@ -194,7 +214,7 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
         ResponseItem::CustomToolCallOutput { call_id, .. } => {
             let has_match = custom_tool_call_ids.contains(call_id);
             if !has_match {
-                error_or_panic(format!(
+                error_mode.report(format!(
                     "Orphan custom tool call output for call id: {call_id}"
                 ));
             }
@@ -207,7 +227,7 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
         } => {
             let has_match = tool_search_call_ids.contains(call_id);
             if !has_match {
-                error_or_panic(format!("Orphan tool search output for call id: {call_id}"));
+                error_mode.report(format!("Orphan tool search output for call id: {call_id}"));
             }
             has_match
         }
@@ -216,7 +236,10 @@ pub(crate) fn remove_orphan_outputs(items: &mut Vec<ResponseItem>) {
     });
 }
 
-pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &ResponseItem) {
+pub(crate) fn remove_corresponding_for(
+    items: &mut Vec<ResponseItem>,
+    item: &ResponseItem,
+) -> Option<usize> {
     match item {
         ResponseItem::FunctionCall { call_id, .. } => {
             remove_first_matching(items, |i| {
@@ -226,17 +249,21 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &Res
                         call_id: existing, ..
                     } if existing == call_id
                 )
-            });
+            })
         }
         ResponseItem::FunctionCallOutput { call_id, .. } => {
             if let Some(pos) = items.iter().position(|i| {
                 matches!(i, ResponseItem::FunctionCall { call_id: existing, .. } if existing == call_id)
             }) {
                 items.remove(pos);
+                Some(pos)
             } else if let Some(pos) = items.iter().position(|i| {
                 matches!(i, ResponseItem::LocalShellCall { call_id: Some(existing), .. } if existing == call_id)
             }) {
                 items.remove(pos);
+                Some(pos)
+            } else {
+                None
             }
         }
         ResponseItem::ToolSearchCall {
@@ -251,7 +278,7 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &Res
                         ..
                     } if existing == call_id
                 )
-            });
+            })
         }
         ResponseItem::ToolSearchOutput {
             call_id: Some(call_id),
@@ -268,7 +295,7 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &Res
                         } if existing == call_id
                     )
                 },
-            );
+            )
         }
         ResponseItem::CustomToolCall { call_id, .. } => {
             remove_first_matching(items, |i| {
@@ -278,13 +305,13 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &Res
                         call_id: existing, ..
                     } if existing == call_id
                 )
-            });
+            })
         }
         ResponseItem::CustomToolCallOutput { call_id, .. } => {
             remove_first_matching(
                 items,
                 |i| matches!(i, ResponseItem::CustomToolCall { call_id: existing, .. } if existing == call_id),
-            );
+            )
         }
         ResponseItem::LocalShellCall {
             call_id: Some(call_id),
@@ -297,18 +324,21 @@ pub(crate) fn remove_corresponding_for(items: &mut Vec<ResponseItem>, item: &Res
                         call_id: existing, ..
                     } if existing == call_id
                 )
-            });
+            })
         }
-        _ => {}
+        _ => None,
     }
 }
 
-fn remove_first_matching<F>(items: &mut Vec<ResponseItem>, predicate: F)
+fn remove_first_matching<F>(items: &mut Vec<ResponseItem>, predicate: F) -> Option<usize>
 where
     F: Fn(&ResponseItem) -> bool,
 {
     if let Some(pos) = items.iter().position(predicate) {
         items.remove(pos);
+        Some(pos)
+    } else {
+        None
     }
 }
 

@@ -91,6 +91,11 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
             matches!(history_mode, ThreadHistoryMode::Paginated)
                 || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_))
         }
+        // `Session` explicitly appends this existing event before the ordinary compatibility
+        // `ResponseItem` for direct user sources. Generic raw-item delivery is nonpersistent.
+        EventMsg::RawResponseItem(event) => {
+            matches!(&event.item, ResponseItem::Message { role, .. } if role == "user")
+        }
         EventMsg::TokenCount(_)
         | EventMsg::ThreadGoalUpdated(_)
         | EventMsg::ExactTailCompactionDiagnostic(_)
@@ -139,7 +144,6 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::ModelVerification(_)
         | EventMsg::TurnModerationMetadata(_)
         | EventMsg::AgentReasoningSectionBreak(_)
-        | EventMsg::RawResponseItem(_)
         | EventMsg::SessionConfigured(_)
         | EventMsg::McpToolCallBegin(_)
         | EventMsg::ExecCommandBegin(_)

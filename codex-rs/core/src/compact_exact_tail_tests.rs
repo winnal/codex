@@ -12,6 +12,7 @@ use codex_protocol::models::AgentMessageInputContent;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::openai_models::InputModality;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::ExactTailModelVisibleItemKind;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -23,6 +24,62 @@ use std::sync::Arc;
 
 fn mid_turn_injection() -> InitialContextInjection {
     InitialContextInjection::BeforeLastUserMessage(Arc::new(WorldState::default()))
+}
+
+fn plan_exact_tail(input: ExactTailPlanInput<'_>) -> Result<ExactTailPlan, ExactTailError> {
+    let item_provenance = test_item_provenance(input.history_items);
+    super::plan_exact_tail(input, &item_provenance)
+}
+
+fn test_item_provenance(items: &[ResponseItem]) -> Vec<HistoryItemProvenance> {
+    items
+        .iter()
+        .map(|item| match item {
+            ResponseItem::Message {
+                id, role, content, ..
+            } if role == "user"
+                && !super::response_item_is_summary_user_message(item)
+                && !crate::event_mapping::is_contextual_user_message_content(content)
+                && crate::context::parse_visible_hook_prompt_message(id.as_ref(), content)
+                    .is_none() =>
+            {
+                HistoryItemProvenance::DirectUserSource
+            }
+            _ => HistoryItemProvenance::Other,
+        })
+        .collect()
+}
+
+fn check_cold_input_fits(
+    plan: &ExactTailPlan,
+    compact_request_items: &[ResponseItem],
+    context_window: i64,
+) -> Result<(), ExactTailError> {
+    super::check_cold_input_fits(
+        plan,
+        compact_request_items,
+        ExactTailCompactInputExpectation::Source { derived_items: &[] },
+        context_window,
+        &codex_protocol::models::BaseInstructions {
+            text: String::new(),
+        },
+    )
+}
+
+fn check_source_final_input(
+    plan: &ExactTailPlan,
+    compact_request_items: &[ResponseItem],
+    derived_items: &[ResponseItem],
+) -> Result<(), ExactTailError> {
+    super::check_cold_input_fits(
+        plan,
+        compact_request_items,
+        ExactTailCompactInputExpectation::Source { derived_items },
+        200_000,
+        &codex_protocol::models::BaseInstructions {
+            text: String::new(),
+        },
+    )
 }
 
 #[test]
@@ -162,10 +219,12 @@ fn prepared_for_hot_suffix(
 ) -> PreparedExactTailPlan {
     let mut plan = plan(vec![user("old"), user("placeholder hot")], 1);
     plan.hot_suffix = hot_suffix;
+    plan.hot_suffix_provenance = test_item_provenance(&plan.hot_suffix);
     plan.tool_surface_hint = derive_exact_tail_tool_surface_hint(&plan.hot_suffix);
     PreparedExactTailPlan {
         plan,
         initial_context,
+        model_context_window: 50_000,
     }
 }
 
@@ -665,8 +724,9 @@ fn planner_filters_stale_app_and_plugin_developer_wrappers() {
 }
 
 #[test]
-fn replacement_fit_ignores_oversize_stale_context_wrapper_item() {
-    let actual = plan(vec![user("old history"), user("recent history")], 1);
+fn replacement_fit_caps_oversize_derived_context_wrapper_item() {
+    let recent = user("recent history");
+    let actual = plan(vec![user("old history"), recent.clone()], 1);
     let stale_context = developer(vec![ContentItem::InputText {
         text: format!("<token_budget>\n{}\n</token_budget>", "ctx ".repeat(15_000)),
     }]);
@@ -674,11 +734,14 @@ fn replacement_fit_ignores_oversize_stale_context_wrapper_item() {
         estimate_response_items_token_count(std::slice::from_ref(&stale_context));
     assert!(stale_context_tokens > EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS);
 
-    let final_tokens =
-        check_replacement_fits(&actual, &[stale_context], /*actual_summary_tokens*/ 0)
-            .expect("stale context wrapper should not fail the exact-tail item cap");
+    let error = check_replacement_fits(
+        &actual,
+        &[stale_context, recent],
+        /*actual_summary_tokens*/ 0,
+    )
+    .expect_err("freshly derived context must remain subject to the item cap");
 
-    assert!(final_tokens < actual.diagnostics.effective_replacement_budget);
+    assert_eq!(error.reason, ExactTailFailReason::ModelVisibleItemTooLarge);
 }
 
 #[test]
@@ -733,8 +796,13 @@ fn planner_filters_oversize_mixed_developer_context_bundle() {
 }
 
 #[test]
-fn oversize_hot_user_item_fails_closed() {
-    let history = [user("old"), user(&"hot user ".repeat(40_000))];
+fn oversize_hot_source_user_item_is_preserved_exactly() {
+    let mut oversized_user = user(&"hot user ".repeat(40_000));
+    oversized_user.set_id(Some("source-user-id".to_string()));
+    let oversized_user_tokens =
+        estimate_response_items_token_count(std::slice::from_ref(&oversized_user));
+    assert!(oversized_user_tokens > EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS);
+    let history = [user("old"), oversized_user.clone()];
     let actual = plan_exact_tail(ExactTailPlanInput {
         history_items: &history,
         target_tokens: 1,
@@ -746,9 +814,64 @@ fn oversize_hot_user_item_fails_closed() {
         retained_cold_user_message_budget_tokens: 0,
         implementation: ExactTailImplementation::Local,
     })
-    .expect_err("hot user item should exceed the per-item cap");
+    .expect("source user history should be governed by the aggregate exact-tail budget");
 
-    assert_eq!(actual.reason, ExactTailFailReason::ModelVisibleItemTooLarge);
+    assert_eq!(actual.hot_suffix, vec![oversized_user.clone()]);
+    assert_eq!(
+        actual.diagnostics.largest_hot_item_tokens,
+        oversized_user_tokens
+    );
+
+    let summary = compaction_summary("bounded cold summary");
+    let summary_tokens = estimate_response_items_token_count(std::slice::from_ref(&summary));
+    let prepared = PreparedExactTailPlan {
+        plan: actual,
+        initial_context: Vec::new(),
+        model_context_window: 200_000,
+    };
+    let replacement = build_exact_tail_replacement(
+        &prepared,
+        vec![summary.clone()],
+        &InitialContextInjection::DoNotInject,
+        summary_tokens,
+    )
+    .expect("the exact oversized source user should remain valid in the final replacement");
+
+    assert_eq!(
+        replacement.replacement_history,
+        vec![summary, oversized_user]
+    );
+    assert!(replacement.diagnostics.hot_suffix_exact_match);
+}
+
+#[test]
+fn oversize_visible_hook_prompt_remains_capped() {
+    let hook_text = "visible hook ".repeat(40_000);
+    let hook = build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
+        &hook_text,
+        "hook-run-oversized",
+    )])
+    .expect("hook prompt message");
+    assert!(
+        estimate_response_items_token_count(std::slice::from_ref(&hook))
+            > EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS
+    );
+    let history = [user("old"), hook];
+
+    let error = plan_exact_tail(ExactTailPlanInput {
+        history_items: &history,
+        target_tokens: 1,
+        effective_replacement_budget: Some(200_000),
+        required_current_context_budget: 0,
+        final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
+        estimated_summary_scaffold_overhead_tokens: 0,
+        retained_cold_user_message_budget_tokens: 0,
+        implementation: ExactTailImplementation::Local,
+    })
+    .expect_err("generated hook prompts should remain subject to the item cap");
+
+    assert_eq!(error.reason, ExactTailFailReason::ModelVisibleItemTooLarge);
 }
 
 #[test]
@@ -922,14 +1045,144 @@ fn configured_larger_item_cap_allows_read_thread_sized_tool_output() {
 #[test]
 fn cold_input_too_large_fails_closed_without_pruning() {
     let actual = plan(vec![user("old"), user("recent")], 1);
-    let error = check_cold_input_fits(
-        &actual,
-        &[user(&"oversized cold input ".repeat(10))],
-        Some(1),
-    )
-    .expect_err("oversized cold input should fail closed");
+    let error = check_cold_input_fits(&actual, &actual.cold_history, 1)
+        .expect_err("oversized cold input should fail closed");
 
     assert_eq!(error.reason, ExactTailFailReason::ColdInputTooLarge);
+}
+
+#[test]
+fn direct_user_source_provenance_overrides_summary_context_and_hook_content_shapes() {
+    let summary_shaped = user(&format!("{SUMMARY_PREFIX}\nliteral direct user text"));
+    let context_shaped = user(&format!(
+        "{APPS_INSTRUCTIONS_OPEN_TAG}\nliteral direct user text"
+    ));
+    let hook_shaped = build_hook_prompt_message(&[HookPromptFragment::from_single_hook(
+        "literal direct user text",
+        "direct-user-hook-shape",
+    )])
+    .expect("hook-shaped direct user message");
+    let hot = user("recent direct user");
+    let history = [
+        summary_shaped.clone(),
+        context_shaped.clone(),
+        hook_shaped.clone(),
+        hot.clone(),
+    ];
+    let provenance = vec![HistoryItemProvenance::DirectUserSource; history.len()];
+
+    let actual = super::plan_exact_tail(plan_input(&history, 1, Some(200_000)), &provenance)
+        .expect("content shape must not override direct-user provenance");
+
+    assert_eq!(
+        actual.cold_history,
+        vec![summary_shaped, context_shaped, hook_shaped]
+    );
+    assert_eq!(actual.hot_suffix, vec![hot]);
+}
+
+#[test]
+fn derived_retained_anchor_is_not_promoted_on_a_second_compaction() {
+    let retained_anchor = user(&"lossy retained anchor ".repeat(1_000));
+    let retained_anchor_tokens =
+        estimate_response_items_token_count(std::slice::from_ref(&retained_anchor));
+    let first_item_cap = retained_anchor_tokens.saturating_add(1);
+    let second_item_cap = retained_anchor_tokens.saturating_sub(1);
+    let source_history = [user("cold source"), user("exact hot source")];
+    let source_provenance = vec![HistoryItemProvenance::DirectUserSource; source_history.len()];
+    let mut first_input = plan_input(&source_history, 1, Some(200_000));
+    first_input.max_model_visible_item_tokens = first_item_cap;
+    let first_plan =
+        super::plan_exact_tail(first_input, &source_provenance).expect("first exact-tail plan");
+    let first_replacement = build_exact_tail_replacement(
+        &PreparedExactTailPlan {
+            plan: first_plan,
+            initial_context: Vec::new(),
+            model_context_window: 200_000,
+        },
+        vec![retained_anchor],
+        &InitialContextInjection::DoNotInject,
+        retained_anchor_tokens,
+    )
+    .expect("first replacement should install the bounded derived anchor");
+
+    let mut second_input = plan_input(&first_replacement.replacement_history, 1, Some(200_000));
+    second_input.max_model_visible_item_tokens = second_item_cap;
+    let second_plan = super::plan_exact_tail(second_input, &first_replacement.item_provenance)
+        .expect("the second plan defers cold-item validation to the final prompt gate");
+    let error = check_source_final_input(&second_plan, &second_plan.cold_history, &[])
+        .expect_err("a retained derived anchor must remain subject to the item cap");
+
+    assert_eq!(error.reason, ExactTailFailReason::ModelVisibleItemTooLarge);
+}
+
+#[test]
+fn final_prompt_projection_rejects_synthetic_call_output_insertion() {
+    let history = [function_call("missing-output"), user("recent hot")];
+    let provenance = [
+        HistoryItemProvenance::Other,
+        HistoryItemProvenance::DirectUserSource,
+    ];
+    let plan = super::plan_exact_tail(plan_input(&history, 1, Some(200_000)), &provenance)
+        .expect("missing output is normalized only at prompt projection");
+    let mut prompt_history = ContextManager::new();
+    prompt_history.replace(plan.cold_history.clone());
+    let projected = prompt_history.for_exact_tail_prompt(&[InputModality::Text]);
+
+    let error = check_source_final_input(&plan, &projected, &[])
+        .expect_err("synthetic prompt output must invalidate the exact source vector");
+    assert_eq!(error.reason, ExactTailFailReason::ColdInputMismatch);
+}
+
+#[test]
+fn final_prompt_projection_rejects_orphan_output_removal() {
+    let history = [
+        function_output("orphan-output", "orphan"),
+        user("recent hot"),
+    ];
+    let provenance = [
+        HistoryItemProvenance::Other,
+        HistoryItemProvenance::DirectUserSource,
+    ];
+    let plan = super::plan_exact_tail(plan_input(&history, 1, Some(200_000)), &provenance)
+        .expect("orphan output is normalized only at prompt projection");
+    let mut prompt_history = ContextManager::new();
+    prompt_history.replace(plan.cold_history.clone());
+    let projected = prompt_history.for_exact_tail_prompt(&[InputModality::Text]);
+
+    let error = check_source_final_input(&plan, &projected, &[])
+        .expect_err("orphan removal must invalidate the exact source vector");
+    assert_eq!(error.reason, ExactTailFailReason::ColdInputMismatch);
+}
+
+#[test]
+fn final_prompt_projection_rejects_unsupported_source_image_rewrite() {
+    let source_with_image = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "literal direct source image".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: "https://example.com/source.png".to_string(),
+                detail: None,
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let history = [source_with_image, user("recent hot")];
+    let provenance = vec![HistoryItemProvenance::DirectUserSource; history.len()];
+    let plan = super::plan_exact_tail(plan_input(&history, 1, Some(200_000)), &provenance)
+        .expect("source image should be planned before prompt projection");
+    let mut prompt_history = ContextManager::new();
+    prompt_history.replace(plan.cold_history.clone());
+    let projected = prompt_history.for_exact_tail_prompt(&[InputModality::Text]);
+
+    let error = check_source_final_input(&plan, &projected, &[])
+        .expect_err("unsupported image rewriting must invalidate the exact source vector");
+    assert_eq!(error.reason, ExactTailFailReason::ColdInputMismatch);
 }
 
 #[test]
@@ -960,7 +1213,7 @@ fn cold_tool_output_fails_before_standard_remote_v2_trim_could_rescue_it() {
         "test setup must exceed the cold input window before standard trimming"
     );
 
-    let error = check_cold_input_fits(&actual, &actual.cold_history, Some(30_000))
+    let error = check_cold_input_fits(&actual, &actual.cold_history, 30_000)
         .expect_err("untrimmed exact-tail cold tool output must fail before v2 compaction");
 
     assert_eq!(error.reason, ExactTailFailReason::ColdInputTooLarge);
@@ -973,32 +1226,66 @@ fn cold_tool_output_fails_before_standard_remote_v2_trim_could_rescue_it() {
             "Output exceeded the available model context and was truncated",
         ),
     ];
-    check_cold_input_fits(&actual, &trimmed_cold_history, Some(30_000))
-        .expect("standard remote-v2 trim sentinel would fit, proving the ordering matters");
+    let error = check_cold_input_fits(&actual, &trimmed_cold_history, 30_000)
+        .expect_err("post-plan cold-history mutation must not masquerade as source history");
+    assert_eq!(error.reason, ExactTailFailReason::ColdInputMismatch);
 }
 
 #[test]
-fn cold_input_oversize_item_fails_closed_without_requesting_compaction() {
-    let actual = plan(vec![user("old"), user("recent")], 1);
-    let error = check_cold_input_fits(
-        &actual,
-        &[user(&"oversized cold input item ".repeat(40_000))],
-        Some(200_000),
-    )
-    .expect_err("oversized cold input item should fail the per-item cap");
+fn oversize_cold_source_users_fall_through_to_the_aggregate_context_limit() {
+    let history = [
+        user(&"x".repeat(183_044 * 4)),
+        assistant("first answer"),
+        user(&"y".repeat(80_000 * 4)),
+        assistant("exact hot answer"),
+    ];
+    let actual = plan_exact_tail(ExactTailPlanInput {
+        history_items: &history,
+        target_tokens: 1,
+        effective_replacement_budget: Some(400_000),
+        required_current_context_budget: 0,
+        final_replacement_extra_budget_tokens: 0,
+        max_model_visible_item_tokens: 22_000,
+        estimated_summary_scaffold_overhead_tokens: 0,
+        retained_cold_user_message_budget_tokens: 0,
+        implementation: ExactTailImplementation::RemoteLegacy,
+    })
+    .expect("source user item size alone should not prevent exact-tail planning");
+    assert!(actual.diagnostics.cold_tokens > 258_400);
 
-    assert_eq!(error.reason, ExactTailFailReason::ModelVisibleItemTooLarge);
+    let error = check_cold_input_fits(&actual, &actual.cold_history, 258_400)
+        .expect_err("the complete cold prefix still must fit the compaction context");
+
+    assert_eq!(error.reason, ExactTailFailReason::ColdInputTooLarge);
+    assert_eq!(error.model_visible_item_limit, None);
+
+    let cold_tokens = estimate_response_items_token_count(&actual.cold_history);
+    check_cold_input_fits(&actual, &actual.cold_history, cold_tokens)
+        .expect("cold items alone should fit exactly at their estimated size");
+    let error = super::check_cold_input_fits(
+        &actual,
+        &actual.cold_history,
+        ExactTailCompactInputExpectation::Source { derived_items: &[] },
+        cold_tokens,
+        &codex_protocol::models::BaseInstructions {
+            text: "base instructions tip the request over".to_string(),
+        },
+    )
+    .expect_err("base instructions must be included in aggregate request accounting");
+    assert_eq!(error.reason, ExactTailFailReason::ColdInputTooLarge);
 }
 
 #[test]
 fn replacement_fit_includes_final_prompt_reserve() {
-    let replacement_history = (0..2_000)
+    let recent = user("recent");
+    let mut replacement_history = (0..2_000)
         .map(|index| user(&format!("summary fragment {index}")))
         .collect::<Vec<_>>();
+    replacement_history.push(recent.clone());
     let replacement_tokens = estimate_response_items_token_count(&replacement_history);
     let final_extra_tokens = 1_000;
     let effective_budget = replacement_tokens + final_extra_tokens - 1;
-    let history = [user("old"), user("recent")];
+    let history = [user("old"), recent];
     let actual = plan_exact_tail(ExactTailPlanInput {
         history_items: &history,
         target_tokens: 1,
@@ -1024,39 +1311,17 @@ fn replacement_fit_includes_final_prompt_reserve() {
 }
 
 #[test]
-fn replacement_fit_rejects_oversize_model_visible_item_even_when_total_fits() {
-    let replacement_history = vec![user(&"oversized replacement item ".repeat(40_000))];
-    let replacement_tokens = estimate_response_items_token_count(&replacement_history);
-    let history = [user("old"), user("recent")];
-    let actual = plan_exact_tail(ExactTailPlanInput {
-        history_items: &history,
-        target_tokens: 1,
-        effective_replacement_budget: Some(replacement_tokens + 100_000),
-        required_current_context_budget: 0,
-        final_replacement_extra_budget_tokens: 0,
-        max_model_visible_item_tokens: EXACT_TAIL_DEFAULT_MAX_MODEL_VISIBLE_ITEM_TOKENS,
-        estimated_summary_scaffold_overhead_tokens: 0,
-        retained_cold_user_message_budget_tokens: 0,
-        implementation: ExactTailImplementation::Local,
-    })
-    .expect("exact-tail plan should fit before final replacement item cap is applied");
-
-    let error = check_replacement_fits(
-        &actual,
-        &replacement_history,
-        /*actual_summary_tokens*/ replacement_tokens,
-    )
-    .expect_err("oversize replacement item should fail the model-visible item cap");
-
-    assert_eq!(error.reason, ExactTailFailReason::ModelVisibleItemTooLarge);
-}
-
-#[test]
 fn post_summary_oversize_fails_without_dropping_hot_suffix() {
     let old = user(&"old ".repeat(100));
     let recent = user(&"recent ".repeat(100));
     let actual = plan(vec![old, recent.clone()], 1);
-    let oversized_replacement = vec![user(&"oversized summary ".repeat(20_000))];
+    let oversized_replacement = vec![
+        user(&format!(
+            "{SUMMARY_PREFIX}\n{}",
+            "oversized summary ".repeat(20_000)
+        )),
+        recent.clone(),
+    ];
 
     let error = check_replacement_fits(
         &actual,
@@ -1295,25 +1560,25 @@ fn mid_turn_replacement_inserts_initial_context_before_inter_agent_instruction_b
 #[test]
 fn body_after_prefix_auto_replacement_budget_uses_full_context_window() {
     let actual = exact_tail_replacement_budget(
-        Some(200_000),
+        200_000,
         Some(100),
         AutoCompactTokenLimitScope::BodyAfterPrefix,
         CompactionTrigger::Auto,
     );
 
-    assert_eq!(actual, Some(200_000));
+    assert_eq!(actual, 200_000);
 }
 
 #[test]
 fn total_scope_auto_replacement_budget_clamps_to_auto_limit() {
     let actual = exact_tail_replacement_budget(
-        Some(200_000),
+        200_000,
         Some(100),
         AutoCompactTokenLimitScope::Total,
         CompactionTrigger::Auto,
     );
 
-    assert_eq!(actual, Some(100));
+    assert_eq!(actual, 100);
 }
 
 #[test]

@@ -2,6 +2,7 @@ use crate::compact::COMPACT_USER_MESSAGE_MAX_TOKENS;
 use crate::compact::CompactedUserMessage;
 use crate::compact::InitialContextInjection;
 use crate::config::Config;
+use crate::context_manager::HistoryItemProvenance;
 use crate::context_manager::model_visible_tool_output_item_token_limit;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -75,6 +76,7 @@ pub(crate) enum ExactTailFailReason {
     NoColdPrefix,
     MinimumHotSuffixTooLarge,
     ReplacementTooLarge,
+    ColdInputMismatch,
     ColdInputTooLarge,
     NoUsableColdSummary,
     ModelVisibleItemTooLarge,
@@ -90,6 +92,7 @@ impl ExactTailFailReason {
             Self::NoColdPrefix => "ExactTailNoColdPrefix",
             Self::MinimumHotSuffixTooLarge => "ExactTailMinimumHotSuffixTooLarge",
             Self::ReplacementTooLarge => "ExactTailReplacementTooLarge",
+            Self::ColdInputMismatch => "ExactTailColdInputMismatch",
             Self::ColdInputTooLarge => "ExactTailColdInputTooLarge",
             Self::NoUsableColdSummary => "ExactTailNoUsableColdSummary",
             Self::ModelVisibleItemTooLarge => "ExactTailModelVisibleItemTooLarge",
@@ -212,7 +215,9 @@ pub(crate) struct ExactTailBudgetReservation {
 #[derive(Clone, Debug)]
 pub(crate) struct ExactTailPlan {
     pub(crate) cold_history: Vec<ResponseItem>,
+    pub(crate) cold_history_provenance: Vec<HistoryItemProvenance>,
     pub(crate) hot_suffix: Vec<ResponseItem>,
+    pub(crate) hot_suffix_provenance: Vec<HistoryItemProvenance>,
     pub(crate) cold_user_messages: Vec<CompactedUserMessage>,
     pub(crate) diagnostics: ExactTailDiagnostics,
     pub(crate) coverage: ExactTailCoverage,
@@ -223,11 +228,13 @@ pub(crate) struct ExactTailPlan {
 pub(crate) struct PreparedExactTailPlan {
     pub(crate) plan: ExactTailPlan,
     pub(crate) initial_context: Vec<ResponseItem>,
+    pub(crate) model_context_window: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ExactTailReplacement {
     pub(crate) replacement_history: Vec<ResponseItem>,
+    pub(crate) item_provenance: Vec<HistoryItemProvenance>,
     pub(crate) diagnostics: ExactTailReplacementDiagnostics,
     pub(crate) tool_surface_hint: ExactTailToolSurfaceHint,
 }
@@ -265,6 +272,7 @@ pub(crate) struct ExactTailPrepareInput<'a> {
     pub(crate) sess: &'a Arc<Session>,
     pub(crate) turn_context: &'a Arc<TurnContext>,
     pub(crate) history_items: &'a [ResponseItem],
+    pub(crate) history_item_provenance: &'a [HistoryItemProvenance],
     pub(crate) base_instructions: &'a BaseInstructions,
     pub(crate) policy: CompactionHistoryPolicy,
     pub(crate) trigger: CompactionTrigger,
@@ -273,4 +281,10 @@ pub(crate) struct ExactTailPrepareInput<'a> {
     pub(crate) retained_cold_user_message_budget_tokens: i64,
     pub(crate) normalized_tool_output_count: usize,
     pub(crate) implementation: ExactTailImplementation,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExactTailCompactInputExpectation<'a> {
+    Source { derived_items: &'a [ResponseItem] },
+    Derived { expected_items: &'a [ResponseItem] },
 }

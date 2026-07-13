@@ -1,5 +1,6 @@
 use super::*;
 use crate::context::world_state::WorldStateSnapshot;
+use crate::context_manager::HistoryItemProvenance;
 use crate::context_manager::is_user_turn_boundary;
 use crate::tools::exact_tail_continuity::ExactTailToolSurfaceHint;
 use crate::tools::exact_tail_continuity::PendingExactTailToolSurfaceHint;
@@ -8,6 +9,7 @@ use codex_protocol::protocol::ExactTailCompactionDiagnosticEvent;
 use codex_protocol::protocol::ExactTailCompactionFitResult;
 use codex_protocol::protocol::ExactTailCompactionRoute;
 use codex_protocol::protocol::SessionContextWindow;
+use codex_protocol::protocol::ThreadHistoryMode;
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
@@ -16,6 +18,7 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub(super) struct RolloutReconstruction {
     pub(super) history: Vec<ResponseItem>,
+    pub(super) history_item_provenance: Vec<HistoryItemProvenance>,
     pub(super) previous_turn_settings: Option<PreviousTurnSettings>,
     pub(super) reference_context_item: Option<TurnContextItem>,
     pub(super) world_state_baseline: Option<WorldStateSnapshot>,
@@ -58,6 +61,7 @@ struct ActiveReplaySegment<'a> {
     reference_context_item: TurnReferenceContextItem,
     world_state_replay: Vec<&'a RolloutItem>,
     base_replacement_history: Option<&'a [ResponseItem]>,
+    base_replacement_history_direct_user_source_indices: Option<&'a [u32]>,
     exact_tail_compaction_source: Option<RecoveredExactTailCompactionSource>,
     exact_tail_tool_surface_notice_emitted_compaction_ids: BTreeSet<String>,
     window: Option<ReconstructedWindow>,
@@ -66,6 +70,7 @@ struct ActiveReplaySegment<'a> {
 #[derive(Debug, Default)]
 struct RolloutReconstructionState<'a> {
     base_replacement_history: Option<&'a [ResponseItem]>,
+    base_replacement_history_direct_user_source_indices: Option<&'a [u32]>,
     previous_turn_settings: Option<PreviousTurnSettings>,
     reference_context_item: TurnReferenceContextItem,
     world_state_replay: Vec<&'a RolloutItem>,
@@ -142,6 +147,8 @@ fn finalize_active_segment<'a>(
         && let Some(segment_base_replacement_history) = active_segment.base_replacement_history
     {
         state.base_replacement_history = Some(segment_base_replacement_history);
+        state.base_replacement_history_direct_user_source_indices =
+            active_segment.base_replacement_history_direct_user_source_indices;
         state.exact_tail_compaction_source = active_segment.exact_tail_compaction_source;
     }
 
@@ -179,6 +186,8 @@ impl Session {
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
     ) -> RolloutReconstruction {
+        let is_paginated_history =
+            matches!(turn_context.history_mode, ThreadHistoryMode::Paginated);
         // Replay metadata should already match the shape of the future lazy reverse loader, even
         // while history materialization still uses an eager bridge. Scan newest-to-oldest,
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
@@ -239,6 +248,10 @@ impl Session {
                         && let Some(replacement_history) = &compacted.replacement_history
                     {
                         active_segment.base_replacement_history = Some(replacement_history);
+                        active_segment.base_replacement_history_direct_user_source_indices =
+                            compacted
+                                .replacement_history_direct_user_source_indices
+                                .as_deref();
                         rollout_suffix = &rollout_items[index + 1..];
                     }
                 }
@@ -295,6 +308,25 @@ impl Session {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
                     active_segment.counts_as_user_turn = true;
+                }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event))
+                    if is_paginated_history && matches!(&event.item, TurnItem::UserMessage(_)) =>
+                {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.counts_as_user_turn = true;
+                    if active_segment.turn_id.is_none() {
+                        active_segment.turn_id = Some(event.turn_id.clone());
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::RawResponseItem(event)) if matches!(&event.item, ResponseItem::Message { role, .. } if role == "user") =>
+                {
+                    let active_segment =
+                        active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.counts_as_user_turn = true;
+                    if active_segment.turn_id.is_none() {
+                        active_segment.turn_id = event.item.turn_id().map(str::to_string);
+                    }
                 }
                 RolloutItem::TurnContext(ctx) => {
                     let active_segment =
@@ -399,32 +431,86 @@ impl Session {
                     )
                 });
         if let Some(base_replacement_history) = state.base_replacement_history {
-            history.replace(base_replacement_history.to_vec());
+            let item_provenance = replacement_history_provenance(
+                base_replacement_history,
+                state.base_replacement_history_direct_user_source_indices,
+            );
+            history.replace_with_provenance(base_replacement_history.to_vec(), item_provenance);
         }
         // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
         // design should keep this same replay shape, but drive it from a resumable reverse source
         // instead of an eagerly loaded `&[RolloutItem]`.
+        let mut paginated_direct_user_candidate = None;
+        let mut durable_direct_user_source = None;
         for item in rollout_suffix {
             match item {
                 RolloutItem::ResponseItem(response_item) => {
+                    paginated_direct_user_candidate = None;
+                    if durable_direct_user_source
+                        .take()
+                        .as_ref()
+                        .is_some_and(|direct_user_source| direct_user_source == response_item)
+                    {
+                        continue;
+                    }
+                    let candidate_index = history.raw_items().len();
                     history.record_items(
                         std::iter::once(response_item),
                         turn_context.model_info.truncation_policy.into(),
                     );
+                    if is_paginated_history
+                        && candidate_index
+                            .checked_add(1)
+                            .is_some_and(|expected_len| history.raw_items().len() == expected_len)
+                        && matches!(response_item, ResponseItem::Message { role, .. } if role == "user")
+                    {
+                        paginated_direct_user_candidate = Some(candidate_index);
+                    }
+                }
+                RolloutItem::EventMsg(EventMsg::RawResponseItem(event)) => {
+                    paginated_direct_user_candidate = None;
+                    if matches!(&event.item, ResponseItem::Message { role, .. } if role == "user") {
+                        let duplicate = durable_direct_user_source
+                            .as_ref()
+                            .is_some_and(|direct_user_source| direct_user_source == &event.item);
+                        if !duplicate {
+                            history.record_direct_user_source_items(
+                                std::iter::once(&event.item),
+                                turn_context.model_info.truncation_policy.into(),
+                            );
+                        }
+                        durable_direct_user_source = Some(event.item.clone());
+                    } else {
+                        durable_direct_user_source = None;
+                    }
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
+                    paginated_direct_user_candidate = None;
+                    durable_direct_user_source = None;
                     let response_item = communication.to_model_input_item();
                     history.record_items(
                         std::iter::once(&response_item),
                         turn_context.model_info.truncation_policy.into(),
                     );
                 }
-                RolloutItem::InterAgentCommunicationMetadata { .. } => {}
+                RolloutItem::InterAgentCommunicationMetadata { .. } => {
+                    paginated_direct_user_candidate = None;
+                    durable_direct_user_source = None;
+                }
                 RolloutItem::Compacted(compacted) => {
+                    paginated_direct_user_candidate = None;
+                    durable_direct_user_source = None;
                     if let Some(replacement_history) = &compacted.replacement_history {
                         // This should actually never happen, because the reverse loop above (to build rollout_suffix)
                         // should stop before any compaction that has Some replacement_history
-                        history.replace(replacement_history.clone());
+                        let item_provenance = replacement_history_provenance(
+                            replacement_history,
+                            compacted
+                                .replacement_history_direct_user_source_indices
+                                .as_deref(),
+                        );
+                        history
+                            .replace_with_provenance(replacement_history.clone(), item_provenance);
                     } else {
                         saw_legacy_compaction_without_replacement_history = true;
                         // Legacy rollouts without `replacement_history` should rebuild the
@@ -445,14 +531,37 @@ impl Session {
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    paginated_direct_user_candidate = None;
+                    durable_direct_user_source = None;
                     history.drop_last_n_user_turns(rollback.num_turns);
+                }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => {
+                    durable_direct_user_source = None;
+                    if is_paginated_history
+                        && !event.turn_id.is_empty()
+                        && matches!(&event.item, TurnItem::UserMessage(_))
+                        && let Some(index) = paginated_direct_user_candidate.take()
+                        && history
+                            .raw_items()
+                            .get(index)
+                            .and_then(ResponseItem::turn_id)
+                            == Some(event.turn_id.as_str())
+                    {
+                        history.mark_direct_user_source(index);
+                    } else {
+                        paginated_direct_user_candidate = None;
+                    }
                 }
                 RolloutItem::EventMsg(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
-                | RolloutItem::SessionMeta(_) => {}
+                | RolloutItem::SessionMeta(_) => {
+                    paginated_direct_user_candidate = None;
+                    durable_direct_user_source = None;
+                }
             }
         }
+        let history_item_provenance = history.item_provenance().to_vec();
 
         let reference_context_item = match state.reference_context_item {
             TurnReferenceContextItem::NeverSet | TurnReferenceContextItem::Cleared => None,
@@ -514,6 +623,7 @@ impl Session {
             });
         RolloutReconstruction {
             history: history.into_raw_items(),
+            history_item_provenance,
             previous_turn_settings: state.previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -524,6 +634,33 @@ impl Session {
             pending_exact_tail_tool_surface_hint,
         }
     }
+}
+
+fn replacement_history_provenance(
+    replacement_history: &[ResponseItem],
+    direct_user_source_indices: Option<&[u32]>,
+) -> Vec<HistoryItemProvenance> {
+    let mut item_provenance = vec![HistoryItemProvenance::Other; replacement_history.len()];
+    let Some(direct_user_source_indices) = direct_user_source_indices else {
+        return item_provenance;
+    };
+    let mut previous_index = None;
+    for &index in direct_user_source_indices {
+        let Ok(index) = usize::try_from(index) else {
+            return vec![HistoryItemProvenance::Other; replacement_history.len()];
+        };
+        if previous_index.is_some_and(|previous_index| previous_index >= index)
+            || !matches!(
+                replacement_history.get(index),
+                Some(ResponseItem::Message { role, .. }) if role == "user"
+            )
+        {
+            return vec![HistoryItemProvenance::Other; replacement_history.len()];
+        }
+        item_provenance[index] = HistoryItemProvenance::DirectUserSource;
+        previous_index = Some(index);
+    }
+    item_provenance
 }
 
 fn recover_pending_exact_tail_tool_surface_hint(

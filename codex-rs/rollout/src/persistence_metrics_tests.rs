@@ -9,6 +9,7 @@ use codex_protocol::protocol::EnteredReviewModeEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
@@ -36,6 +37,20 @@ fn retained_message(text: &str) -> RolloutItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     })
+}
+
+fn raw_message(role: &str, text: &str) -> RolloutItem {
+    RolloutItem::EventMsg(EventMsg::RawResponseItem(RawResponseItemEvent {
+        item: ResponseItem::Message {
+            id: None,
+            role: role.to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    }))
 }
 
 fn turn_started(turn_id: &str) -> RolloutItem {
@@ -146,6 +161,21 @@ fn retained_items_are_byte_identical() {
         measurement.post_filter.payload_bytes,
         measurement.items[0].payload_bytes.expect("payload bytes")
     );
+}
+
+#[test]
+fn only_user_raw_source_carriers_persist_in_both_history_modes() {
+    let user = raw_message("user", "direct source");
+    let assistant = raw_message("assistant", "transient raw item");
+    let items = [user.clone(), assistant];
+
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        let (persisted, _) = measure_and_filter_rollout_items(&items, history_mode);
+        assert_eq!(
+            serde_json::to_value(persisted).expect("serialize persisted items"),
+            serde_json::to_value([user.clone()]).expect("serialize expected items")
+        );
+    }
 }
 
 #[test]

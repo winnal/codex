@@ -227,26 +227,33 @@ pub(super) fn json_fragment(text: &str) -> String {
 }
 
 pub(super) fn replacement_history_from_rollout(path: &Path) -> Result<Vec<Value>> {
+    replacement_checkpoint_from_rollout(path)?
+        .replacement_history
+        .expect("replacement checkpoint must contain history")
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+pub(super) fn replacement_checkpoint_from_rollout(
+    path: &Path,
+) -> Result<codex_protocol::protocol::CompactedItem> {
     let rollout_text = fs::read_to_string(path)?;
-    let mut replacement_history = None;
+    let mut replacement_checkpoint = None;
     for line in rollout_text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let entry: RolloutLine = serde_json::from_str(line)?;
-        if let RolloutItem::Compacted(compacted) = entry.item
-            && let Some(items) = compacted.replacement_history
+        let line: RolloutLine = serde_json::from_str(line)?;
+        if let RolloutItem::Compacted(compacted) = line.item
+            && compacted.replacement_history.is_some()
         {
-            replacement_history = Some(
-                items
-                    .into_iter()
-                    .map(serde_json::to_value)
-                    .collect::<std::result::Result<Vec<_>, _>>()?,
-            );
+            replacement_checkpoint = Some(compacted);
         }
     }
-    replacement_history.ok_or_else(|| anyhow!("expected rollout replacement history"))
+    replacement_checkpoint.ok_or_else(|| anyhow!("expected rollout replacement checkpoint"))
 }
 
 pub(super) fn exact_tail_diagnostics_from_rollout(path: &Path) -> Result<Vec<Value>> {

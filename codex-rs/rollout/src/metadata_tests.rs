@@ -198,6 +198,7 @@ fn builder_from_items_falls_back_to_filename() {
     let items = vec![RolloutItem::Compacted(CompactedItem {
         message: "noop".to_string(),
         replacement_history: None,
+        replacement_history_direct_user_source_indices: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
